@@ -810,16 +810,10 @@ async function buildDeletePreflight(ctx, ids, signal, includeForks) {
       }
       const running = runningById.get(entry.id) === true
       if (!snapshot) blockers.push({ code: 'missing', message: `${label}不存在` })
-      if (running) {
-        blockers.push({ code: 'running', message: `${label}正在运行` })
-      } else if (loaded) {
-        // A loaded session keeps its write handle (and the Native sidebar keeps
-        // its in-memory summary), so moving it would leave a ghost behind.
-        blockers.push({
-          code: 'loaded',
-          message: `${label}仍被应用打开，需要重启 DSH 后才能移入回收站`,
-        })
-      }
+      if (running) blockers.push({ code: 'running', message: `${label}正在运行` })
+      // A loaded-but-idle session is only a warning: `agents.get` means the
+      // session was activated in this process (the startup-selected session
+      // always is), so blocking it would lock the most-used session forever.
       members.push({
         id: entry.id,
         role: entry.role,
@@ -840,6 +834,14 @@ async function buildDeletePreflight(ctx, ids, signal, includeForks) {
       }
     })
 
+    const loadedMembers = members.filter((member) => member.loaded === true)
+    const warnings = loadedMembers.length > 0
+      ? [{
+          code: 'loaded',
+          message: `有 ${loadedMembers.length} 个会话仍被应用保留（已打开），移入后可能要从重启 DSH 后才从原生侧边栏消失`,
+        }]
+      : []
+
     families.push({
       rootId,
       rootTitle: titleResult.titles.get(rootId) ?? null,
@@ -850,6 +852,7 @@ async function buildDeletePreflight(ctx, ids, signal, includeForks) {
       totalBytes: members.reduce((sum, member) => sum + member.sizeBytes, 0),
       canTrash: blockers.length === 0 && members.length > 0,
       blockers,
+      warnings,
     })
   }
 

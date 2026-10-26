@@ -1064,11 +1064,11 @@ window.__ModuleLoader__.load({
                   )
                 : null,
               dialog.phase === 'ready'
-                && families.some((family) => (family.blockers || []).some((blocker) => blocker.code === 'loaded'))
+                && families.some((family) => (family.warnings || []).some((warning) => warning.code === 'loaded'))
                 ? h(
                     'div',
                     { style: loadedHintStyle },
-                    '提示：被应用打开/激活过的会话需要重启 DSH 后才能移入回收站（切换会话或归档都不会释放它）。',
+                    '提示：有会话仍被应用保留（已打开）。可以移入回收站，但原生侧边栏里的残留要重启 DSH 后才会消失。',
                   )
                 : null,
               dialog.phase === 'done' && skipped.length > 0
