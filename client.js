@@ -869,7 +869,9 @@ window.__ModuleLoader__.load({
                           style: actionButtonStyle,
                           onClick: () => restoreFamily(family.entries.map((entry) => entry.entryName)),
                         },
-                        '恢复整族',
+                        family.entries.length > 1
+                          ? `恢复会话（${family.entries.length} 个）`
+                          : '恢复会话',
                       )
                     : h('span', { style: badgeStyle }, '数据缺失'),
                 ),
@@ -962,8 +964,8 @@ window.__ModuleLoader__.load({
                 'p',
                 { style: dialogHintStyle },
                 dialog.phase === 'done'
-                  ? `成功 ${trashed.length} 个会话，跳过 ${skipped.length} 个。可从回收站整族恢复。`
-                  : `将移入 ${memberTotal} 个会话${dialog.includeForks === true ? '（含分叉）' : ''}；子智能体/队友会随族一起移入，可整族恢复，不会彻底删除文件。`,
+                  ? `成功 ${trashed.length} 个会话，跳过 ${skipped.length} 个。可从回收站恢复。`
+                  : `将移入 ${memberTotal} 个会话${dialog.includeForks === true ? '（含分叉）' : ''}；子智能体/队友会一并移入，可从回收站恢复，不会彻底删除文件。`,
               ),
               dialog.phase === 'loading' ? h('div', { style: dialogTextStyle }, '正在检查…') : null,
               dialog.phase === 'busy' ? h('div', { style: dialogTextStyle }, '正在移入回收站…') : null,
