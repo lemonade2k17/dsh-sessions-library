@@ -396,7 +396,40 @@ async function readTitles(ctx, sessionIds, signal, requestId) {
 }
 
 /**
+ * Read the durable session list: the authoritative set of stored sessions.
+ *
+ * @param {object} ctx Cordis context.
+ * @param {AbortSignal} signal request cancellation.
+ * @param {string} requestId trace identity.
+ * @returns {Promise<{ snapshots: Array<object>, source: string }>} persistence snapshots and source tag.
+ */
+async function readPersistedSessions(ctx, signal, requestId) {
+  const persistence = ctx.get('sessionPersistence')
+  if (!persistence || typeof persistence.list !== 'function') {
+    trace(requestId, 'persisted', 'unavailable')
+    return { snapshots: [], source: 'unavailable' }
+  }
+  const outcome = await withTimeout(Promise.resolve().then(() => persistence.list({ signal })), SUMMARIES_TIMEOUT_MS)
+  if (outcome.timedOut) {
+    trace(requestId, 'persisted', `timeout>${SUMMARIES_TIMEOUT_MS}ms`)
+    return { snapshots: [], source: 'timeout' }
+  }
+  if (outcome.error) {
+    trace(requestId, 'persisted', `error ${describeError(outcome.error)}`)
+    return { snapshots: [], source: 'error' }
+  }
+  const snapshots = Array.isArray(outcome.value) ? outcome.value : []
+  trace(requestId, 'persisted', `ok items=${snapshots.length}`)
+  return { snapshots, source: 'persistence' }
+}
+
+/**
  * Assemble the session-library snapshot.
+ *
+ * The durable store is authoritative: a session moved to the recycle bin
+ * disappears from the page even while the Host still holds it in memory. The
+ * live summaries only contribute activity time, running state, blank state and
+ * projection titles.
  *
  * @param {object} ctx Cordis context.
  * @param {AbortSignal} signal request cancellation.
@@ -405,82 +438,105 @@ async function readTitles(ctx, sessionIds, signal, requestId) {
  */
 async function buildSnapshot(ctx, signal, requestId) {
   const workspace = await readWorkspaceBaseline(ctx, requestId)
+  const persisted = await readPersistedSessions(ctx, signal, requestId)
   const summaryResult = await readSummaries(ctx, signal, requestId)
   const baseline = workspace.baseline
-  const summaries = summaryResult.items
-
   const archived = new Set(baseline.archivedSessionIds)
   const pinned = new Set(baseline.pinnedSessionIds)
-  const byId = new Map(summaries.map((summary) => [summary.id, summary]))
+  const summaryById = new Map(summaryResult.items.map((summary) => [summary.id, summary]))
+
+  /** @type {Array<object>} */
+  let sessions
+  if (persisted.snapshots.length > 0 || persisted.source === 'persistence') {
+    sessions = persisted.snapshots.map((snapshot) => {
+      const id = String(snapshot.header.id)
+      const summary = summaryById.get(id)
+      return {
+        id,
+        title: summary ? summary.title : null,
+        updatedAt: summary && summary.updatedAt ? summary.updatedAt : snapshot.header.createdAt,
+        blank: summary ? summary.blank : false,
+        running: summary ? summary.running : false,
+        ...(snapshot.header.origin === 'subagent' ? { origin: 'subagent' } : {}),
+        ...(typeof snapshot.header.cwd === 'string' ? { cwd: snapshot.header.cwd } : {}),
+        ...(snapshot.formatStatus ? { formatStatus: snapshot.formatStatus } : {}),
+      }
+    })
+  } else {
+    // Persistence unavailable: fall back to the live summaries.
+    sessions = summaryResult.items.map((summary) => ({ ...summary }))
+  }
 
   // Titles for migration-required sessions would force a format migration per
   // session; the page can show the unnamed label instead of paying that on the
   // first open.
-  const missingTitleIds = summaries
-    .filter((summary) => summary.title === null
-      && summary.blank !== true
-      && summary.origin !== 'subagent'
-      && summary.formatStatus !== 'migration-required')
-    .map((summary) => summary.id)
+  const missingTitleIds = sessions
+    .filter((session) => session.title === null
+      && session.blank !== true
+      && session.origin !== 'subagent'
+      && session.formatStatus !== 'migration-required')
+    .map((session) => session.id)
   const titleResult = await readTitles(ctx, missingTitleIds, signal, requestId)
-  for (const summary of summaries) {
-    if (summary.title === null) summary.title = titleResult.titles.get(summary.id) ?? null
+  for (const session of sessions) {
+    if (session.title === null) session.title = titleResult.titles.get(session.id) ?? null
   }
 
   /**
-   * Decorate one summary for the Client.
+   * Decorate one session for the Client.
    *
-   * @param {object} summary normalized summary.
+   * @param {object} session normalized session.
    * @returns {object} decorated session.
    */
-  const decorate = (summary) => ({
-    id: summary.id,
-    title: summary.title,
-    updatedAt: summary.updatedAt,
-    archived: archived.has(summary.id),
-    pinned: pinned.has(summary.id),
-    blank: summary.blank,
-    running: summary.running,
-    ...(summary.origin ? { origin: summary.origin } : {}),
-    ...(summary.cwd ? { cwd: summary.cwd } : {}),
-    ...(summary.formatStatus ? { formatStatus: summary.formatStatus } : {}),
+  const decorate = (session) => ({
+    id: session.id,
+    title: session.title,
+    updatedAt: session.updatedAt,
+    archived: archived.has(session.id),
+    pinned: pinned.has(session.id),
+    blank: session.blank,
+    running: session.running,
+    ...(session.origin ? { origin: session.origin } : {}),
+    ...(session.cwd ? { cwd: session.cwd } : {}),
+    ...(session.formatStatus ? { formatStatus: session.formatStatus } : {}),
   })
 
   const accounted = new Set()
+  const byId = new Map(sessions.map((session) => [session.id, session]))
   const workspaces = []
   for (const workspaceItem of baseline.items) {
-    const sessions = []
+    const workspaceSessions = []
     for (const sessionId of workspaceItem.sessionIds) {
-      const summary = byId.get(sessionId)
-      if (!summary) continue
+      const session = byId.get(sessionId)
+      if (!session) continue
       accounted.add(sessionId)
-      sessions.push(decorate(summary))
+      workspaceSessions.push(decorate(session))
     }
     workspaces.push({
       kind: 'workspace',
       id: workspaceItem.workspaceId,
       title: workspaceItem.title,
       path: workspaceItem.path,
-      sessions,
+      sessions: workspaceSessions,
     })
   }
 
-  const ungrouped = summaries
-    .filter((summary) => !accounted.has(summary.id) && summary.origin !== 'subagent')
+  const ungrouped = sessions
+    .filter((session) => !accounted.has(session.id) && session.origin !== 'subagent')
     .map(decorate)
 
   return {
     workspaces,
     ungrouped: { kind: 'ungrouped', id: '__ungrouped__', title: '未分组', sessions: ungrouped },
     counts: {
-      total: summaries.length,
-      archived: summaries.filter((summary) => archived.has(summary.id)).length,
-      subagent: summaries.filter((summary) => summary.origin === 'subagent').length,
-      blank: summaries.filter((summary) => summary.blank).length,
+      total: sessions.length,
+      archived: sessions.filter((session) => archived.has(session.id)).length,
+      subagent: sessions.filter((session) => session.origin === 'subagent').length,
+      blank: sessions.filter((session) => session.blank).length,
     },
     sources: {
       workspaces: workspace.source,
       summaries: summaryResult.source,
+      sessions: persisted.source,
       titles: titleResult.source,
     },
     fetchedAt: Date.now(),

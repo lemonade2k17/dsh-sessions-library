@@ -1150,7 +1150,7 @@ window.__ModuleLoader__.load({
         }
 
         const sources = snapshot && snapshot.sources
-          ? `数据来源：工作区 ${snapshot.sources.workspaces} · 会话 ${snapshot.sources.summaries} · 标题 ${snapshot.sources.titles}`
+          ? `数据来源：工作区 ${snapshot.sources.workspaces} · 会话 ${snapshot.sources.sessions ?? snapshot.sources.summaries} · 标题 ${snapshot.sources.titles}`
           : ''
 
         return h(
