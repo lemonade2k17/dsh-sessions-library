@@ -985,8 +985,17 @@ async function trashSessions(ctx, rawIds, signal, includeForks) {
 
     for (const member of family.members) {
       // A loaded session still holds its write handle: moving its log now would
-      // break the Agent (ENOENT on the next turn). Queue it for the next start.
+      // break the Agent (ENOENT on the next turn). Archive it so the Native
+      // sidebar hides it immediately, and queue the physical move for the next
+      // start, when no Agent is live.
       if (member.loaded === true && member.running !== true) {
+        if (registry && typeof registry.archiveSession === 'function' && !archived.has(member.id)) {
+          try {
+            await registry.archiveSession(member.id, {})
+          } catch {
+            // Background work may refuse archiving; the deferred move still applies.
+          }
+        }
         pending[member.id] = {
           requestedAt: Date.now(),
           familyRoot: family.rootId,
@@ -1241,6 +1250,22 @@ async function flushPendingTrash(ctx) {
       mkdirSync(entryDir, { recursive: true })
       renameSync(dir, join(entryDir, 'session'))
       const workspaceIds = await detachFromWorkspaces(registry, id)
+      // The delete archived the session so the Native sidebar hid it; drop that
+      // residue now that the log is really gone.
+      if (registry && typeof registry.unarchiveSession === 'function') {
+        try {
+          await registry.unarchiveSession(id)
+        } catch {
+          // Removing an id cannot introduce an unknown one.
+        }
+      }
+      if (registry && typeof registry.unpinSession === 'function') {
+        try {
+          await registry.unpinSession(id)
+        } catch {
+          // Already unpinned or unknown; both are harmless.
+        }
+      }
       writeFileSync(join(entryDir, 'manifest.json'), JSON.stringify({
         id,
         entryName,

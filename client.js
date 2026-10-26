@@ -1069,7 +1069,7 @@ window.__ModuleLoader__.load({
                 ? h(
                     'div',
                     { style: loadedHintStyle },
-                    '提示：仍被应用保留（已打开）的会话会先登记，在下次启动 DSH 时自动移入回收站；当前使用不受影响。',
+                    '提示：仍被应用保留（已打开）的会话会立即从侧边栏隐藏（归档），日志文件在下次启动 DSH 时才移入回收站；期间不影响任何使用。',
                   )
                 : null,
               dialog.phase === 'done' && skipped.length > 0
