@@ -1063,6 +1063,14 @@ window.__ModuleLoader__.load({
                     h('span', null, `一并删除 ${forkCandidates} 个分叉会话`),
                   )
                 : null,
+              dialog.phase === 'ready'
+                && families.some((family) => (family.blockers || []).some((blocker) => blocker.code === 'loaded'))
+                ? h(
+                    'div',
+                    { style: loadedHintStyle },
+                    '提示：被应用打开/激活过的会话需要重启 DSH 后才能移入回收站（切换会话或归档都不会释放它）。',
+                  )
+                : null,
               dialog.phase === 'done' && skipped.length > 0
                 ? h('div', { style: dialogListStyle }, skipped.map((result) => h(
                     'div',
@@ -1647,6 +1655,16 @@ window.__ModuleLoader__.load({
       opacity: 0.85,
       margin: '4px 0 10px',
       cursor: 'pointer',
+    }
+    const loadedHintStyle = {
+      fontSize: 12,
+      lineHeight: 1.6,
+      padding: '8px 10px',
+      margin: '4px 0 10px',
+      borderRadius: 6,
+      border: '1px solid color-mix(in srgb, #f0b37e 45%, transparent)',
+      color: '#f0b37e',
+      background: 'color-mix(in srgb, #f0b37e 10%, transparent)',
     }
     const purgeInputStyle = {
       width: '100%',

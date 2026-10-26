@@ -817,7 +817,7 @@ async function buildDeletePreflight(ctx, ids, signal, includeForks) {
         // its in-memory summary), so moving it would leave a ghost behind.
         blockers.push({
           code: 'loaded',
-          message: `${label}仍被应用打开，请先关闭该会话或重启应用后再试`,
+          message: `${label}仍被应用打开，需要重启 DSH 后才能移入回收站`,
         })
       }
       members.push({
