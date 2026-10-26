@@ -60,6 +60,8 @@ const TRASH_RESTORE_PATH = '/api/sessions-library/trash-restore'
 const TRASH_PURGE_PATH = '/api/sessions-library/trash-purge'
 const DELETE_BATCH_LIMIT = 100
 const PURGE_AUDIT_FILE = join(DSH_HOME, 'sessions-library', 'audit.log')
+// Sessions deleted while still loaded are queued here and moved on next start.
+const PENDING_TRASH_FILE = join(DSH_HOME, 'sessions-library', 'pending-trash.json')
 
 // Identifies one Host process. The Client compares it with the value it stored
 // last time: a different value means DSH restarted, so view state resets.
@@ -398,6 +400,37 @@ async function readTitles(ctx, sessionIds, signal, requestId) {
 }
 
 /**
+ * Read the deferred-deletion registry (sessions deleted while still loaded).
+ *
+ * @returns {Record<string, object>} session id to its pending record.
+ */
+function readPendingTrash() {
+  try {
+    const parsed = JSON.parse(readFileSync(PENDING_TRASH_FILE, 'utf8'))
+    if (parsed && typeof parsed === 'object' && parsed.items && typeof parsed.items === 'object') {
+      return parsed.items
+    }
+    return {}
+  } catch {
+    return {}
+  }
+}
+
+/**
+ * Persist the deferred-deletion registry.
+ *
+ * @param {Record<string, object>} items session id to its pending record.
+ */
+function writePendingTrash(items) {
+  try {
+    mkdirSync(dirname(PENDING_TRASH_FILE), { recursive: true })
+    writeFileSync(PENDING_TRASH_FILE, JSON.stringify({ items }, null, 2))
+  } catch {
+    // Best effort: an unreadable registry only delays the move.
+  }
+}
+
+/**
  * Read the durable session list: the authoritative set of stored sessions.
  *
  * @param {object} ctx Cordis context.
@@ -468,6 +501,10 @@ async function buildSnapshot(ctx, signal, requestId) {
     // Persistence unavailable: fall back to the live summaries.
     sessions = summaryResult.items.map((summary) => ({ ...summary }))
   }
+
+  // Sessions whose deletion is deferred until the next start stay hidden.
+  const pendingIds = new Set(Object.keys(readPendingTrash()))
+  if (pendingIds.size > 0) sessions = sessions.filter((session) => !pendingIds.has(session.id))
 
   // Titles for migration-required sessions would force a format migration per
   // session; the page can show the unnamed label instead of paying that on the
@@ -925,6 +962,8 @@ async function trashSessions(ctx, rawIds, signal, includeForks) {
   const archived = new Set(baseline.baseline.archivedSessionIds)
   const pinned = new Set(baseline.baseline.pinnedSessionIds)
   const registry = ctx.get('workspaceRegistry')
+  const pending = readPendingTrash()
+  let pendingChanged = false
   const results = []
   const families = []
 
@@ -945,6 +984,21 @@ async function trashSessions(ctx, rawIds, signal, includeForks) {
     const memberIds = family.members.map((member) => member.id)
 
     for (const member of family.members) {
+      // A loaded session still holds its write handle: moving its log now would
+      // break the Agent (ENOENT on the next turn). Queue it for the next start.
+      if (member.loaded === true && member.running !== true) {
+        pending[member.id] = {
+          requestedAt: Date.now(),
+          familyRoot: family.rootId,
+          role: member.role,
+          title: member.title,
+          cwd: member.cwd ?? null,
+        }
+        pendingChanged = true
+        trace('trash', 'deferred', `id=${member.id} family=${family.rootId}`)
+        results.push({ id: member.id, familyRoot: family.rootId, role: member.role, status: 'deferred' })
+        continue
+      }
       try {
         const dir = findSessionDir(member.id)
         if (!dir) {
@@ -1002,6 +1056,8 @@ async function trashSessions(ctx, rawIds, signal, includeForks) {
 
     families.push({ familyRoot: family.rootId, memberCount: memberIds.length })
   }
+
+  if (pendingChanged) writePendingTrash(pending)
 
   return { results, families }
 }
@@ -1156,6 +1212,62 @@ async function purgeTrashEntries(rawNames) {
 }
 
 /**
+ * Move deferred trash requests into the recycle bin.
+ *
+ * Runs shortly after start, when no Agent is live yet, so moving a stored
+ * session is always safe. Failures stay queued for the next attempt.
+ *
+ * @param {object} ctx Cordis context.
+ * @returns {Promise<void>} resolution after every queued session was handled.
+ */
+async function flushPendingTrash(ctx) {
+  const items = readPendingTrash()
+  const ids = Object.keys(items)
+  if (ids.length === 0) return
+
+  const registry = ctx.get('workspaceRegistry')
+  const remaining = {}
+  for (const id of ids) {
+    const record = items[id] && typeof items[id] === 'object' ? items[id] : {}
+    try {
+      const dir = findSessionDir(id)
+      if (!dir) {
+        trace('trash', 'deferred-skip', `id=${id} already gone`)
+        continue
+      }
+      const deletedAt = Date.now()
+      const entryName = `${deletedAt}-${id}`
+      const entryDir = join(TRASH_ROOT, entryName)
+      mkdirSync(entryDir, { recursive: true })
+      renameSync(dir, join(entryDir, 'session'))
+      const workspaceIds = await detachFromWorkspaces(registry, id)
+      writeFileSync(join(entryDir, 'manifest.json'), JSON.stringify({
+        id,
+        entryName,
+        role: typeof record.role === 'string' ? record.role : 'root',
+        familyRoot: typeof record.familyRoot === 'string' ? record.familyRoot : id,
+        memberIds: [id],
+        title: typeof record.title === 'string' ? record.title : null,
+        cwd: typeof record.cwd === 'string' ? record.cwd : null,
+        projectDirName: basename(dirname(dir)),
+        originalDir: dir,
+        workspaceIds,
+        archived: false,
+        pinned: false,
+        sizeBytes: dirSize(join(entryDir, 'session')),
+        deletedAt,
+        deferred: true,
+      }, null, 2))
+      trace('trash', 'deferred-ok', `id=${id}`)
+    } catch (error) {
+      remaining[id] = record
+      trace('trash', 'deferred-fail', `id=${id} ${describeError(error)}`)
+    }
+  }
+  writePendingTrash(remaining)
+}
+
+/**
  * Activate the Host half.
  *
  * @param {object} ctx Cordis context.
@@ -1274,4 +1386,11 @@ export function apply(ctx) {
     })
   }, SELF_TEST_DELAY_MS)
   ctx.effect(() => () => clearTimeout(timer), 'sessions-library: self-test')
+
+  // Deferred deletions are queued while the session was still loaded; move them
+  // now that no Agent is live.
+  const flushTimer = setTimeout(() => {
+    flushPendingTrash(ctx).catch((error) => trace('trash', 'deferred-fail', describeError(error)))
+  }, 6000)
+  ctx.effect(() => () => clearTimeout(flushTimer), 'sessions-library: deferred trash flush')
 }

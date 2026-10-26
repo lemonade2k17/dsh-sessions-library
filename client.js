@@ -975,7 +975,8 @@ window.__ModuleLoader__.load({
           const families = dialog.families || []
           const results = dialog.results || []
           const trashed = results.filter((result) => result.status === 'trashed')
-          const skipped = results.filter((result) => result.status !== 'trashed')
+          const deferred = results.filter((result) => result.status === 'deferred')
+          const skipped = results.filter((result) => result.status !== 'trashed' && result.status !== 'deferred')
           const blocked = families.filter((family) => family.canTrash === false)
           const memberTotal = families.reduce((sum, family) => sum + family.memberCount, 0)
           const forkTotal = families.reduce((sum, family) => sum + family.forkCount, 0)
@@ -1044,7 +1045,7 @@ window.__ModuleLoader__.load({
                 'p',
                 { style: dialogHintStyle },
                 dialog.phase === 'done'
-                  ? `成功 ${trashed.length} 个会话，跳过 ${skipped.length} 个。可从回收站恢复。`
+                  ? `已移入 ${trashed.length} 个会话${deferred.length > 0 ? `，${deferred.length} 个将在下次启动 DSH 时自动移入` : ''}${skipped.length > 0 ? `，跳过 ${skipped.length} 个` : ''}。可从回收站恢复。`
                   : `将移入 ${memberTotal} 个会话${dialog.includeForks === true ? '（含分叉）' : ''}；子智能体/队友会一并移入，可从回收站恢复，不会彻底删除文件。`,
               ),
               dialog.phase === 'loading' ? h('div', { style: dialogTextStyle }, '正在检查…') : null,
@@ -1068,7 +1069,7 @@ window.__ModuleLoader__.load({
                 ? h(
                     'div',
                     { style: loadedHintStyle },
-                    '提示：有会话仍被应用保留（已打开）。可以移入回收站，但原生侧边栏里的残留要重启 DSH 后才会消失。',
+                    '提示：仍被应用保留（已打开）的会话会先登记，在下次启动 DSH 时自动移入回收站；当前使用不受影响。',
                   )
                 : null,
               dialog.phase === 'done' && skipped.length > 0
