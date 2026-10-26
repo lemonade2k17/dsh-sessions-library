@@ -940,6 +940,27 @@ function readTrashEntries() {
     })
   }
 
+  // Deferred deletions are listed as pending entries so they appear in the
+  // recycle bin immediately, before their log is moved on the next start.
+  const pending = readPendingTrash()
+  for (const id of Object.keys(pending)) {
+    const record = pending[id] && typeof pending[id] === 'object' ? pending[id] : {}
+    const dir = findSessionDir(id)
+    entries.push({
+      entryName: `pending:${id}`,
+      sessionId: id,
+      title: typeof record.title === 'string' ? record.title : null,
+      role: typeof record.role === 'string' ? record.role : 'root',
+      familyRoot: typeof record.familyRoot === 'string' ? record.familyRoot : id,
+      memberCount: 1,
+      cwd: typeof record.cwd === 'string' ? record.cwd : null,
+      deletedAt: typeof record.requestedAt === 'number' ? record.requestedAt : Date.now(),
+      sizeBytes: dir ? dirSize(dir) : 0,
+      restoreAvailable: true,
+      pending: true,
+    })
+  }
+
   entries.sort((left, right) => right.deletedAt - left.deletedAt)
   return entries
 }
@@ -1002,6 +1023,7 @@ async function trashSessions(ctx, rawIds, signal, includeForks) {
           role: member.role,
           title: member.title,
           cwd: member.cwd ?? null,
+          archivedByDelete: true,
         }
         pendingChanged = true
         trace('trash', 'deferred', `id=${member.id} family=${family.rootId}`)
@@ -1085,6 +1107,24 @@ async function restoreTrashEntries(ctx, rawNames, signal) {
   const results = []
 
   for (const rawName of Array.isArray(rawNames) ? rawNames : []) {
+    if (typeof rawName === 'string' && rawName.startsWith('pending:')) {
+      const pendingId = rawName.slice('pending:'.length)
+      const currentPending = readPendingTrash()
+      if (!currentPending[pendingId]) {
+        results.push({ entryName: rawName, status: 'failed', reason: '找不到待移入条目' })
+        continue
+      }
+      delete currentPending[pendingId]
+      writePendingTrash(currentPending)
+      try {
+        if (registry && typeof registry.unarchiveSession === 'function') await registry.unarchiveSession(pendingId)
+      } catch {
+        // The session was archived only to hide it during deletion.
+      }
+      trace('restore', 'end', `ok pending id=${pendingId}`)
+      results.push({ entryName: rawName, sessionId: pendingId, status: 'restored' })
+      continue
+    }
     if (typeof rawName !== 'string' || !allowed.has(rawName)) {
       results.push({ entryName: String(rawName), status: 'failed', reason: '回收站中找不到该条目' })
       continue
@@ -1183,6 +1223,14 @@ async function purgeTrashEntries(rawNames) {
   const purged = []
 
   for (const rawName of Array.isArray(rawNames) ? rawNames : []) {
+    if (typeof rawName === 'string' && rawName.startsWith('pending:')) {
+      results.push({
+        entryName: rawName,
+        status: 'failed',
+        reason: '该会话尚未完成移入（需重启 DSH 后才能彻底删除）',
+      })
+      continue
+    }
     if (typeof rawName !== 'string' || !byName.has(rawName)) {
       results.push({ entryName: String(rawName), status: 'failed', reason: '回收站中找不到该条目' })
       continue

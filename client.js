@@ -959,6 +959,7 @@ window.__ModuleLoader__.load({
                     { style: badgeStyle },
                     entry.role === 'subagent' ? '子智能体/队友' : entry.role === 'fork' ? '分叉' : '会话',
                   ),
+                  entry.pending === true ? h('span', { style: badgeStyle }, '待重启整理') : null,
                   h(
                     'span',
                     { style: sessionTitleStyle },
@@ -1069,7 +1070,7 @@ window.__ModuleLoader__.load({
                 ? h(
                     'div',
                     { style: loadedHintStyle },
-                    '提示：仍被应用保留（已打开）的会话会立即从侧边栏隐藏（归档），日志文件在下次启动 DSH 时才移入回收站；期间不影响任何使用。',
+                    '提示：仍被应用保留（已打开）的会话会立即从侧边栏隐藏并出现在回收站（标为待重启整理），日志文件在下次启动 DSH 时完成移动；期间不影响任何使用。',
                   )
                 : null,
               dialog.phase === 'done' && skipped.length > 0
