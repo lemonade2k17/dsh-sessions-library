@@ -1029,7 +1029,7 @@ window.__ModuleLoader__.load({
                 )
               : null,
             family.blockers.length > 0
-              ? h('div', { style: warnStyle }, family.blockers.map((blocker) => blocker.message).join('；'))
+              ? h('div', { style: dialogBlockerStyle }, family.blockers.map((blocker) => blocker.message).join('；'))
               : null,
           ))
 
@@ -1049,7 +1049,7 @@ window.__ModuleLoader__.load({
               ),
               dialog.phase === 'loading' ? h('div', { style: dialogTextStyle }, '正在检查…') : null,
               dialog.phase === 'busy' ? h('div', { style: dialogTextStyle }, '正在移入回收站…') : null,
-              dialog.phase === 'error' ? h('div', { style: warnStyle }, `失败：${dialog.error}`) : null,
+              dialog.phase === 'error' ? h('div', { style: dialogBlockerStyle }, `失败：${dialog.error}`) : null,
               dialog.phase === 'ready' ? h('div', { style: dialogListStyle }, familyBlocks) : null,
               dialog.phase === 'ready' && forkCandidates > 0
                 ? h(
@@ -1152,7 +1152,7 @@ window.__ModuleLoader__.load({
                   : `将永久删除 ${sessionCount} 个会话（${(totalBytes / 1048576).toFixed(1)} MB）。此操作不可恢复；附件与成本账本不会被清理。`,
               ),
               purgeDialog.phase === 'confirm' ? h('div', { style: dialogListStyle }, familyBlocks) : null,
-              purgeDialog.error ? h('div', { style: warnStyle }, `失败：${purgeDialog.error}`) : null,
+              purgeDialog.error ? h('div', { style: dialogBlockerStyle }, `失败：${purgeDialog.error}`) : null,
               purgeDialog.phase === 'confirm'
                 ? h(
                     'div',
@@ -1678,6 +1678,16 @@ window.__ModuleLoader__.load({
       fontSize: 13,
     }
     const placeholderStyle = { padding: '40px 10px', fontSize: 13, opacity: 0.55, textAlign: 'center' }
+    const dialogBlockerStyle = {
+      fontSize: 12,
+      lineHeight: 1.6,
+      padding: '6px 8px',
+      margin: '6px 0 2px',
+      borderRadius: 6,
+      color: '#f0b37e',
+      background: 'color-mix(in srgb, #f0b37e 12%, transparent)',
+      textAlign: 'left',
+    }
     const warnStyle = {
       flex: '0 0 auto',
       padding: '6px 24px',
