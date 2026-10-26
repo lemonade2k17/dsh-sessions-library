@@ -1140,7 +1140,7 @@ window.__ModuleLoader__.load({
                   : `将永久删除 ${sessionCount} 个会话（${(totalBytes / 1048576).toFixed(1)} MB）。此操作不可恢复；附件与成本账本不会被清理。`,
               ),
               purgeDialog.phase === 'confirm' ? h('div', { style: dialogListStyle }, familyBlocks) : null,
-              purgeDialog.phase === 'error' ? h('div', { style: warnStyle }, `失败：${purgeDialog.error}`) : null,
+              purgeDialog.error ? h('div', { style: warnStyle }, `失败：${purgeDialog.error}`) : null,
               purgeDialog.phase === 'confirm'
                 ? h(
                     'div',
