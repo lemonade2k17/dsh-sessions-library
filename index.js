@@ -639,14 +639,52 @@ async function detachFromWorkspaces(registry, sessionId) {
 }
 
 /**
- * Build the delete preflight for the requested sessions.
+ * Collect one deletion family.
+ *
+ * A family is the root plus every `origin: 'subagent'` descendant (subagent and
+ * Agent Teams teammate sessions). Fork children are returned separately and
+ * stay in place unless `includeForks` is set, because their logs carry their
+ * own copy of the inherited prefix.
+ *
+ * @param {string} rootId family root session id.
+ * @param {Map<string, object>} byId persistence snapshots by session id.
+ * @param {Map<string, string[]>} childrenByParent session id to child ids.
+ * @param {boolean} includeForks whether fork children join the family.
+ * @returns {{ members: Array<{ id: string, role: string }>, forks: string[] }} family members and kept forks.
+ */
+function collectFamily(rootId, byId, childrenByParent, includeForks) {
+  const members = []
+  const forks = []
+  const seen = new Set([rootId])
+  const queue = [{ id: rootId, role: 'root' }]
+  while (queue.length > 0) {
+    const current = queue.shift()
+    members.push(current)
+    for (const childId of childrenByParent.get(current.id) ?? []) {
+      if (seen.has(childId)) continue
+      seen.add(childId)
+      const child = byId.get(childId)
+      const isSubagent = Boolean(child && child.header.origin === 'subagent')
+      if (!isSubagent && !includeForks) {
+        forks.push(childId)
+        continue
+      }
+      queue.push({ id: childId, role: isSubagent ? 'subagent' : 'fork' })
+    }
+  }
+  return { members, forks }
+}
+
+/**
+ * Build the delete preflight: one family per requested root session.
  *
  * @param {object} ctx Cordis context.
- * @param {string[]} ids requested session ids.
+ * @param {string[]} ids requested root session ids.
  * @param {AbortSignal} signal request cancellation.
- * @returns {Promise<Array<object>>} one preflight item per session.
+ * @param {boolean} includeForks whether fork children travel with the family.
+ * @returns {Promise<Array<object>>} one family per requested root.
  */
-async function buildDeletePreflight(ctx, ids, signal) {
+async function buildDeletePreflight(ctx, ids, signal, includeForks) {
   const persistence = ctx.get('sessionPersistence')
   let snapshots = []
   if (persistence && typeof persistence.list === 'function') {
@@ -656,12 +694,15 @@ async function buildDeletePreflight(ctx, ids, signal) {
 
   const byId = new Map(snapshots.map((snapshot) => [String(snapshot.header.id), snapshot]))
   const childrenByParent = new Map()
+  const parentById = new Map()
   for (const snapshot of snapshots) {
     const parent = snapshot.header.parentSession
     if (!parent) continue
-    const key = String(parent)
-    if (!childrenByParent.has(key)) childrenByParent.set(key, [])
-    childrenByParent.get(key).push(String(snapshot.header.id))
+    const childId = String(snapshot.header.id)
+    const parentId = String(parent)
+    parentById.set(childId, parentId)
+    if (!childrenByParent.has(parentId)) childrenByParent.set(parentId, [])
+    childrenByParent.get(parentId).push(childId)
   }
 
   const agents = ctx.get('agents')
@@ -673,48 +714,79 @@ async function buildDeletePreflight(ctx, ids, signal) {
       for (const item of outcome.value.items) runningById.set(String(item.sessionId), item.running === true)
     }
   }
-  const titleResult = await readTitles(ctx, ids, signal, 'delete-preflight')
-  const items = []
 
-  for (const id of ids) {
-    const snapshot = byId.get(id)
-    const blockers = []
-    const warnings = []
-    if (!snapshot) blockers.push({ code: 'missing', message: '会话不存在' })
-
-    // `agents.get` means the session is loaded/retained, not that a turn is
-    // executing; only the summary's `running` flag blocks the move.
-    let loaded = false
-    try {
-      loaded = Boolean(agents && typeof agents.get === 'function' && agents.get(id))
-    } catch {
-      loaded = false
+  // Drop requested ids that sit inside another requested id's family: the
+  // ancestor's family already covers them.
+  const requested = new Set(ids)
+  const roots = ids.filter((id) => {
+    let cursor = parentById.get(id)
+    const visited = new Set()
+    while (cursor && !visited.has(cursor)) {
+      if (requested.has(cursor)) return false
+      visited.add(cursor)
+      cursor = parentById.get(cursor)
     }
-    const running = runningById.get(id) === true
-    if (running) blockers.push({ code: 'running', message: '会话正在运行' })
-    else if (loaded) warnings.push({ code: 'loaded', message: '会话仍被应用保留，移入可能失败' })
+    return true
+  })
 
-    const children = childrenByParent.get(id) ?? []
-    if (children.length > 0) blockers.push({ code: 'has-children', message: `有 ${children.length} 个子会话` })
-    if (snapshot && snapshot.header.isSeeded) warnings.push({ code: 'seeded', message: '这是分叉出的子会话' })
+  const collected = roots.map((rootId) => collectFamily(rootId, byId, childrenByParent, includeForks))
+  const memberIds = [...new Set(collected.flatMap((family) => family.members.map((member) => member.id)))]
+  const titleResult = await readTitles(ctx, memberIds, signal, 'delete-preflight')
 
-    const dir = findSessionDir(id)
-    items.push({
-      id,
-      title: titleResult.titles.get(id) ?? null,
-      exists: Boolean(snapshot),
-      running,
-      seeded: Boolean(snapshot && snapshot.header.isSeeded),
-      childCount: children.length,
-      cwd: snapshot && typeof snapshot.header.cwd === 'string' ? snapshot.header.cwd : null,
-      sizeBytes: dir ? dirSize(dir) : 0,
-      canTrash: blockers.length === 0,
+  const families = []
+  for (let index = 0; index < roots.length; index += 1) {
+    const rootId = roots[index]
+    const family = collected[index]
+    const blockers = []
+    const members = []
+
+    for (const entry of family.members) {
+      const snapshot = byId.get(entry.id)
+      const dir = findSessionDir(entry.id)
+      const label = entry.role === 'root' ? '会话' : '家族成员'
+      let loaded = false
+      try {
+        loaded = Boolean(agents && typeof agents.get === 'function' && agents.get(entry.id))
+      } catch {
+        loaded = false
+      }
+      const running = runningById.get(entry.id) === true
+      if (!snapshot) blockers.push({ code: 'missing', message: `${label}不存在` })
+      if (running) blockers.push({ code: 'running', message: `${label}正在运行` })
+      members.push({
+        id: entry.id,
+        role: entry.role,
+        title: titleResult.titles.get(entry.id) ?? null,
+        running,
+        loaded,
+        sizeBytes: dir ? dirSize(dir) : 0,
+        cwd: snapshot && typeof snapshot.header.cwd === 'string' ? snapshot.header.cwd : null,
+      })
+    }
+
+    const forks = family.forks.map((forkId) => {
+      const dir = findSessionDir(forkId)
+      return {
+        id: forkId,
+        title: titleResult.titles.get(forkId) ?? null,
+        sizeBytes: dir ? dirSize(dir) : 0,
+      }
+    })
+
+    families.push({
+      rootId,
+      rootTitle: titleResult.titles.get(rootId) ?? null,
+      members,
+      forks,
+      memberCount: members.length,
+      forkCount: forks.length,
+      totalBytes: members.reduce((sum, member) => sum + member.sizeBytes, 0),
+      canTrash: blockers.length === 0 && members.length > 0,
       blockers,
-      warnings,
     })
   }
 
-  return items
+  return families
 }
 
 /**
@@ -749,6 +821,11 @@ function readTrashEntries() {
       entryName: name,
       sessionId: manifest && typeof manifest.id === 'string' ? manifest.id : name.replace(/^\d+-/, ''),
       title: manifest && typeof manifest.title === 'string' ? manifest.title : null,
+      role: manifest && typeof manifest.role === 'string' ? manifest.role : 'root',
+      familyRoot: manifest && typeof manifest.familyRoot === 'string'
+        ? manifest.familyRoot
+        : (manifest && typeof manifest.id === 'string' ? manifest.id : name.replace(/^\d+-/, '')),
+      memberCount: manifest && Array.isArray(manifest.memberIds) ? manifest.memberIds.length : 1,
       cwd: manifest && typeof manifest.cwd === 'string' ? manifest.cwd : null,
       deletedAt: manifest && typeof manifest.deletedAt === 'number' ? manifest.deletedAt : (Number.isFinite(timestamp) ? timestamp : 0),
       sizeBytes: dirSize(entryDir),
@@ -761,83 +838,102 @@ function readTrashEntries() {
 }
 
 /**
- * Move sessions into the recycle bin.
+ * Move whole families into the recycle bin.
  *
  * @param {object} ctx Cordis context.
- * @param {any} rawIds requested session ids.
+ * @param {any} rawIds requested root session ids.
  * @param {AbortSignal} signal request cancellation.
- * @returns {Promise<Array<object>>} one result per session.
+ * @param {boolean} includeForks whether fork children travel with the family.
+ * @returns {Promise<{ results: Array<object>, families: Array<object> }>} per-member results and family summaries.
  */
-async function trashSessions(ctx, rawIds, signal) {
+async function trashSessions(ctx, rawIds, signal, includeForks) {
   const ids = normalizeIds(rawIds)
-  if (ids.length === 0) return []
+  if (ids.length === 0) return { results: [], families: [] }
 
-  const preflight = await buildDeletePreflight(ctx, ids, signal)
+  const preflight = await buildDeletePreflight(ctx, ids, signal, includeForks)
   const baseline = await readWorkspaceBaseline(ctx, 'trash')
   const archived = new Set(baseline.baseline.archivedSessionIds)
   const pinned = new Set(baseline.baseline.pinnedSessionIds)
   const registry = ctx.get('workspaceRegistry')
   const results = []
+  const families = []
 
-  for (const item of preflight) {
-    if (!item.canTrash) {
-      results.push({ id: item.id, status: 'skipped', reason: item.blockers.map((blocker) => blocker.message).join('；') })
+  for (const family of preflight) {
+    if (!family.canTrash) {
+      for (const member of family.members) {
+        results.push({
+          id: member.id,
+          familyRoot: family.rootId,
+          status: 'skipped',
+          reason: family.blockers.map((blocker) => blocker.message).join('；'),
+        })
+      }
       continue
     }
-    try {
-      const dir = findSessionDir(item.id)
-      if (!dir) {
-        results.push({ id: item.id, status: 'failed', reason: '找不到会话目录' })
-        continue
-      }
-      const deletedAt = Date.now()
-      const entryName = `${deletedAt}-${item.id}`
-      const entryDir = join(TRASH_ROOT, entryName)
-      mkdirSync(entryDir, { recursive: true })
 
-      // Move first (atomic on one volume), then record and clean accounting:
-      // a failure after the move still leaves a recoverable trash entry.
-      renameSync(dir, join(entryDir, 'session'))
+    const deletedAt = Date.now()
+    const memberIds = family.members.map((member) => member.id)
 
-      const workspaceIds = await detachFromWorkspaces(registry, item.id)
-      if (archived.has(item.id) && registry && typeof registry.unarchiveSession === 'function') {
-        try {
-          await registry.unarchiveSession(item.id)
-        } catch {
-          // Removal cannot introduce an unknown id, so a failure is cosmetic.
+    for (const member of family.members) {
+      try {
+        const dir = findSessionDir(member.id)
+        if (!dir) {
+          results.push({ id: member.id, familyRoot: family.rootId, status: 'failed', reason: '找不到会话目录' })
+          continue
         }
-      }
-      if (pinned.has(item.id) && registry && typeof registry.unpinSession === 'function') {
-        try {
-          await registry.unpinSession(item.id)
-        } catch {
-          // Same as above.
+        const entryName = `${deletedAt}-${member.id}`
+        const entryDir = join(TRASH_ROOT, entryName)
+        mkdirSync(entryDir, { recursive: true })
+
+        // Move first (atomic on one volume), then record and clean accounting:
+        // a failure after the move still leaves a recoverable trash entry.
+        renameSync(dir, join(entryDir, 'session'))
+
+        const workspaceIds = await detachFromWorkspaces(registry, member.id)
+        if (archived.has(member.id) && registry && typeof registry.unarchiveSession === 'function') {
+          try {
+            await registry.unarchiveSession(member.id)
+          } catch {
+            // Removal cannot introduce an unknown id, so a failure is cosmetic.
+          }
         }
+        if (pinned.has(member.id) && registry && typeof registry.unpinSession === 'function') {
+          try {
+            await registry.unpinSession(member.id)
+          } catch {
+            // Same as above.
+          }
+        }
+
+        writeFileSync(join(entryDir, 'manifest.json'), JSON.stringify({
+          id: member.id,
+          entryName,
+          role: member.role,
+          familyRoot: family.rootId,
+          memberIds,
+          title: member.title,
+          cwd: member.cwd ?? null,
+          projectDirName: basename(dirname(dir)),
+          originalDir: dir,
+          workspaceIds,
+          archived: archived.has(member.id),
+          pinned: pinned.has(member.id),
+          sizeBytes: member.sizeBytes,
+          deletedAt,
+        }, null, 2))
+
+        trace('trash', 'end', `ok id=${member.id} family=${family.rootId} role=${member.role} entry=${entryName}`)
+        results.push({ id: member.id, familyRoot: family.rootId, role: member.role, status: 'trashed', entryName })
+      } catch (error) {
+        trace('trash', 'end', `throw id=${member.id} ${describeError(error)}`)
+        results.push({ id: member.id, familyRoot: family.rootId, status: 'failed', reason: describeError(error) })
       }
-
-      writeFileSync(join(entryDir, 'manifest.json'), JSON.stringify({
-        id: item.id,
-        entryName,
-        title: item.title,
-        cwd: item.cwd ?? null,
-        projectDirName: basename(dirname(dir)),
-        originalDir: dir,
-        workspaceIds,
-        archived: archived.has(item.id),
-        pinned: pinned.has(item.id),
-        sizeBytes: item.sizeBytes,
-        deletedAt,
-      }, null, 2))
-
-      trace('trash', 'end', `ok id=${item.id} entry=${entryName}`)
-      results.push({ id: item.id, status: 'trashed', entryName })
-    } catch (error) {
-      trace('trash', 'end', `throw id=${item.id} ${describeError(error)}`)
-      results.push({ id: item.id, status: 'failed', reason: describeError(error) })
     }
+
+    families.push({ familyRoot: family.rootId, memberCount: memberIds.length })
   }
 
-  return results
+  return { results, families }
 }
 
 /**
@@ -950,8 +1046,13 @@ export function apply(ctx) {
         label: 'delete-preflight',
         handler: async (request) => {
           const body = await readJsonBody(request)
-          const items = await buildDeletePreflight(ctx, normalizeIds(body.sessionIds), request.signal)
-          return jsonResponse({ ok: true, items })
+          const families = await buildDeletePreflight(
+            ctx,
+            normalizeIds(body.sessionIds),
+            request.signal,
+            body.includeForks === true,
+          )
+          return jsonResponse({ ok: true, families })
         },
       },
       {
@@ -959,8 +1060,8 @@ export function apply(ctx) {
         label: 'delete',
         handler: async (request) => {
           const body = await readJsonBody(request)
-          const results = await trashSessions(ctx, body.sessionIds, request.signal)
-          return jsonResponse({ ok: true, results })
+          const outcome = await trashSessions(ctx, body.sessionIds, request.signal, body.includeForks === true)
+          return jsonResponse({ ok: true, results: outcome.results, families: outcome.families })
         },
       },
       {

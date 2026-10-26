@@ -608,29 +608,48 @@ window.__ModuleLoader__.load({
           setView('library')
         }
 
-        async function beginDelete() {
+        async function beginDelete(includeForks) {
           const ids = selectedVisibleIds()
           if (ids.length === 0) return
-          setDialog({ phase: 'loading', items: [], results: [], error: null })
+          const withForks = includeForks === true
+          setDialog({ phase: 'loading', families: [], results: [], includeForks: withForks, error: null })
           try {
-            const payload = await postJson('api/sessions-library/delete-preflight', { sessionIds: ids })
-            setDialog({ phase: 'ready', items: Array.isArray(payload.items) ? payload.items : [], results: [], error: null })
+            const payload = await postJson('api/sessions-library/delete-preflight', {
+              sessionIds: ids,
+              includeForks: withForks,
+            })
+            setDialog({
+              phase: 'ready',
+              families: Array.isArray(payload.families) ? payload.families : [],
+              results: [],
+              includeForks: withForks,
+              error: null,
+            })
           } catch (failure) {
             setDialog({
               phase: 'error',
-              items: [],
+              families: [],
               results: [],
+              includeForks: withForks,
               error: failure && failure.message ? failure.message : String(failure),
             })
           }
         }
 
+        function toggleIncludeForks() {
+          beginDelete(dialog === null || dialog.includeForks !== true)
+        }
+
         async function confirmDelete() {
           const ids = selectedVisibleIds()
           if (ids.length === 0) return
+          const withForks = dialog === null || dialog.includeForks === true
           setDialog((current) => ({ ...(current || {}), phase: 'busy' }))
           try {
-            const payload = await postJson('api/sessions-library/delete', { sessionIds: ids })
+            const payload = await postJson('api/sessions-library/delete', {
+              sessionIds: ids,
+              includeForks: withForks,
+            })
             const results = Array.isArray(payload.results) ? payload.results : []
             const trashedIds = results.filter((result) => result.status === 'trashed').map((result) => result.id)
             setDialog((current) => ({ ...(current || {}), phase: 'done', results }))
@@ -651,10 +670,10 @@ window.__ModuleLoader__.load({
           }
         }
 
-        async function restoreEntry(entryName) {
+        async function restoreFamily(entryNames) {
           setTrashError(null)
           try {
-            const payload = await postJson('api/sessions-library/trash-restore', { entryNames: [entryName] })
+            const payload = await postJson('api/sessions-library/trash-restore', { entryNames })
             const results = Array.isArray(payload.results) ? payload.results : []
             const failed = results.find((result) => result.status !== 'restored')
             if (failed) setTrashError(failed.reason || '恢复失败')
@@ -803,48 +822,125 @@ window.__ModuleLoader__.load({
           if (trash.length === 0) {
             return h('div', { style: placeholderStyle }, '回收站是空的')
           }
+
+          // Group entries into the families they were deleted as.
+          const families = []
+          const byFamily = new Map()
+          for (const entry of trash) {
+            const key = entry.familyRoot || entry.sessionId
+            if (!byFamily.has(key)) {
+              const family = { key, entries: [], deletedAt: 0, totalBytes: 0 }
+              byFamily.set(key, family)
+              families.push(family)
+            }
+            const family = byFamily.get(key)
+            family.entries.push(entry)
+            family.deletedAt = Math.max(family.deletedAt, entry.deletedAt || 0)
+            family.totalBytes += entry.sizeBytes || 0
+          }
+          families.sort((left, right) => right.deletedAt - left.deletedAt)
+
           return h(
             'div',
             null,
             trashError !== null ? h('div', { style: warnStyle }, trashError) : null,
-            trash.map((entry) => h(
-              'div',
-              { key: entry.entryName, style: trashRowStyle },
-              h(
-                'span',
-                { style: sessionTitleStyle },
-                entry.title && entry.title.trim() !== '' ? entry.title : entry.sessionId,
-              ),
-              h('span', { style: trashMetaStyle }, formatRelative(entry.deletedAt)),
-              h('span', { style: trashMetaStyle }, `${(entry.sizeBytes / 1048576).toFixed(1)} MB`),
-              entry.restoreAvailable
-                ? h(
-                    'button',
-                    { className: 'sl-btn', style: actionButtonStyle, onClick: () => restoreEntry(entry.entryName) },
-                    '恢复',
-                  )
-                : h('span', { style: badgeStyle }, '数据缺失'),
-            )),
+            families.map((family) => {
+              const rootEntry = family.entries.find((entry) => entry.role === 'root') || family.entries[0]
+              const canRestore = family.entries.every((entry) => entry.restoreAvailable === true)
+              return h(
+                'div',
+                { key: family.key, style: dialogFamilyStyle },
+                h(
+                  'div',
+                  { style: dialogFamilyHeadStyle },
+                  h(
+                    'span',
+                    { style: sessionTitleStyle },
+                    rootEntry.title && rootEntry.title.trim() !== '' ? rootEntry.title : rootEntry.sessionId,
+                  ),
+                  h('span', { style: badgeStyle }, `${family.entries.length} 个会话`),
+                  h('span', { style: trashMetaStyle }, formatRelative(family.deletedAt)),
+                  h('span', { style: trashMetaStyle }, `${(family.totalBytes / 1048576).toFixed(1)} MB`),
+                  canRestore
+                    ? h(
+                        'button',
+                        {
+                          className: 'sl-btn',
+                          style: actionButtonStyle,
+                          onClick: () => restoreFamily(family.entries.map((entry) => entry.entryName)),
+                        },
+                        '恢复整族',
+                      )
+                    : h('span', { style: badgeStyle }, '数据缺失'),
+                ),
+                family.entries.map((entry) => h(
+                  'div',
+                  { key: entry.entryName, style: dialogRowStyle },
+                  h(
+                    'span',
+                    { style: badgeStyle },
+                    entry.role === 'subagent' ? '子智能体/队友' : entry.role === 'fork' ? '分叉' : '会话',
+                  ),
+                  h(
+                    'span',
+                    { style: sessionTitleStyle },
+                    entry.title && entry.title.trim() !== '' ? entry.title : entry.sessionId,
+                  ),
+                  h('span', { style: trashMetaStyle }, `${(entry.sizeBytes / 1048576).toFixed(1)} MB`),
+                )),
+              )
+            }),
           )
         }
 
         function renderDialog() {
-          const items = dialog.items || []
+          const families = dialog.families || []
           const results = dialog.results || []
-          const blocked = items.filter((item) => item.canTrash === false)
           const trashed = results.filter((result) => result.status === 'trashed')
           const skipped = results.filter((result) => result.status !== 'trashed')
+          const blocked = families.filter((family) => family.canTrash === false)
+          const memberTotal = families.reduce((sum, family) => sum + family.memberCount, 0)
+          const forkTotal = families.reduce((sum, family) => sum + family.forkCount, 0)
+          const roleLabel = { root: '会话', subagent: '子智能体/队友', fork: '分叉' }
 
-          const rows = items.map((item) => h(
+          const familyBlocks = families.map((family) => h(
             'div',
-            { key: item.id, style: dialogRowStyle },
-            h('span', { style: sessionTitleStyle }, item.title && item.title.trim() !== '' ? item.title : item.id),
-            !item.canTrash
-              ? h('span', { style: blockedBadgeStyle }, item.blockers.map((blocker) => blocker.message).join('；'))
-              : item.warnings && item.warnings.length > 0
-                ? h('span', { style: badgeStyle }, item.warnings.map((warning) => warning.message).join('；'))
-                : null,
-            h('span', { style: trashMetaStyle }, `${(item.sizeBytes / 1048576).toFixed(1)} MB`),
+            { key: family.rootId, style: dialogFamilyStyle },
+            h(
+              'div',
+              { style: dialogFamilyHeadStyle },
+              h(
+                'span',
+                { style: sessionTitleStyle },
+                family.rootTitle && family.rootTitle.trim() !== '' ? family.rootTitle : family.rootId,
+              ),
+              h('span', { style: badgeStyle }, `${family.memberCount} 个会话`),
+              h('span', { style: trashMetaStyle }, `${(family.totalBytes / 1048576).toFixed(1)} MB`),
+            ),
+            family.members.map((member) => h(
+              'div',
+              { key: member.id, style: dialogRowStyle },
+              h('span', { style: badgeStyle }, roleLabel[member.role] || member.role),
+              h(
+                'span',
+                { style: sessionTitleStyle },
+                member.title && member.title.trim() !== '' ? member.title : member.id,
+              ),
+              member.running ? h('span', { style: blockedBadgeStyle }, '正在运行') : null,
+              h('span', { style: trashMetaStyle }, `${(member.sizeBytes / 1048576).toFixed(1)} MB`),
+            )),
+            family.forkCount > 0
+              ? h(
+                  'div',
+                  { style: dialogHintStyle },
+                  dialog.includeForks === true
+                    ? `将一并移入 ${family.forkCount} 个分叉会话`
+                    : `保留 ${family.forkCount} 个分叉会话，不随本次删除移动`,
+                )
+              : null,
+            family.blockers.length > 0
+              ? h('div', { style: warnStyle }, family.blockers.map((blocker) => blocker.message).join('；'))
+              : null,
           ))
 
           return h(
@@ -858,13 +954,25 @@ window.__ModuleLoader__.load({
                 'p',
                 { style: dialogHintStyle },
                 dialog.phase === 'done'
-                  ? `成功 ${trashed.length} 个，跳过 ${skipped.length} 个。可随时从回收站恢复。`
-                  : '这些会话会从列表移除并放入回收站，可随时恢复；不会彻底删除文件。',
+                  ? `成功 ${trashed.length} 个会话，跳过 ${skipped.length} 个。可从回收站整族恢复。`
+                  : `将移入 ${memberTotal} 个会话${dialog.includeForks === true ? '（含分叉）' : ''}；子智能体/队友会随族一起移入，可整族恢复，不会彻底删除文件。`,
               ),
               dialog.phase === 'loading' ? h('div', { style: dialogTextStyle }, '正在检查…') : null,
               dialog.phase === 'busy' ? h('div', { style: dialogTextStyle }, '正在移入回收站…') : null,
               dialog.phase === 'error' ? h('div', { style: warnStyle }, `失败：${dialog.error}`) : null,
-              dialog.phase === 'ready' ? h('div', { style: dialogListStyle }, rows) : null,
+              dialog.phase === 'ready' ? h('div', { style: dialogListStyle }, familyBlocks) : null,
+              dialog.phase === 'ready' && forkTotal > 0
+                ? h(
+                    'label',
+                    { style: forkOptionStyle },
+                    h('input', {
+                      type: 'checkbox',
+                      checked: dialog.includeForks === true,
+                      onChange: toggleIncludeForks,
+                    }),
+                    h('span', null, `一并删除 ${forkTotal} 个分叉会话`),
+                  )
+                : null,
               dialog.phase === 'done' && skipped.length > 0
                 ? h('div', { style: dialogListStyle }, skipped.map((result) => h(
                     'div',
@@ -892,10 +1000,10 @@ window.__ModuleLoader__.load({
                       {
                         className: 'sl-btn',
                         style: dangerButtonStyle,
-                        disabled: blocked.length > 0,
+                        disabled: blocked.length > 0 || memberTotal === 0,
                         onClick: confirmDelete,
                       },
-                      `确认移入回收站（${items.length - blocked.length}）`,
+                      `确认移入回收站（${memberTotal}）`,
                     )
                   : null,
               ),
@@ -935,7 +1043,7 @@ window.__ModuleLoader__.load({
                 {
                   className: 'sl-btn',
                   style: dangerButtonStyle,
-                  onClick: beginDelete,
+                  onClick: () => beginDelete(false),
                 },
                 `移入回收站 ${selectedCount}`,
               )
@@ -1308,6 +1416,28 @@ window.__ModuleLoader__.load({
       fontSize: 13,
     }
     const dialogActionsStyle = { display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 8 }
+    const dialogFamilyStyle = {
+      border: '1px solid color-mix(in srgb, currentColor 12%, transparent)',
+      borderRadius: 8,
+      padding: '6px 8px',
+      marginBottom: 10,
+    }
+    const dialogFamilyHeadStyle = {
+      display: 'flex',
+      alignItems: 'center',
+      gap: 8,
+      padding: '6px 2px',
+      fontWeight: 600,
+    }
+    const forkOptionStyle = {
+      display: 'flex',
+      alignItems: 'center',
+      gap: 6,
+      fontSize: 12,
+      opacity: 0.85,
+      margin: '4px 0 10px',
+      cursor: 'pointer',
+    }
     const placeholderStyle = { padding: '40px 10px', fontSize: 13, opacity: 0.55, textAlign: 'center' }
     const warnStyle = {
       flex: '0 0 auto',
