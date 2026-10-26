@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Sessions Library">
+  <rect x="4" y="8" width="56" height="48" rx="10" fill="#1f2937"/>
+  <rect x="12" y="17" width="40" height="4.5" rx="2.25" fill="#60a5fa"/>
+  <rect x="12" y="27" width="40" height="4.5" rx="2.25" fill="#93c5fd"/>
+  <rect x="12" y="37" width="24" height="4.5" rx="2.25" fill="#bfdbfe"/>
+  <path d="M40 41.5l7 6-7 6" fill="none" stroke="#60a5fa" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

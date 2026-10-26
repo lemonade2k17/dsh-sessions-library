@@ -1,0 +1,6 @@
+# Bundle patch layer: one Host row loads the package's main entry as a plain
+# Cordis plugin; the `dsh.client` declaration makes the web app load the
+# `./client` bundle as the browser half.
+- insert:
+    - id: sessions-library
+      name: dsh-sessions-library
