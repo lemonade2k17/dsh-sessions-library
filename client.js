@@ -1012,7 +1012,11 @@ window.__ModuleLoader__.load({
                 { style: sessionTitleStyle },
                 member.title && member.title.trim() !== '' ? member.title : member.id,
               ),
-              member.running ? h('span', { style: blockedBadgeStyle }, '正在运行') : null,
+              member.running
+                ? h('span', { style: blockedBadgeStyle }, '正在运行')
+                : member.loaded
+                  ? h('span', { style: badgeStyle }, '已打开')
+                  : null,
               h('span', { style: trashMetaStyle }, `${(member.sizeBytes / 1048576).toFixed(1)} MB`),
             )),
             family.forkCount > 0 || (family.members || []).some((member) => member.role === 'fork')

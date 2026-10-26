@@ -810,7 +810,16 @@ async function buildDeletePreflight(ctx, ids, signal, includeForks) {
       }
       const running = runningById.get(entry.id) === true
       if (!snapshot) blockers.push({ code: 'missing', message: `${label}不存在` })
-      if (running) blockers.push({ code: 'running', message: `${label}正在运行` })
+      if (running) {
+        blockers.push({ code: 'running', message: `${label}正在运行` })
+      } else if (loaded) {
+        // A loaded session keeps its write handle (and the Native sidebar keeps
+        // its in-memory summary), so moving it would leave a ghost behind.
+        blockers.push({
+          code: 'loaded',
+          message: `${label}仍被应用打开，请先关闭该会话或重启应用后再试`,
+        })
+      }
       members.push({
         id: entry.id,
         role: entry.role,
