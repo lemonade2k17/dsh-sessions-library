@@ -313,6 +313,8 @@ window.__ModuleLoader__.load({
         const [trashPhase, setTrashPhase] = React.useState('idle')
         const [trashError, setTrashError] = React.useState(null)
         const [dialog, setDialog] = React.useState(null)
+        const [trashSelected, setTrashSelected] = React.useState({})
+        const [purgeDialog, setPurgeDialog] = React.useState(null)
         const [query, setQuery] = React.useState('')
         const [reloadToken, setReloadToken] = React.useState(0)
 
@@ -439,6 +441,26 @@ window.__ModuleLoader__.load({
           return result
         }, [allGroups, filter, query])
 
+        // Recycle-bin entries grouped into the families they were deleted as.
+        const trashFamilies = React.useMemo(() => {
+          const families = []
+          const byFamily = new Map()
+          for (const entry of trash) {
+            const key = entry.familyRoot || entry.sessionId
+            if (!byFamily.has(key)) {
+              const family = { key, entries: [], deletedAt: 0, totalBytes: 0 }
+              byFamily.set(key, family)
+              families.push(family)
+            }
+            const family = byFamily.get(key)
+            family.entries.push(entry)
+            family.deletedAt = Math.max(family.deletedAt, entry.deletedAt || 0)
+            family.totalBytes += entry.sizeBytes || 0
+          }
+          families.sort((left, right) => right.deletedAt - left.deletedAt)
+          return families
+        }, [trash])
+
         const visibleCount = groups.reduce((sum, group) => sum + group.sessions.length, 0)
         // Count only what is on screen, so a filter change cannot show a
         // selection the user cannot see.
@@ -450,6 +472,11 @@ window.__ModuleLoader__.load({
         // independent expansion state.
         const expandedGroups = expandedByFilter[filter] || {}
         const anyOpen = groups.some((group) => expandedGroups[group.id] === true)
+        const selectedTrashFamilies = trashFamilies.filter((family) => trashSelected[family.key] === true)
+        const selectedTrashEntries = selectedTrashFamilies.flatMap((family) => family.entries)
+        const selectedTrashCount = selectedTrashEntries.length
+        const allTrashSelected = trashFamilies.length > 0
+          && trashFamilies.every((family) => trashSelected[family.key] === true)
 
         /** Select one session in the Conversation. */
         function openSession(sessionId) {
@@ -591,7 +618,14 @@ window.__ModuleLoader__.load({
           setTrashError(null)
           try {
             const payload = await postJson('api/sessions-library/trash-list', {})
-            setTrash(Array.isArray(payload.entries) ? payload.entries : [])
+            const entries = Array.isArray(payload.entries) ? payload.entries : []
+            setTrash(entries)
+            setTrashSelected((current) => {
+              const keys = new Set(entries.map((entry) => entry.familyRoot || entry.sessionId))
+              const next = {}
+              for (const key of Object.keys(current)) if (keys.has(key)) next[key] = true
+              return next
+            })
             setTrashPhase('ready')
           } catch (failure) {
             setTrashPhase('error')
@@ -681,6 +715,58 @@ window.__ModuleLoader__.load({
             setReloadToken((token) => token + 1)
           } catch (failure) {
             setTrashError(failure && failure.message ? failure.message : String(failure))
+          }
+        }
+
+        function toggleTrashFamily(familyKey) {
+          setTrashSelected((current) => {
+            const next = { ...current }
+            if (next[familyKey] === true) delete next[familyKey]
+            else next[familyKey] = true
+            return next
+          })
+        }
+
+        function toggleTrashSelectAll() {
+          if (allTrashSelected) {
+            setTrashSelected({})
+            return
+          }
+          const next = {}
+          for (const family of trashFamilies) next[family.key] = true
+          setTrashSelected(next)
+        }
+
+        function openPurgeDialog() {
+          if (selectedTrashEntries.length === 0) return
+          setPurgeDialog({
+            phase: 'confirm',
+            families: selectedTrashFamilies,
+            text: '',
+            error: null,
+            results: [],
+          })
+        }
+
+        async function confirmPurge() {
+          if (purgeDialog === null || purgeDialog.phase === 'busy') return
+          if ((purgeDialog.text || '').trim() !== '永久删除') return
+          const entryNames = (purgeDialog.families || []).flatMap(
+            (family) => family.entries.map((entry) => entry.entryName),
+          )
+          setPurgeDialog((current) => ({ ...(current || {}), phase: 'busy' }))
+          try {
+            const payload = await postJson('api/sessions-library/trash-purge', { entryNames })
+            const results = Array.isArray(payload.results) ? payload.results : []
+            setPurgeDialog((current) => ({ ...(current || {}), phase: 'done', results }))
+            setTrashSelected({})
+            await refreshTrash()
+          } catch (failure) {
+            setPurgeDialog((current) => ({
+              ...(current || {}),
+              phase: 'confirm',
+              error: failure && failure.message ? failure.message : String(failure),
+            }))
           }
         }
 
@@ -823,22 +909,7 @@ window.__ModuleLoader__.load({
             return h('div', { style: placeholderStyle }, '回收站是空的')
           }
 
-          // Group entries into the families they were deleted as.
-          const families = []
-          const byFamily = new Map()
-          for (const entry of trash) {
-            const key = entry.familyRoot || entry.sessionId
-            if (!byFamily.has(key)) {
-              const family = { key, entries: [], deletedAt: 0, totalBytes: 0 }
-              byFamily.set(key, family)
-              families.push(family)
-            }
-            const family = byFamily.get(key)
-            family.entries.push(entry)
-            family.deletedAt = Math.max(family.deletedAt, entry.deletedAt || 0)
-            family.totalBytes += entry.sizeBytes || 0
-          }
-          families.sort((left, right) => right.deletedAt - left.deletedAt)
+          const families = trashFamilies
 
           return h(
             'div',
@@ -853,6 +924,11 @@ window.__ModuleLoader__.load({
                 h(
                   'div',
                   { style: dialogFamilyHeadStyle },
+                  renderCheckbox(
+                    trashSelected[family.key] === true ? 'all' : 'none',
+                    () => toggleTrashFamily(family.key),
+                    '选择该回收站条目',
+                  ),
                   h(
                     'span',
                     { style: sessionTitleStyle },
@@ -1021,6 +1097,105 @@ window.__ModuleLoader__.load({
           )
         }
 
+        function renderPurgeDialog() {
+          const families = purgeDialog.families || []
+          const results = purgeDialog.results || []
+          const purged = results.filter((result) => result.status === 'purged')
+          const failed = results.filter((result) => result.status !== 'purged')
+          const sessionCount = families.reduce((sum, family) => sum + family.entries.length, 0)
+          const totalBytes = families.reduce((sum, family) => sum + family.totalBytes, 0)
+          const confirmText = purgeDialog.text || ''
+
+          const familyBlocks = families.map((family) => {
+            const rootEntry = family.entries.find((entry) => entry.role === 'root') || family.entries[0]
+            return h(
+              'div',
+              { key: family.key, style: dialogFamilyStyle },
+              h(
+                'div',
+                { style: dialogFamilyHeadStyle },
+                h(
+                  'span',
+                  { style: sessionTitleStyle },
+                  rootEntry.title && rootEntry.title.trim() !== '' ? rootEntry.title : rootEntry.sessionId,
+                ),
+                h('span', { style: badgeStyle }, `${family.entries.length} 个会话`),
+                h('span', { style: trashMetaStyle }, `${(family.totalBytes / 1048576).toFixed(1)} MB`),
+              ),
+            )
+          })
+
+          return h(
+            'div',
+            { style: overlayStyle, onClick: () => { if (purgeDialog.phase !== 'busy') setPurgeDialog(null) } },
+            h(
+              'div',
+              { style: dialogStyle, onClick: (event) => event.stopPropagation() },
+              h('h2', { style: dialogTitleStyle }, purgeDialog.phase === 'done' ? '已永久删除' : '永久删除'),
+              h(
+                'p',
+                { style: dialogHintStyle },
+                purgeDialog.phase === 'done'
+                  ? `已永久删除 ${purged.length} 个会话${failed.length > 0 ? `，失败 ${failed.length} 个` : ''}。此操作不可恢复。`
+                  : `将永久删除 ${sessionCount} 个会话（${(totalBytes / 1048576).toFixed(1)} MB）。此操作不可恢复；附件与成本账本不会被清理。`,
+              ),
+              purgeDialog.phase === 'confirm' ? h('div', { style: dialogListStyle }, familyBlocks) : null,
+              purgeDialog.phase === 'error' ? h('div', { style: warnStyle }, `失败：${purgeDialog.error}`) : null,
+              purgeDialog.phase === 'confirm'
+                ? h(
+                    'div',
+                    { style: { margin: '4px 0 11px' } },
+                    h('div', { style: dialogHintStyle }, '请输入「永久删除」以确认：'),
+                    h('input', {
+                      className: 'sl-input',
+                      style: purgeInputStyle,
+                      value: confirmText,
+                      placeholder: '永久删除',
+                      onChange: (event) => setPurgeDialog((current) => ({
+                        ...(current || {}),
+                        text: event.target.value,
+                      })),
+                    }),
+                  )
+                : null,
+              purgeDialog.phase === 'done' && failed.length > 0
+                ? h('div', { style: dialogListStyle }, failed.map((result) => h(
+                    'div',
+                    { key: result.entryName, style: dialogRowStyle },
+                    h('span', { style: sessionTitleStyle }, result.entryName),
+                    h('span', { style: blockedBadgeStyle }, result.reason || result.status),
+                  )))
+                : null,
+              h(
+                'div',
+                { style: dialogActionsStyle },
+                h(
+                  'button',
+                  {
+                    className: 'sl-btn',
+                    style: actionButtonStyle,
+                    disabled: purgeDialog.phase === 'busy',
+                    onClick: () => setPurgeDialog(null),
+                  },
+                  purgeDialog.phase === 'done' ? '关闭' : '取消',
+                ),
+                purgeDialog.phase === 'confirm'
+                  ? h(
+                      'button',
+                      {
+                        className: 'sl-btn',
+                        style: dangerButtonStyle,
+                        disabled: confirmText.trim() !== '永久删除',
+                        onClick: confirmPurge,
+                      },
+                      `永久删除 ${sessionCount} 个会话`,
+                    )
+                  : null,
+              ),
+            ),
+          )
+        }
+
         const filterButton = (value, label, count) => h(
           'button',
           {
@@ -1119,6 +1294,26 @@ window.__ModuleLoader__.load({
             },
             '刷新回收站',
           ),
+          h(
+            'button',
+            {
+              className: 'sl-btn',
+              style: actionButtonStyle,
+              onClick: toggleTrashSelectAll,
+            },
+            allTrashSelected ? '取消全选' : '全选',
+          ),
+          selectedTrashCount > 0
+            ? h(
+                'button',
+                {
+                  className: 'sl-btn',
+                  style: dangerButtonStyle,
+                  onClick: openPurgeDialog,
+                },
+                `永久删除 ${selectedTrashCount} 个会话`,
+              )
+            : null,
         )
 
         const controls = view === 'trash' ? trashControls : libraryControls
@@ -1190,6 +1385,7 @@ window.__ModuleLoader__.load({
             ? h('div', { style: footerStyle }, sources)
             : null,
           dialog !== null ? renderDialog() : null,
+          purgeDialog !== null ? renderPurgeDialog() : null,
         )
       }
     }
@@ -1447,6 +1643,17 @@ window.__ModuleLoader__.load({
       opacity: 0.85,
       margin: '4px 0 10px',
       cursor: 'pointer',
+    }
+    const purgeInputStyle = {
+      width: '100%',
+      height: 32,
+      padding: '0 10px',
+      borderRadius: 6,
+      border: '1px solid color-mix(in srgb, #f06a6a 45%, transparent)',
+      background: 'transparent',
+      color: 'inherit',
+      font: 'inherit',
+      fontSize: 13,
     }
     const placeholderStyle = { padding: '40px 10px', fontSize: 13, opacity: 0.55, textAlign: 'center' }
     const warnStyle = {

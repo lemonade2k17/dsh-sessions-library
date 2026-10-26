@@ -28,7 +28,7 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { homedir } from 'node:os'
-import { basename, dirname, join } from 'node:path'
+import { basename, dirname, join, resolve, sep } from 'node:path'
 
 export const name = 'dsh-sessions-library'
 
@@ -57,7 +57,9 @@ const DELETE_PREFLIGHT_PATH = '/api/sessions-library/delete-preflight'
 const DELETE_PATH = '/api/sessions-library/delete'
 const TRASH_LIST_PATH = '/api/sessions-library/trash-list'
 const TRASH_RESTORE_PATH = '/api/sessions-library/trash-restore'
+const TRASH_PURGE_PATH = '/api/sessions-library/trash-purge'
 const DELETE_BATCH_LIMIT = 100
+const PURGE_AUDIT_FILE = join(DSH_HOME, 'sessions-library', 'audit.log')
 
 // Identifies one Host process. The Client compares it with the value it stored
 // last time: a different value means DSH restarted, so view state resets.
@@ -1074,6 +1076,74 @@ async function restoreTrashEntries(ctx, rawNames, signal) {
 }
 
 /**
+ * Append one durable audit record for a destructive operation.
+ *
+ * @param {object} record JSON-serializable record.
+ */
+function appendAudit(record) {
+  try {
+    mkdirSync(dirname(PURGE_AUDIT_FILE), { recursive: true })
+    appendFileSync(PURGE_AUDIT_FILE, `${JSON.stringify(record)}\n`)
+  } catch {
+    // Audit failures must not block the purge.
+  }
+}
+
+/**
+ * Permanently delete recycle-bin entries.
+ *
+ * Only entry names currently present in the recycle bin are accepted, and the
+ * resolved directory must stay inside the trash root.
+ *
+ * @param {any} rawNames requested entry names.
+ * @returns {Promise<Array<object>>} one result per entry.
+ */
+async function purgeTrashEntries(rawNames) {
+  const entries = readTrashEntries()
+  const byName = new Map(entries.map((entry) => [entry.entryName, entry]))
+  const trashRoot = resolve(TRASH_ROOT)
+  const results = []
+  const purged = []
+
+  for (const rawName of Array.isArray(rawNames) ? rawNames : []) {
+    if (typeof rawName !== 'string' || !byName.has(rawName)) {
+      results.push({ entryName: String(rawName), status: 'failed', reason: '回收站中找不到该条目' })
+      continue
+    }
+    const entry = byName.get(rawName)
+    const entryDir = join(TRASH_ROOT, rawName)
+    try {
+      const resolved = resolve(entryDir)
+      if (resolved === trashRoot || !resolved.startsWith(trashRoot + sep)) {
+        results.push({ entryName: rawName, status: 'failed', reason: '条目路径非法' })
+        continue
+      }
+      rmSync(entryDir, { recursive: true, force: true })
+      results.push({ entryName: rawName, sessionId: entry.sessionId, status: 'purged', sizeBytes: entry.sizeBytes })
+      purged.push(entry)
+    } catch (error) {
+      results.push({ entryName: rawName, status: 'failed', reason: describeError(error) })
+    }
+  }
+
+  if (purged.length > 0) {
+    appendAudit({
+      at: new Date().toISOString(),
+      action: 'purge',
+      entries: purged.map((entry) => ({
+        entryName: entry.entryName,
+        sessionId: entry.sessionId,
+        familyRoot: entry.familyRoot,
+        role: entry.role,
+        sizeBytes: entry.sizeBytes,
+      })),
+    })
+  }
+  trace('purge', 'end', `purged=${purged.length} failed=${results.length - purged.length}`)
+  return results
+}
+
+/**
  * Activate the Host half.
  *
  * @param {object} ctx Cordis context.
@@ -1131,6 +1201,15 @@ export function apply(ctx) {
         handler: async (request) => {
           const body = await readJsonBody(request)
           const results = await restoreTrashEntries(ctx, body.entryNames, request.signal)
+          return jsonResponse({ ok: true, results })
+        },
+      },
+      {
+        path: TRASH_PURGE_PATH,
+        label: 'trash-purge',
+        handler: async (request) => {
+          const body = await readJsonBody(request)
+          const results = await purgeTrashEntries(body.entryNames)
           return jsonResponse({ ok: true, results })
         },
       },
