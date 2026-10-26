@@ -901,6 +901,14 @@ window.__ModuleLoader__.load({
           const blocked = families.filter((family) => family.canTrash === false)
           const memberTotal = families.reduce((sum, family) => sum + family.memberCount, 0)
           const forkTotal = families.reduce((sum, family) => sum + family.forkCount, 0)
+          // In the "keep forks" mode forks are listed separately; in the
+          // "include forks" mode they arrive as members. Sum both so the
+          // checkbox stays available and can always be toggled back.
+          const forkIncluded = families.reduce(
+            (sum, family) => sum + (family.members || []).filter((member) => member.role === 'fork').length,
+            0,
+          )
+          const forkCandidates = forkTotal + forkIncluded
           const roleLabel = { root: '会话', subagent: '子智能体/队友', fork: '分叉' }
 
           const familyBlocks = families.map((family) => h(
@@ -929,12 +937,12 @@ window.__ModuleLoader__.load({
               member.running ? h('span', { style: blockedBadgeStyle }, '正在运行') : null,
               h('span', { style: trashMetaStyle }, `${(member.sizeBytes / 1048576).toFixed(1)} MB`),
             )),
-            family.forkCount > 0
+            family.forkCount > 0 || (family.members || []).some((member) => member.role === 'fork')
               ? h(
                   'div',
                   { style: dialogHintStyle },
                   dialog.includeForks === true
-                    ? `将一并移入 ${family.forkCount} 个分叉会话`
+                    ? `将一并移入 ${(family.members || []).filter((member) => member.role === 'fork').length} 个分叉会话`
                     : `保留 ${family.forkCount} 个分叉会话，不随本次删除移动`,
                 )
               : null,
@@ -961,7 +969,7 @@ window.__ModuleLoader__.load({
               dialog.phase === 'busy' ? h('div', { style: dialogTextStyle }, '正在移入回收站…') : null,
               dialog.phase === 'error' ? h('div', { style: warnStyle }, `失败：${dialog.error}`) : null,
               dialog.phase === 'ready' ? h('div', { style: dialogListStyle }, familyBlocks) : null,
-              dialog.phase === 'ready' && forkTotal > 0
+              dialog.phase === 'ready' && forkCandidates > 0
                 ? h(
                     'label',
                     { style: forkOptionStyle },
@@ -970,7 +978,7 @@ window.__ModuleLoader__.load({
                       checked: dialog.includeForks === true,
                       onChange: toggleIncludeForks,
                     }),
-                    h('span', null, `一并删除 ${forkTotal} 个分叉会话`),
+                    h('span', null, `一并删除 ${forkCandidates} 个分叉会话`),
                   )
                 : null,
               dialog.phase === 'done' && skipped.length > 0
