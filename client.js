@@ -735,6 +735,38 @@ window.__ModuleLoader__.load({
           }
         }
 
+        /**
+         * Cancel a queued permanent delete without restoring the session.
+         *
+         * The session stays deleted: it keeps its pending record, remains hidden
+         * from both the library and the Native sidebar, and the next start moves
+         * it into the recycle bin as usual.
+         *
+         * @param {string[]} entryNames pending entry names to un-queue.
+         * @returns {Promise<void>} resolution after the recycle bin refreshed.
+         */
+        async function cancelQueuedPurge(entryNames) {
+          if (!Array.isArray(entryNames) || entryNames.length === 0) return
+          setTrashError(null)
+          setTrashNotice(null)
+          try {
+            const payload = await postJson('api/sessions-library/trash-restore', {
+              entryNames,
+              cancelPurgeOnly: true,
+            })
+            const results = Array.isArray(payload.results) ? payload.results : []
+            const failed = results.find((result) => result.status !== 'canceled')
+            if (failed) {
+              setTrashError(failed.reason || '取消失败')
+            } else {
+              setTrashNotice('已取消永久删除。会话仍在回收站（待重启整理），重启 DSH 后照常移入回收站，不会被删除；如需恢复请点“恢复会话”。')
+            }
+            await refreshTrash()
+          } catch (failure) {
+            setTrashError(failure && failure.message ? failure.message : String(failure))
+          }
+        }
+
         async function restoreFamily(entryNames) {
           setTrashError(null)
           setTrashNotice(null)
@@ -959,6 +991,9 @@ window.__ModuleLoader__.load({
             families.map((family) => {
               const rootEntry = family.entries.find((entry) => entry.role === 'root') || family.entries[0]
               const canRestore = family.entries.every((entry) => entry.restoreAvailable === true)
+              const queuedNames = family.entries
+                .filter((entry) => entry.purge === true)
+                .map((entry) => entry.entryName)
               return h(
                 'div',
                 { key: family.key, style: dialogFamilyStyle },
@@ -978,6 +1013,17 @@ window.__ModuleLoader__.load({
                   h('span', { style: badgeStyle }, `${family.entries.length} 个会话`),
                   h('span', { style: trashMetaStyle }, formatRelative(family.deletedAt)),
                   h('span', { style: trashMetaStyle }, `${(family.totalBytes / 1048576).toFixed(1)} MB`),
+                  queuedNames.length > 0
+                    ? h(
+                        'button',
+                        {
+                          className: 'sl-btn',
+                          style: actionButtonStyle,
+                          onClick: () => cancelQueuedPurge(queuedNames),
+                        },
+                        '取消永久删除',
+                      )
+                    : null,
                   canRestore
                     ? h(
                         'button',
@@ -986,11 +1032,9 @@ window.__ModuleLoader__.load({
                           style: actionButtonStyle,
                           onClick: () => restoreFamily(family.entries.map((entry) => entry.entryName)),
                         },
-                        family.entries.some((entry) => entry.purge === true)
-                          ? '取消永久删除，恢复会话'
-                          : family.entries.length > 1
-                            ? `恢复会话（${family.entries.length} 个）`
-                            : '恢复会话',
+                        family.entries.length > 1
+                          ? `恢复会话（${family.entries.length} 个）`
+                          : '恢复会话',
                       )
                     : h('span', { style: badgeStyle }, '数据缺失'),
                 ),

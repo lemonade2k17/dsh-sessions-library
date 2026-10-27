@@ -902,14 +902,15 @@ async function buildDeletePreflight(ctx, ids, signal, includeForks) {
  * @returns {Array<object>} trash entries, newest first.
  */
 function readTrashEntries() {
-  if (!existsSync(TRASH_ROOT)) return []
+  // A missing trash root only means no entry was ever physically moved; queued
+  // deferred deletions still belong in the list.
   let names = []
   try {
     names = readdirSync(TRASH_ROOT, { withFileTypes: true })
       .filter((entry) => entry.isDirectory())
       .map((entry) => entry.name)
   } catch {
-    return []
+    names = []
   }
 
   const entries = []
@@ -1103,27 +1104,46 @@ async function trashSessions(ctx, rawIds, signal, includeForks) {
 /**
  * Restore recycle-bin entries.
  *
+ * With `options.cancelPurgeOnly`, a pending entry only loses its queued
+ * permanent deletion: it stays in the recycle bin, still hidden from the Native
+ * sidebar, and the next start moves it into the bin as usual.
+ *
  * @param {object} ctx Cordis context.
  * @param {any} rawNames requested entry names.
  * @param {AbortSignal} signal request cancellation.
+ * @param {{ cancelPurgeOnly?: boolean }} [options] cancel a queued permanent delete only.
  * @returns {Promise<Array<object>>} one result per entry.
  */
-async function restoreTrashEntries(ctx, rawNames, signal) {
+async function restoreTrashEntries(ctx, rawNames, signal, options = {}) {
   const allowed = new Set(readTrashEntries().map((entry) => entry.entryName))
   const registry = ctx.get('workspaceRegistry')
+  const cancelPurgeOnly = options.cancelPurgeOnly === true
   const results = []
 
   for (const rawName of Array.isArray(rawNames) ? rawNames : []) {
     if (typeof rawName === 'string' && rawName.startsWith('pending:')) {
       const pendingId = rawName.slice('pending:'.length)
       const currentPending = readPendingTrash()
-      if (!currentPending[pendingId]) {
+      if (!currentPending[pendingId] || typeof currentPending[pendingId] !== 'object') {
         results.push({ entryName: rawName, status: 'failed', reason: '找不到待移入条目' })
         continue
       }
-      const record = currentPending[pendingId] && typeof currentPending[pendingId] === 'object'
-        ? currentPending[pendingId]
-        : {}
+      if (cancelPurgeOnly) {
+        const queued = currentPending[pendingId]
+        if (queued.purge !== true) {
+          results.push({ entryName: rawName, status: 'failed', reason: '该条目未排队永久删除' })
+          continue
+        }
+        // Drop only the destructive intent: the delete itself stays queued, so
+        // the session remains hidden and still moves into the bin next start.
+        const { purge, purgeRequestedAt, ...kept } = queued
+        currentPending[pendingId] = kept
+        writePendingTrash(currentPending)
+        trace('restore', 'end', `cancel-purge id=${pendingId}`)
+        results.push({ entryName: rawName, sessionId: pendingId, status: 'canceled' })
+        continue
+      }
+      const record = currentPending[pendingId]
       delete currentPending[pendingId]
       writePendingTrash(currentPending)
       try {
@@ -1137,6 +1157,14 @@ async function restoreTrashEntries(ctx, rawNames, signal) {
       }
       trace('restore', 'end', `ok pending id=${pendingId}`)
       results.push({ entryName: rawName, sessionId: pendingId, status: 'restored' })
+      continue
+    }
+    if (cancelPurgeOnly) {
+      results.push({
+        entryName: String(rawName),
+        status: 'failed',
+        reason: '仅待处理条目支持取消永久删除',
+      })
       continue
     }
     if (typeof rawName !== 'string' || !allowed.has(rawName)) {
@@ -1466,7 +1494,9 @@ export function apply(ctx) {
         label: 'trash-restore',
         handler: async (request) => {
           const body = await readJsonBody(request)
-          const results = await restoreTrashEntries(ctx, body.entryNames, request.signal)
+          const results = await restoreTrashEntries(ctx, body.entryNames, request.signal, {
+            cancelPurgeOnly: body.cancelPurgeOnly === true,
+          })
           return jsonResponse({ ok: true, results })
         },
       },
