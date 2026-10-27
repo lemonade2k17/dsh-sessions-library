@@ -312,6 +312,7 @@ window.__ModuleLoader__.load({
         const [trash, setTrash] = React.useState([])
         const [trashPhase, setTrashPhase] = React.useState('idle')
         const [trashError, setTrashError] = React.useState(null)
+        const [trashNotice, setTrashNotice] = React.useState(null)
         const [dialog, setDialog] = React.useState(null)
         const [trashSelected, setTrashSelected] = React.useState({})
         const [purgeDialog, setPurgeDialog] = React.useState(null)
@@ -635,11 +636,13 @@ window.__ModuleLoader__.load({
 
         function openTrash() {
           setView('trash')
+          setTrashNotice(null)
           refreshTrash()
         }
 
         function closeTrash() {
           setView('library')
+          setTrashNotice(null)
         }
 
         async function beginDelete(includeForks) {
@@ -706,11 +709,13 @@ window.__ModuleLoader__.load({
 
         async function restoreFamily(entryNames) {
           setTrashError(null)
+          setTrashNotice(null)
           try {
             const payload = await postJson('api/sessions-library/trash-restore', { entryNames })
             const results = Array.isArray(payload.results) ? payload.results : []
             const failed = results.find((result) => result.status !== 'restored')
             if (failed) setTrashError(failed.reason || '恢复失败')
+            else setTrashNotice('已恢复。会话库立即可见；原生侧边栏可能需要重启 DSH 后才会显示该会话。')
             await refreshTrash()
             setReloadToken((token) => token + 1)
           } catch (failure) {
@@ -915,6 +920,7 @@ window.__ModuleLoader__.load({
             'div',
             null,
             trashError !== null ? h('div', { style: warnStyle }, trashError) : null,
+            trashNotice !== null ? h('div', { style: infoStyle }, trashNotice) : null,
             families.map((family) => {
               const rootEntry = family.entries.find((entry) => entry.role === 'root') || family.entries[0]
               const canRestore = family.entries.every((entry) => entry.restoreAvailable === true)
@@ -1680,6 +1686,16 @@ window.__ModuleLoader__.load({
       fontSize: 13,
     }
     const placeholderStyle = { padding: '40px 10px', fontSize: 13, opacity: 0.55, textAlign: 'center' }
+    const infoStyle = {
+      fontSize: 12,
+      lineHeight: 1.6,
+      padding: '8px 10px',
+      margin: '4px 0 10px',
+      borderRadius: 6,
+      border: '1px solid color-mix(in srgb, #6aa9f0 45%, transparent)',
+      color: '#6aa9f0',
+      background: 'color-mix(in srgb, #6aa9f0 10%, transparent)',
+    }
     const dialogBlockerStyle = {
       fontSize: 12,
       lineHeight: 1.6,
