@@ -1017,13 +1017,17 @@ async function trashSessions(ctx, rawIds, signal, includeForks) {
             // Background work may refuse archiving; the deferred move still applies.
           }
         }
+        const wasArchived = archived.has(member.id)
         pending[member.id] = {
           requestedAt: Date.now(),
           familyRoot: family.rootId,
           role: member.role,
           title: member.title,
           cwd: member.cwd ?? null,
-          archivedByDelete: true,
+          // Record the archive state from before the delete: restore must undo
+          // only the archive this delete applied to hide the session.
+          wasArchived,
+          archivedByDelete: !wasArchived,
         }
         pendingChanged = true
         trace('trash', 'deferred', `id=${member.id} family=${family.rootId}`)
@@ -1114,10 +1118,17 @@ async function restoreTrashEntries(ctx, rawNames, signal) {
         results.push({ entryName: rawName, status: 'failed', reason: '找不到待移入条目' })
         continue
       }
+      const record = currentPending[pendingId] && typeof currentPending[pendingId] === 'object'
+        ? currentPending[pendingId]
+        : {}
       delete currentPending[pendingId]
       writePendingTrash(currentPending)
       try {
-        if (registry && typeof registry.unarchiveSession === 'function') await registry.unarchiveSession(pendingId)
+        // A session that was archived before the delete keeps that state; only
+        // the archive added by the delete itself is undone.
+        if (record.wasArchived !== true && registry && typeof registry.unarchiveSession === 'function') {
+          await registry.unarchiveSession(pendingId)
+        }
       } catch {
         // The session was archived only to hide it during deletion.
       }

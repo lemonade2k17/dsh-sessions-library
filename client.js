@@ -714,8 +714,15 @@ window.__ModuleLoader__.load({
             const payload = await postJson('api/sessions-library/trash-restore', { entryNames })
             const results = Array.isArray(payload.results) ? payload.results : []
             const failed = results.find((result) => result.status !== 'restored')
+            // A pending entry never left the session directory: the delete only
+            // archived it, so undoing that archive makes it reappear at once.
+            // Only entries that moved their log back need the restart caveat.
+            const moved = entryNames.some(
+              (name) => typeof name === 'string' && !name.startsWith('pending:'),
+            )
             if (failed) setTrashError(failed.reason || '恢复失败')
-            else setTrashNotice('已恢复。会话库立即可见；原生侧边栏可能需要重启 DSH 后才会显示该会话。')
+            else if (moved) setTrashNotice('已恢复。会话库立即可见；从回收站搬回文件的会话，原生侧边栏可能需要重启 DSH 后才会显示。')
+            else setTrashNotice('已恢复。该会话的文件未被移动过，原生侧边栏会立即显示，无需重启。')
             await refreshTrash()
             setReloadToken((token) => token + 1)
           } catch (failure) {
