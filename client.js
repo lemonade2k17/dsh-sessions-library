@@ -758,8 +758,19 @@ window.__ModuleLoader__.load({
             const failed = results.find((result) => result.status !== 'canceled')
             if (failed) {
               setTrashError(failed.reason || '取消失败')
+              await refreshTrash()
+              return
+            }
+            // Verify what really happened: a Host that predates the flag ignores
+            // it and restores the session instead, which must never pass unseen.
+            const listPayload = await postJson('api/sessions-library/trash-list', {})
+            const list = Array.isArray(listPayload.entries) ? listPayload.entries : []
+            const stillListed = entryNames.every((name) => list.some((entry) => entry.entryName === name))
+            if (!stillListed) {
+              setTrashError('取消永久删除没有按预期生效：Host 端可能仍在运行旧版本，会话已被按旧逻辑恢复。请完全退出并重新打开 DSH 后，重新删除该会话并重试。')
+              refreshNativeSessionList()
             } else {
-              setTrashNotice('已取消永久删除。会话仍在回收站（待重启整理），重启 DSH 后照常移入回收站，不会被删除；如需恢复请点“恢复会话”。')
+              setTrashNotice('已取消永久删除：会话仍在回收站（待重启整理），重启 DSH 后照常移入回收站，不会被删除。如需把会话找回来，请点「恢复会话」。')
             }
             await refreshTrash()
           } catch (failure) {
@@ -1021,7 +1032,7 @@ window.__ModuleLoader__.load({
                           style: actionButtonStyle,
                           onClick: () => cancelQueuedPurge(queuedNames),
                         },
-                        '取消永久删除',
+                        '放弃永久删除（留在回收站）',
                       )
                     : null,
                   canRestore
@@ -1033,8 +1044,8 @@ window.__ModuleLoader__.load({
                           onClick: () => restoreFamily(family.entries.map((entry) => entry.entryName)),
                         },
                         family.entries.length > 1
-                          ? `恢复会话（${family.entries.length} 个）`
-                          : '恢复会话',
+                          ? `恢复会话（回到会话库，${family.entries.length} 个）`
+                          : '恢复会话（回到会话库）',
                       )
                     : h('span', { style: badgeStyle }, '数据缺失'),
                 ),
