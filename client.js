@@ -491,6 +491,27 @@ window.__ModuleLoader__.load({
           }
         }
 
+        /**
+         * Re-pull the Native session list after this plugin moved files.
+         *
+         * The Native sidebar renders workspace members intersected with the
+         * Client session list, and that list is only re-pulled on connect or
+         * through this call. Moving files is an external change that produces
+         * no Host event, so without this the restored row stays missing (and a
+         * deleted row lingers) until the page reloads.
+         */
+        function refreshNativeSessionList() {
+          try {
+            const sessions = ctx.get('sessions')
+            if (sessions && typeof sessions.refresh === 'function') {
+              Promise.resolve(sessions.refresh()).catch(() => {})
+            }
+          } catch {
+            // Without the session controller the list refreshes on page reload,
+            // so a failure here only delays the row.
+          }
+        }
+
         function toggleGroup(groupId) {
           setExpandedByFilter((current) => {
             const scoped = { ...(current[filter] || {}) }
@@ -697,6 +718,9 @@ window.__ModuleLoader__.load({
                 return next
               })
               setReloadToken((token) => token + 1)
+              // Drop the deleted rows from the Native list as well; the offline
+              // move emits no Host event, so it would otherwise stay stale.
+              refreshNativeSessionList()
             }
           } catch (failure) {
             setDialog((current) => ({
@@ -714,15 +738,15 @@ window.__ModuleLoader__.load({
             const payload = await postJson('api/sessions-library/trash-restore', { entryNames })
             const results = Array.isArray(payload.results) ? payload.results : []
             const failed = results.find((result) => result.status !== 'restored')
-            // A pending entry never left the session directory: the delete only
-            // archived it, so undoing that archive makes it reappear at once.
-            // Only entries that moved their log back need the restart caveat.
-            const moved = entryNames.some(
-              (name) => typeof name === 'string' && !name.startsWith('pending:'),
-            )
-            if (failed) setTrashError(failed.reason || '恢复失败')
-            else if (moved) setTrashNotice('已恢复。会话库立即可见；从回收站搬回文件的会话，原生侧边栏可能需要重启 DSH 后才会显示。')
-            else setTrashNotice('已恢复。该会话的文件未被移动过，原生侧边栏会立即显示，无需重启。')
+            if (failed) {
+              setTrashError(failed.reason || '恢复失败')
+            } else {
+              setTrashNotice('已恢复。会话库立即可见；已请求原生侧边栏刷新，若未出现请刷新页面。')
+              // Both kinds must show up at once: a pending entry only needed its
+              // archive undone, a trashed one also needs the Client session list
+              // to re-pull the row this plugin put back on disk.
+              refreshNativeSessionList()
+            }
             await refreshTrash()
             setReloadToken((token) => token + 1)
           } catch (failure) {
