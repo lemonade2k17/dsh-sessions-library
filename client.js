@@ -982,9 +982,11 @@ window.__ModuleLoader__.load({
                           style: actionButtonStyle,
                           onClick: () => restoreFamily(family.entries.map((entry) => entry.entryName)),
                         },
-                        family.entries.length > 1
-                          ? `恢复会话（${family.entries.length} 个）`
-                          : '恢复会话',
+                        family.entries.some((entry) => entry.purge === true)
+                          ? '取消永久删除，恢复会话'
+                          : family.entries.length > 1
+                            ? `恢复会话（${family.entries.length} 个）`
+                            : '恢复会话',
                       )
                     : h('span', { style: badgeStyle }, '数据缺失'),
                 ),
@@ -996,7 +998,9 @@ window.__ModuleLoader__.load({
                     { style: badgeStyle },
                     entry.role === 'subagent' ? '子智能体/队友' : entry.role === 'fork' ? '分叉' : '会话',
                   ),
-                  entry.pending === true ? h('span', { style: badgeStyle }, '待重启整理') : null,
+                  entry.pending === true
+                    ? h('span', { style: badgeStyle }, entry.purge === true ? '待重启永久删除' : '待重启整理')
+                    : null,
                   h(
                     'span',
                     { style: sessionTitleStyle },
@@ -1152,10 +1156,25 @@ window.__ModuleLoader__.load({
           const families = purgeDialog.families || []
           const results = purgeDialog.results || []
           const purged = results.filter((result) => result.status === 'purged')
-          const failed = results.filter((result) => result.status !== 'purged')
+          const queued = results.filter((result) => result.status === 'queued')
+          const failed = results.filter(
+            (result) => result.status !== 'purged' && result.status !== 'queued',
+          )
           const sessionCount = families.reduce((sum, family) => sum + family.entries.length, 0)
+          const pendingCount = families.reduce(
+            (sum, family) => sum + family.entries.filter((entry) => entry.pending === true).length,
+            0,
+          )
           const totalBytes = families.reduce((sum, family) => sum + family.totalBytes, 0)
           const confirmText = purgeDialog.text || ''
+          // A queued deletion is not irreversible yet: it runs at the next start
+          // and the recycle bin can still cancel it before then.
+          const doneParts = []
+          if (purged.length > 0) doneParts.push(`已永久删除 ${purged.length} 个会话`)
+          if (queued.length > 0) doneParts.push(`${queued.length} 个已排队（重启 DSH 后删除，重启前可取消）`)
+          if (failed.length > 0) doneParts.push(`${failed.length} 个失败`)
+          const doneSummary = doneParts.length > 0 ? `${doneParts.join('；')}。` : '已完成。'
+          const doneTitle = purged.length > 0 ? '已永久删除' : queued.length > 0 ? '已排队永久删除' : '已完成'
 
           const familyBlocks = families.map((family) => {
             const rootEntry = family.entries.find((entry) => entry.role === 'root') || family.entries[0]
@@ -1182,13 +1201,13 @@ window.__ModuleLoader__.load({
             h(
               'div',
               { style: dialogStyle, onClick: (event) => event.stopPropagation() },
-              h('h2', { style: dialogTitleStyle }, purgeDialog.phase === 'done' ? '已永久删除' : '永久删除'),
+              h('h2', { style: dialogTitleStyle }, purgeDialog.phase === 'done' ? doneTitle : '永久删除'),
               h(
                 'p',
                 { style: dialogHintStyle },
                 purgeDialog.phase === 'done'
-                  ? `已永久删除 ${purged.length} 个会话${failed.length > 0 ? `，失败 ${failed.length} 个` : ''}。此操作不可恢复。`
-                  : `将永久删除 ${sessionCount} 个会话（${(totalBytes / 1048576).toFixed(1)} MB）。此操作不可恢复；附件与成本账本不会被清理。`,
+                  ? doneSummary
+                  : `将永久删除 ${sessionCount} 个会话（${(totalBytes / 1048576).toFixed(1)} MB）。此操作不可恢复；附件与成本账本不会被清理。${pendingCount > 0 ? `其中 ${pendingCount} 个仍被应用打开，将在重启 DSH 后删除。` : ''}`,
               ),
               purgeDialog.phase === 'confirm' ? h('div', { style: dialogListStyle }, familyBlocks) : null,
               purgeDialog.error ? h('div', { style: dialogBlockerStyle }, `失败：${purgeDialog.error}`) : null,

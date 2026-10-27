@@ -958,6 +958,9 @@ function readTrashEntries() {
       sizeBytes: dir ? dirSize(dir) : 0,
       restoreAvailable: true,
       pending: true,
+      // A queued permanent delete waits for the next start, when no Agent holds
+      // the log file, so it is still a pending entry until then.
+      purge: record.purge === true,
     })
   }
 
@@ -1230,16 +1233,28 @@ async function purgeTrashEntries(rawNames) {
   const entries = readTrashEntries()
   const byName = new Map(entries.map((entry) => [entry.entryName, entry]))
   const trashRoot = resolve(TRASH_ROOT)
+  const pending = readPendingTrash()
+  let pendingChanged = false
   const results = []
   const purged = []
+  const queued = []
 
   for (const rawName of Array.isArray(rawNames) ? rawNames : []) {
     if (typeof rawName === 'string' && rawName.startsWith('pending:')) {
-      results.push({
-        entryName: rawName,
-        status: 'failed',
-        reason: '该会话尚未完成移入（需重启 DSH 后才能彻底删除）',
-      })
+      const pendingId = rawName.slice('pending:'.length)
+      const record = pending[pendingId]
+      if (!record || typeof record !== 'object' || !byName.has(rawName)) {
+        results.push({ entryName: rawName, status: 'failed', reason: '回收站中找不到该条目' })
+        continue
+      }
+      // The session is still open, so its log cannot be removed now; queue the
+      // deletion for the next start instead of rejecting it.
+      if (record.purge !== true) {
+        pending[pendingId] = { ...record, purge: true, purgeRequestedAt: Date.now() }
+        pendingChanged = true
+      }
+      queued.push({ entryName: rawName, sessionId: pendingId })
+      results.push({ entryName: rawName, sessionId: pendingId, status: 'queued' })
       continue
     }
     if (typeof rawName !== 'string' || !byName.has(rawName)) {
@@ -1262,6 +1277,8 @@ async function purgeTrashEntries(rawNames) {
     }
   }
 
+  if (pendingChanged) writePendingTrash(pending)
+
   if (purged.length > 0) {
     appendAudit({
       at: new Date().toISOString(),
@@ -1275,15 +1292,21 @@ async function purgeTrashEntries(rawNames) {
       })),
     })
   }
-  trace('purge', 'end', `purged=${purged.length} failed=${results.length - purged.length}`)
+  trace(
+    'purge',
+    'end',
+    `purged=${purged.length} queued=${queued.length} failed=${results.length - purged.length - queued.length}`,
+  )
   return results
 }
 
 /**
- * Move deferred trash requests into the recycle bin.
+ * Finish queued deletions after start.
  *
- * Runs shortly after start, when no Agent is live yet, so moving a stored
- * session is always safe. Failures stay queued for the next attempt.
+ * Runs shortly after start, when no Agent is live yet, so moving or removing a
+ * stored session is always safe. Records flagged `purge` are destroyed here
+ * instead of moving into the recycle bin; failures stay queued for the next
+ * attempt.
  *
  * @param {object} ctx Cordis context.
  * @returns {Promise<void>} resolution after every queued session was handled.
@@ -1301,6 +1324,41 @@ async function flushPendingTrash(ctx) {
       const dir = findSessionDir(id)
       if (!dir) {
         trace('trash', 'deferred-skip', `id=${id} already gone`)
+        continue
+      }
+      // A queued permanent delete destroys the log here instead of creating a
+      // trash entry: no Agent is live yet, and the durable audit records it.
+      if (record.purge === true) {
+        const sizeBytes = dirSize(dir)
+        rmSync(dir, { recursive: true, force: true })
+        await detachFromWorkspaces(registry, id)
+        if (registry && typeof registry.unarchiveSession === 'function') {
+          try {
+            await registry.unarchiveSession(id)
+          } catch {
+            // Removing an id cannot introduce an unknown one.
+          }
+        }
+        if (registry && typeof registry.unpinSession === 'function') {
+          try {
+            await registry.unpinSession(id)
+          } catch {
+            // Already unpinned or unknown; both are harmless.
+          }
+        }
+        appendAudit({
+          at: new Date().toISOString(),
+          action: 'purge',
+          deferred: true,
+          entries: [{
+            entryName: id,
+            sessionId: id,
+            familyRoot: typeof record.familyRoot === 'string' ? record.familyRoot : id,
+            role: typeof record.role === 'string' ? record.role : 'root',
+            sizeBytes,
+          }],
+        })
+        trace('trash', 'purge-ok', `id=${id}`)
         continue
       }
       const deletedAt = Date.now()
