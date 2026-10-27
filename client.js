@@ -770,7 +770,7 @@ window.__ModuleLoader__.load({
               setTrashError('取消永久删除没有按预期生效：Host 端可能仍在运行旧版本，会话已被按旧逻辑恢复。请完全退出并重新打开 DSH 后，重新删除该会话并重试。')
               refreshNativeSessionList()
             } else {
-              setTrashNotice('已取消永久删除：会话仍在回收站（待重启整理），重启 DSH 后照常移入回收站，不会被删除。如需把会话找回来，请点「恢复会话」。')
+              setTrashNotice('已取消永久删除：会话仍在回收站（待重启整理），重启 DSH 后照常移入回收站，不会被删除。如需把会话找回来，现在会显示「恢复会话」按钮。')
             }
             await refreshTrash()
           } catch (failure) {
@@ -1024,6 +1024,9 @@ window.__ModuleLoader__.load({
                   h('span', { style: badgeStyle }, `${family.entries.length} 个会话`),
                   h('span', { style: trashMetaStyle }, formatRelative(family.deletedAt)),
                   h('span', { style: trashMetaStyle }, `${(family.totalBytes / 1048576).toFixed(1)} MB`),
+                  // A queued permanent delete offers exactly one action: abandon
+                  // it and stay in the bin. Restoring is only offered once the
+                  // entry is no longer queued for deletion.
                   queuedNames.length > 0
                     ? h(
                         'button',
@@ -1034,20 +1037,19 @@ window.__ModuleLoader__.load({
                         },
                         '放弃永久删除（留在回收站）',
                       )
-                    : null,
-                  canRestore
-                    ? h(
-                        'button',
-                        {
-                          className: 'sl-btn',
-                          style: actionButtonStyle,
-                          onClick: () => restoreFamily(family.entries.map((entry) => entry.entryName)),
-                        },
-                        family.entries.length > 1
-                          ? `恢复会话（回到会话库，${family.entries.length} 个）`
-                          : '恢复会话（回到会话库）',
-                      )
-                    : h('span', { style: badgeStyle }, '数据缺失'),
+                    : canRestore
+                      ? h(
+                          'button',
+                          {
+                            className: 'sl-btn',
+                            style: actionButtonStyle,
+                            onClick: () => restoreFamily(family.entries.map((entry) => entry.entryName)),
+                          },
+                          family.entries.length > 1
+                            ? `恢复会话（回到会话库，${family.entries.length} 个）`
+                            : '恢复会话（回到会话库）',
+                        )
+                      : h('span', { style: badgeStyle }, '数据缺失'),
                 ),
                 family.entries.map((entry) => h(
                   'div',
