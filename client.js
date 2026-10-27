@@ -1293,7 +1293,7 @@ window.__ModuleLoader__.load({
           h(
             'div',
             { style: segmentedStyle },
-            filterButton('unarchived', '未归档', totals.active),
+            filterButton('unarchived', '未归档会话', totals.active),
             filterButton('all', '全部会话', totals.total),
           ),
           selectedCount > 0
