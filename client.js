@@ -658,12 +658,16 @@ window.__ModuleLoader__.load({
         function openTrash() {
           setView('trash')
           setTrashNotice(null)
+          // A fresh visit starts with nothing selected: a selection carried over
+          // from an earlier visit would keep "永久删除" armed with stale intent.
+          setTrashSelected({})
           refreshTrash()
         }
 
         function closeTrash() {
           setView('library')
           setTrashNotice(null)
+          setTrashSelected({})
         }
 
         async function beginDelete(includeForks) {
