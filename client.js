@@ -2638,11 +2638,11 @@ window.__ModuleLoader__.load({
       justifyContent: 'flex-end',
       padding: '0 20px',
       background: 'linear-gradient(180deg, '
-        + 'rgba(243, 246, 249, 0.32) 0%, '
-        + 'rgba(196, 202, 210, 0.19) 26%, '
-        + 'rgba(118, 124, 134, 0.15) 50%, '
-        + 'rgba(196, 202, 210, 0.19) 74%, '
-        + 'rgba(243, 246, 249, 0.32) 100%)',
+        + 'rgba(243, 246, 249, 0.16) 0%, '
+        + 'rgba(196, 202, 210, 0.10) 26%, '
+        + 'rgba(118, 124, 134, 0.08) 50%, '
+        + 'rgba(196, 202, 210, 0.10) 74%, '
+        + 'rgba(243, 246, 249, 0.16) 100%)',
       backdropFilter: 'blur(8px)',
       WebkitBackdropFilter: 'blur(8px)',
       pointerEvents: 'none',
