@@ -20,6 +20,7 @@ window.__ModuleLoader__.load({
     const LOGS_CLEAR_PATH = 'api/sessions-library/logs-clear'
     const LOGS_LIMIT = 500
     const DELETE_PROGRESS_PATH = 'api/sessions-library/delete-progress'
+    const EXPORT_PATH = 'api/sessions-library/export'
 
     /**
      * Token identifying one delete batch's live progress on the Host.
@@ -45,6 +46,7 @@ window.__ModuleLoader__.load({
       'flush-purge': '被永久删除（延迟执行）',
       'queue-purge': '被排队永久删除（重启后执行）',
       'cancel-purge': '取消了排队永久删除',
+      export: '被导出为会话包',
     }
 
     /**
@@ -410,6 +412,7 @@ window.__ModuleLoader__.load({
         const [logsPhase, setLogsPhase] = React.useState('idle')
         const [logsError, setLogsError] = React.useState(null)
         const [clearLogsDialog, setClearLogsDialog] = React.useState(false)
+        const [exportDialog, setExportDialog] = React.useState(null)
         const [trashQuery, setTrashQuery] = React.useState('')
         const [trashSort, setTrashSort] = React.useState('newest')
         const [logsQuery, setLogsQuery] = React.useState('')
@@ -921,6 +924,37 @@ window.__ModuleLoader__.load({
 
         function toggleIncludeForks() {
           beginDelete(dialog === null || dialog.includeForks !== true)
+        }
+
+        /**
+         * Package the selected sessions (with their workspace membership).
+         *
+         * @returns {Promise<void>} resolution after the dialog state settled.
+         */
+        async function beginExport() {
+          const ids = selectedVisibleIds()
+          if (ids.length === 0) return
+          setExportDialog({ phase: 'busy', path: '', fileName: '', sessionCount: 0, error: null })
+          try {
+            const payload = await postJson(EXPORT_PATH, { sessionIds: ids })
+            setExportDialog({
+              phase: 'done',
+              fileName: typeof payload.fileName === 'string' ? payload.fileName : '',
+              path: typeof payload.path === 'string' ? payload.path : '',
+              sessionCount: Number(payload.sessionCount) || 0,
+              workspaceCount: Number(payload.workspaceCount) || 0,
+              bytes: Number(payload.bytes) || 0,
+              error: null,
+            })
+          } catch (failure) {
+            setExportDialog({
+              phase: 'error',
+              path: '',
+              fileName: '',
+              sessionCount: 0,
+              error: failure && failure.message ? failure.message : String(failure),
+            })
+          }
         }
 
         async function confirmDelete() {
@@ -1708,6 +1742,56 @@ window.__ModuleLoader__.load({
           )
         }
 
+        /**
+         * Render the export result dialog.
+         *
+         * @returns {object} React element.
+         */
+        function renderExportDialog() {
+          const done = exportDialog.phase === 'done'
+          const bytes = Number(exportDialog.bytes) || 0
+          return h(
+            'div',
+            { style: overlayStyle, onClick: () => setExportDialog(null) },
+            h(
+              'div',
+              { style: dialogStyle, onClick: (event) => event.stopPropagation() },
+              h('h2', { style: dialogTitleStyle }, done ? '已导出会话' : '导出会话'),
+              exportDialog.phase === 'busy'
+                ? h('p', { style: dialogHintStyle }, '正在打包会话日志与工作区信息…')
+                : null,
+              exportDialog.phase === 'error'
+                ? h('div', { style: dialogBlockerStyle }, `导出失败：${exportDialog.error}`)
+                : null,
+              done
+                ? h(
+                    'div',
+                    null,
+                    h(
+                      'p',
+                      { style: dialogHintStyle },
+                      `已导出 ${exportDialog.sessionCount} 个会话（${(bytes / 1048576).toFixed(2)} MB），`
+                        + `包内包含 ${exportDialog.workspaceCount} 个工作区的信息（ID、路径、标题）。`,
+                    ),
+                    h('div', { style: exportPathStyle }, exportDialog.path),
+                    h('p', { style: dialogHintStyle }, '会话日志按原存储格式逐字节复制；导入功能尚未实现，这个包用于先备份或跨机器携带。'),
+                  )
+                : null,
+              exportDialog.phase === 'busy'
+                ? null
+                : h(
+                    'div',
+                    { style: dialogActionsStyle },
+                    h(
+                      'button',
+                      { className: 'sl-btn', style: actionButtonStyle, onClick: () => setExportDialog(null) },
+                      '关闭',
+                    ),
+                  ),
+            ),
+          )
+        }
+
         const filterButton = (value, label, count) => h(
           'button',
           {
@@ -1773,6 +1857,17 @@ window.__ModuleLoader__.load({
                   onClick: clearSelection,
                 },
                 `清除选择 ${selectedCount}`,
+              )
+            : null,
+          selectedCount > 0
+            ? h(
+                'button',
+                {
+                  className: 'sl-btn',
+                  style: actionButtonStyle,
+                  onClick: beginExport,
+                },
+                `导出所选 ${selectedCount}`,
               )
             : null,
           h(
@@ -1991,6 +2086,7 @@ window.__ModuleLoader__.load({
           dialog !== null ? renderDialog() : null,
           purgeDialog !== null ? renderPurgeDialog() : null,
           clearLogsDialog ? renderClearLogsDialog() : null,
+          exportDialog !== null ? renderExportDialog() : null,
         )
       }
     }
@@ -2249,6 +2345,17 @@ window.__ModuleLoader__.load({
       overflow: 'hidden',
       textOverflow: 'ellipsis',
       whiteSpace: 'nowrap',
+    }
+    const exportPathStyle = {
+      margin: '10px 0',
+      padding: '8px 10px',
+      borderRadius: 6,
+      border: '1px solid color-mix(in srgb, currentColor 16%, transparent)',
+      fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+      fontSize: 12,
+      lineHeight: 1.5,
+      wordBreak: 'break-all',
+      userSelect: 'text',
     }
     const overlayStyle = {
       position: 'fixed',

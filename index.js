@@ -61,10 +61,14 @@ const TRASH_PURGE_PATH = '/api/sessions-library/trash-purge'
 const LOGS_PATH = '/api/sessions-library/logs'
 const LOGS_CLEAR_PATH = '/api/sessions-library/logs-clear'
 const DELETE_PROGRESS_PATH = '/api/sessions-library/delete-progress'
+const EXPORT_PATH = '/api/sessions-library/export'
 const DELETE_BATCH_LIMIT = 100
 const PURGE_AUDIT_FILE = join(DSH_HOME, 'sessions-library', 'audit.log')
 // Sessions deleted while still loaded are queued here and moved on next start.
 const PENDING_TRASH_FILE = join(DSH_HOME, 'sessions-library', 'pending-trash.json')
+// Exported session packages land here for the user to move between machines.
+const EXPORT_DIR = join(DSH_HOME, 'sessions-library', 'exports')
+const EXPORT_MAX_BYTES = 512 * 1024 * 1024
 
 // Identifies one Host process. The Client compares it with the value it stored
 // last time: a different value means DSH restarted, so view state resets.
@@ -837,6 +841,163 @@ function dirSize(target) {
   return total
 }
 
+// --- Export archive support -------------------------------------------------
+// Session logs are already compressed, so a stored (uncompressed) ZIP keeps the
+// archive lossless without pulling in a codec.
+
+let crc32Table = null
+
+/**
+ * Build the CRC-32 lookup table once.
+ *
+ * @returns {Uint32Array} the table.
+ */
+function getCrc32Table() {
+  if (crc32Table) return crc32Table
+  const table = new Uint32Array(256)
+  for (let index = 0; index < 256; index += 1) {
+    let value = index
+    for (let bit = 0; bit < 8; bit += 1) {
+      value = (value & 1) === 1 ? (0xedb88320 ^ (value >>> 1)) : value >>> 1
+    }
+    table[index] = value >>> 0
+  }
+  crc32Table = table
+  return table
+}
+
+/**
+ * Compute one buffer's CRC-32 checksum.
+ *
+ * @param {Buffer} buffer input bytes.
+ * @returns {number} the checksum.
+ */
+function crc32(buffer) {
+  const table = getCrc32Table()
+  let value = 0xffffffff
+  for (let index = 0; index < buffer.length; index += 1) {
+    value = table[(value ^ buffer[index]) & 0xff] ^ (value >>> 8)
+  }
+  return (value ^ 0xffffffff) >>> 0
+}
+
+/**
+ * Encode a timestamp as ZIP MS-DOS time and date fields.
+ *
+ * @param {Date} date timestamp.
+ * @returns {{ time: number, date: number }} encoded fields.
+ */
+function dosDateTime(date) {
+  const time = ((date.getHours() & 0x1f) << 11)
+    | ((date.getMinutes() & 0x3f) << 5)
+    | (Math.floor(date.getSeconds() / 2) & 0x1f)
+  const day = (((date.getFullYear() - 1980) & 0x7f) << 9)
+    | (((date.getMonth() + 1) & 0xf) << 5)
+    | (date.getDate() & 0x1f)
+  return { time, date: day }
+}
+
+/**
+ * Build one stored (uncompressed) ZIP archive.
+ *
+ * @param {Array<{ name: string, data: Buffer }>} entries archive members.
+ * @returns {Buffer} the archive bytes.
+ */
+function buildStoredZip(entries) {
+  if (entries.length > 65535) throw new Error('导出条目过多，请分批导出')
+  const locals = []
+  const centrals = []
+  const { time: dosTime, date: dosDate } = dosDateTime(new Date())
+  let offset = 0
+  for (const entry of entries) {
+    const name = Buffer.from(entry.name, 'utf8')
+    const data = entry.data
+    const checksum = crc32(data)
+    const local = Buffer.alloc(30)
+    local.writeUInt32LE(0x04034b50, 0)
+    local.writeUInt16LE(20, 4)
+    local.writeUInt16LE(0x0800, 6)
+    local.writeUInt16LE(0, 8)
+    local.writeUInt16LE(dosTime, 10)
+    local.writeUInt16LE(dosDate, 12)
+    local.writeUInt32LE(checksum, 14)
+    local.writeUInt32LE(data.length, 18)
+    local.writeUInt32LE(data.length, 22)
+    local.writeUInt16LE(name.length, 26)
+    local.writeUInt16LE(0, 28)
+    locals.push(local, name, data)
+
+    const central = Buffer.alloc(46)
+    central.writeUInt32LE(0x02014b50, 0)
+    central.writeUInt16LE(20, 4)
+    central.writeUInt16LE(20, 6)
+    central.writeUInt16LE(0x0800, 8)
+    central.writeUInt16LE(0, 10)
+    central.writeUInt16LE(dosTime, 12)
+    central.writeUInt16LE(dosDate, 14)
+    central.writeUInt32LE(checksum, 16)
+    central.writeUInt32LE(data.length, 20)
+    central.writeUInt32LE(data.length, 24)
+    central.writeUInt16LE(name.length, 28)
+    central.writeUInt16LE(0, 30)
+    central.writeUInt16LE(0, 32)
+    central.writeUInt16LE(0, 34)
+    central.writeUInt16LE(0, 36)
+    central.writeUInt32LE(0, 38)
+    central.writeUInt32LE(offset, 42)
+    centrals.push(central, name)
+
+    offset += local.length + name.length + data.length
+  }
+  const centralSize = centrals.reduce((sum, buffer) => sum + buffer.length, 0)
+  const end = Buffer.alloc(22)
+  end.writeUInt32LE(0x06054b50, 0)
+  end.writeUInt16LE(0, 4)
+  end.writeUInt16LE(0, 6)
+  end.writeUInt16LE(entries.length, 8)
+  end.writeUInt16LE(entries.length, 10)
+  end.writeUInt32LE(centralSize, 12)
+  end.writeUInt32LE(offset, 16)
+  end.writeUInt16LE(0, 20)
+  return Buffer.concat([...locals, ...centrals, end])
+}
+
+/**
+ * Read every file under one directory into archive entries.
+ *
+ * @param {string} root absolute directory.
+ * @param {string} prefix archive path prefix without a trailing slash.
+ * @param {Array<{ name: string, data: Buffer }>} entries destination.
+ * @param {number} budget remaining byte budget for this session.
+ * @returns {number} bytes read.
+ */
+function collectDirectoryEntries(root, prefix, entries, budget) {
+  let used = 0
+  const stack = [{ dir: root, rel: '' }]
+  while (stack.length > 0) {
+    const current = stack.pop()
+    let children = []
+    try {
+      children = readdirSync(current.dir, { withFileTypes: true })
+    } catch {
+      continue
+    }
+    for (const child of children) {
+      const absolute = join(current.dir, child.name)
+      const relative = current.rel === '' ? child.name : `${current.rel}/${child.name}`
+      if (child.isDirectory()) {
+        stack.push({ dir: absolute, rel: relative })
+        continue
+      }
+      const data = readFileSync(absolute)
+      used += data.length
+      if (used > budget) throw new Error('导出包超过体积上限（512 MB），请分批导出')
+      entries.push({ name: `${prefix}/${relative}`, data })
+    }
+  }
+  return used
+}
+
 /**
  * Detach a session from every workspace that accounts for it.
  *
@@ -1547,6 +1708,173 @@ async function purgeTrashEntries(rawNames) {
 }
 
 /**
+ * Export the requested sessions as one self-describing ZIP package.
+ *
+ * The package copies every session directory verbatim (logs stay in their
+ * stored format) and carries the workspace membership plus the per-session
+ * metadata an importer needs: role, parent, cwd, project directory name and
+ * archive/pin state.
+ *
+ * @param {object} ctx Cordis context.
+ * @param {any} rawIds requested root session ids.
+ * @param {AbortSignal} signal request cancellation.
+ * @returns {Promise<object>} archive description.
+ */
+async function exportSessions(ctx, rawIds, signal) {
+  const ids = normalizeIds(rawIds)
+  if (ids.length === 0) throw new Error('请先勾选要导出的会话')
+
+  const persistence = ctx.get('sessionPersistence')
+  if (!persistence || typeof persistence.list !== 'function') throw new Error('会话持久化服务不可用')
+  const outcome = await withTimeout(
+    Promise.resolve().then(() => persistence.list({ signal })),
+    SUMMARIES_TIMEOUT_MS,
+  )
+  const snapshots = !outcome.timedOut && !outcome.error && Array.isArray(outcome.value)
+    ? outcome.value
+    : []
+  if (snapshots.length === 0) throw new Error('读取会话列表失败')
+
+  const byId = new Map(snapshots.map((snapshot) => [String(snapshot.header.id), snapshot]))
+  const childrenByParent = new Map()
+  for (const snapshot of snapshots) {
+    const parent = snapshot.header.parentSession
+    if (!parent) continue
+    const parentId = String(parent)
+    const childId = String(snapshot.header.id)
+    if (!childrenByParent.has(parentId)) childrenByParent.set(parentId, [])
+    childrenByParent.get(parentId).push(childId)
+  }
+
+  // Selected sessions plus their subagent/teammate descendants, so an exported
+  // family arrives intact.
+  const selected = []
+  const seen = new Set()
+  const queue = [...ids]
+  while (queue.length > 0) {
+    const id = queue.shift()
+    if (seen.has(id)) continue
+    seen.add(id)
+    if (!byId.has(id)) continue
+    selected.push(id)
+    for (const childId of childrenByParent.get(id) ?? []) {
+      const child = byId.get(childId)
+      if (child && child.header.origin === 'subagent') queue.push(childId)
+    }
+  }
+  if (selected.length === 0) throw new Error('勾选的会话在磁盘上不存在')
+
+  const baseline = await readWorkspaceBaseline(ctx, 'export')
+  const workspaceById = new Map(
+    baseline.baseline.items.map((item) => [String(item.workspaceId), item]),
+  )
+  const archived = new Set(baseline.baseline.archivedSessionIds.map(String))
+  const pinned = new Set(baseline.baseline.pinnedSessionIds.map(String))
+  const workspaceIdsBySession = new Map()
+  for (const item of baseline.baseline.items) {
+    for (const sessionId of item.sessionIds ?? []) {
+      const key = String(sessionId)
+      if (!workspaceIdsBySession.has(key)) workspaceIdsBySession.set(key, [])
+      workspaceIdsBySession.get(key).push(String(item.workspaceId))
+    }
+  }
+
+  const titles = new Map()
+  const unknownTitleIds = []
+  for (const id of selected) {
+    const cached = titleCache.get(id)
+    if (typeof cached === 'string') titles.set(id, cached)
+    else unknownTitleIds.push(id)
+  }
+  if (unknownTitleIds.length > 0) {
+    const titleResult = await readTitles(ctx, unknownTitleIds, signal, 'export')
+    for (const [id, title] of titleResult.titles) {
+      titles.set(id, title)
+      rememberTitle(id, title)
+    }
+  }
+
+  const entries = []
+  const sessions = []
+  let totalBytes = 0
+  for (const id of selected) {
+    const snapshot = byId.get(id)
+    const dir = findSessionDir(id)
+    if (!snapshot || !dir) continue
+    const prefix = `sessions/${id}`
+    const before = entries.length
+    totalBytes += collectDirectoryEntries(dir, prefix, entries, EXPORT_MAX_BYTES - totalBytes)
+    if (entries.length === before) continue
+    const header = snapshot.header
+    sessions.push({
+      id,
+      title: titles.get(id) ?? null,
+      role: header.origin === 'subagent' ? 'subagent' : (header.parentSession ? 'fork' : 'root'),
+      parentSession: typeof header.parentSession === 'string' ? header.parentSession : null,
+      cwd: typeof header.cwd === 'string' ? header.cwd : null,
+      createdAt: typeof header.createdAt === 'number' ? header.createdAt : null,
+      formatStatus: typeof snapshot.formatStatus === 'string' ? snapshot.formatStatus : null,
+      archived: archived.has(id),
+      pinned: pinned.has(id),
+      workspaceIds: workspaceIdsBySession.get(id) ?? [],
+      projectDirName: basename(dirname(dir)),
+      files: entries.slice(before).map((entry) => entry.name.slice(prefix.length + 1)),
+    })
+  }
+  if (sessions.length === 0) throw new Error('没有可写入导出包的会话文件')
+
+  const workspaces = []
+  for (const workspaceId of [...new Set(sessions.flatMap((session) => session.workspaceIds))]) {
+    const item = workspaceById.get(workspaceId)
+    if (item) workspaces.push({ workspaceId, path: item.path, title: item.title })
+  }
+
+  const manifest = {
+    format: 'dsh-sessions-library-export',
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    source: { dshHome: DSH_HOME },
+    // Session directories are copied verbatim; an importer restores them under
+    // the target sessions root and reads workspace membership from here.
+    workspaces,
+    sessions,
+  }
+  entries.unshift({
+    name: 'manifest.json',
+    data: Buffer.from(JSON.stringify(manifest, null, 2), 'utf8'),
+  })
+
+  const archive = buildStoredZip(entries)
+  mkdirSync(EXPORT_DIR, { recursive: true })
+  const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\..+$/, '').replace('T', '-')
+  // Two exports in the same second must not overwrite each other.
+  let fileName = `dsh-sessions-${stamp}.zip`
+  let target = join(EXPORT_DIR, fileName)
+  for (let index = 2; existsSync(target); index += 1) {
+    fileName = `dsh-sessions-${stamp}-${index}.zip`
+    target = join(EXPORT_DIR, fileName)
+  }
+  writeFileSync(target, archive)
+  for (const session of sessions) {
+    appendOperation({
+      action: 'export',
+      sessionId: session.id,
+      title: session.title,
+      role: session.role,
+    })
+  }
+  trace('export', 'end', `sessions=${sessions.length} bytes=${archive.length} file=${fileName}`)
+  return {
+    fileName,
+    path: target,
+    sessionCount: sessions.length,
+    workspaceCount: workspaces.length,
+    bytes: archive.length,
+    missing: ids.filter((id) => !byId.has(id)).length,
+  }
+}
+
+/**
  * Finish queued deletions after start.
  *
  * Runs shortly after start, when no Agent is live yet, so moving or removing a
@@ -1825,6 +2153,15 @@ export function apply(ctx) {
           clearOperations()
           trace('logs', 'cleared', '')
           return jsonResponse({ ok: true })
+        },
+      },
+      {
+        path: EXPORT_PATH,
+        label: 'export',
+        handler: async (request) => {
+          const body = await readJsonBody(request)
+          const result = await exportSessions(ctx, body.sessionIds, request.signal)
+          return jsonResponse({ ok: true, ...result })
         },
       },
     ]
