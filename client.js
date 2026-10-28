@@ -237,6 +237,21 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * Order sessions for the library list: unarchived rows first, then archived
+     * rows, each block by recency (pinned rows lead inside their block).
+     *
+     * @param {object} left session.
+     * @param {object} right session.
+     * @returns {number} comparator result.
+     */
+    function compareListSessions(left, right) {
+      const leftArchived = left.archived === true
+      const rightArchived = right.archived === true
+      if (leftArchived !== rightArchived) return leftArchived ? 1 : -1
+      return compareSessions(left, right)
+    }
+
+    /**
      * Read the Host snapshot, retrying once with an absolute path when the
      * document-relative URL does not resolve.
      *
@@ -423,7 +438,7 @@ window.__ModuleLoader__.load({
           const keep = (session) => session.origin !== 'subagent' && session.blank !== true
           const groups = []
           for (const group of snapshot.workspaces || []) {
-            const sessions = (group.sessions || []).filter(keep).sort(compareSessions)
+            const sessions = (group.sessions || []).filter(keep).sort(compareListSessions)
             groups.push({
               kind: 'workspace',
               id: group.id,
@@ -432,7 +447,7 @@ window.__ModuleLoader__.load({
               sessions,
             })
           }
-          const ungrouped = (snapshot.ungrouped?.sessions || []).filter(keep).sort(compareSessions)
+          const ungrouped = (snapshot.ungrouped?.sessions || []).filter(keep).sort(compareListSessions)
           groups.push({ kind: 'ungrouped', id: '__ungrouped__', title: '未分组', sessions: ungrouped })
           return groups
         }, [snapshot])
