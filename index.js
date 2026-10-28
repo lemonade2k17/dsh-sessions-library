@@ -58,6 +58,8 @@ const DELETE_PATH = '/api/sessions-library/delete'
 const TRASH_LIST_PATH = '/api/sessions-library/trash-list'
 const TRASH_RESTORE_PATH = '/api/sessions-library/trash-restore'
 const TRASH_PURGE_PATH = '/api/sessions-library/trash-purge'
+const LOGS_PATH = '/api/sessions-library/logs'
+const LOGS_CLEAR_PATH = '/api/sessions-library/logs-clear'
 const DELETE_BATCH_LIMIT = 100
 const PURGE_AUDIT_FILE = join(DSH_HOME, 'sessions-library', 'audit.log')
 // Sessions deleted while still loaded are queued here and moved on next start.
@@ -83,6 +85,85 @@ function rememberTitle(id, title) {
   if (typeof id !== 'string' || typeof title !== 'string' || title.trim() === '') return
   if (titleCache.size >= TITLE_CACHE_LIMIT) titleCache.clear()
   titleCache.set(id, title)
+}
+
+// Operation history shown on the library's log page: one JSONL record per
+// action, appended only after the action succeeded.
+const OPERATIONS_FILE = join(DSH_HOME, 'sessions-library', 'operations.log')
+const OPERATIONS_LIMIT = 500
+const OPERATIONS_BYTES_LIMIT = 512 * 1024
+const OPERATIONS_KEEP = 1000
+
+/**
+ * Append one operation record.
+ *
+ * @param {{ action: string, sessionId?: string, title?: string | null, role?: string }} record the action.
+ */
+function appendOperation(record) {
+  try {
+    mkdirSync(dirname(OPERATIONS_FILE), { recursive: true })
+    appendFileSync(OPERATIONS_FILE, `${JSON.stringify({
+      at: new Date().toISOString(),
+      action: typeof record.action === 'string' ? record.action : 'unknown',
+      sessionId: typeof record.sessionId === 'string' ? record.sessionId : '',
+      title: typeof record.title === 'string' && record.title.trim() !== '' ? record.title : null,
+      role: typeof record.role === 'string' ? record.role : 'root',
+    })}\n`)
+    trimOperations()
+  } catch {
+    // History must never block an operation.
+  }
+}
+
+/** Keep the history file bounded by dropping the oldest records. */
+function trimOperations() {
+  try {
+    if (statSync(OPERATIONS_FILE).size <= OPERATIONS_BYTES_LIMIT) return
+    const lines = readFileSync(OPERATIONS_FILE, 'utf8')
+      .split('\n')
+      .filter((line) => line.trim() !== '')
+    writeFileSync(OPERATIONS_FILE, `${lines.slice(-OPERATIONS_KEEP).join('\n')}\n`)
+  } catch {
+    // A failed trim only costs disk space.
+  }
+}
+
+/**
+ * Read the most recent operations, newest first.
+ *
+ * @param {any} limit requested row count.
+ * @returns {Array<object>} operation records.
+ */
+function readOperations(limit) {
+  let lines = []
+  try {
+    lines = readFileSync(OPERATIONS_FILE, 'utf8').split('\n').filter((line) => line.trim() !== '')
+  } catch {
+    return []
+  }
+  const parsedLimit = Number(limit)
+  const wanted = Number.isFinite(parsedLimit) && parsedLimit > 0
+    ? Math.min(OPERATIONS_LIMIT, Math.floor(parsedLimit))
+    : OPERATIONS_LIMIT
+  const entries = []
+  for (let index = lines.length - 1; index >= 0 && entries.length < wanted; index -= 1) {
+    try {
+      const value = JSON.parse(lines[index])
+      if (value && typeof value === 'object') entries.push(value)
+    } catch {
+      // Skip a corrupt line instead of dropping the whole history.
+    }
+  }
+  return entries
+}
+
+/** Remove the operation history. */
+function clearOperations() {
+  try {
+    rmSync(OPERATIONS_FILE, { force: true })
+  } catch {
+    // A failed clear leaves the old history in place.
+  }
 }
 
 /**
@@ -1101,6 +1182,7 @@ async function trashSessions(ctx, rawIds, signal, includeForks) {
         }
         pendingChanged = true
         trace('trash', 'deferred', `id=${member.id} family=${family.rootId}`)
+        appendOperation({ action: 'defer', sessionId: member.id, title: member.title, role: member.role })
         results.push({ id: member.id, familyRoot: family.rootId, role: member.role, status: 'deferred' })
         continue
       }
@@ -1152,6 +1234,7 @@ async function trashSessions(ctx, rawIds, signal, includeForks) {
         }, null, 2))
 
         trace('trash', 'end', `ok id=${member.id} family=${family.rootId} role=${member.role} entry=${entryName}`)
+        appendOperation({ action: 'trash', sessionId: member.id, title: member.title, role: member.role })
         results.push({ id: member.id, familyRoot: family.rootId, role: member.role, status: 'trashed', entryName })
       } catch (error) {
         trace('trash', 'end', `throw id=${member.id} ${describeError(error)}`)
@@ -1206,6 +1289,12 @@ async function restoreTrashEntries(ctx, rawNames, signal, options = {}) {
         currentPending[pendingId] = kept
         writePendingTrash(currentPending)
         trace('restore', 'end', `cancel-purge id=${pendingId}`)
+        appendOperation({
+          action: 'cancel-purge',
+          sessionId: pendingId,
+          title: typeof queued.title === 'string' ? queued.title : null,
+          role: typeof queued.role === 'string' ? queued.role : 'root',
+        })
         results.push({ entryName: rawName, sessionId: pendingId, status: 'canceled' })
         continue
       }
@@ -1222,6 +1311,12 @@ async function restoreTrashEntries(ctx, rawNames, signal, options = {}) {
         // The session was archived only to hide it during deletion.
       }
       trace('restore', 'end', `ok pending id=${pendingId}`)
+      appendOperation({
+        action: 'restore',
+        sessionId: pendingId,
+        title: typeof record.title === 'string' ? record.title : null,
+        role: typeof record.role === 'string' ? record.role : 'root',
+      })
       results.push({ entryName: rawName, sessionId: pendingId, status: 'restored' })
       continue
     }
@@ -1290,6 +1385,12 @@ async function restoreTrashEntries(ctx, rawNames, signal, options = {}) {
       }
 
       trace('restore', 'end', `ok id=${manifest.id} entry=${rawName}`)
+      appendOperation({
+        action: 'restore',
+        sessionId: manifest.id,
+        title: typeof manifest.title === 'string' ? manifest.title : null,
+        role: typeof manifest.role === 'string' ? manifest.role : 'root',
+      })
       results.push({ entryName: rawName, sessionId: manifest.id, status: 'restored' })
     } catch (error) {
       trace('restore', 'end', `throw entry=${rawName} ${describeError(error)}`)
@@ -1346,6 +1447,12 @@ async function purgeTrashEntries(rawNames) {
       if (record.purge !== true) {
         pending[pendingId] = { ...record, purge: true, purgeRequestedAt: Date.now() }
         pendingChanged = true
+        appendOperation({
+          action: 'queue-purge',
+          sessionId: pendingId,
+          title: typeof record.title === 'string' ? record.title : null,
+          role: typeof record.role === 'string' ? record.role : 'root',
+        })
       }
       queued.push({ entryName: rawName, sessionId: pendingId })
       results.push({ entryName: rawName, sessionId: pendingId, status: 'queued' })
@@ -1364,6 +1471,12 @@ async function purgeTrashEntries(rawNames) {
         continue
       }
       rmSync(entryDir, { recursive: true, force: true })
+      appendOperation({
+        action: 'purge',
+        sessionId: typeof entry.sessionId === 'string' ? entry.sessionId : '',
+        title: typeof entry.title === 'string' ? entry.title : null,
+        role: typeof entry.role === 'string' ? entry.role : 'root',
+      })
       results.push({ entryName: rawName, sessionId: entry.sessionId, status: 'purged', sizeBytes: entry.sizeBytes })
       purged.push(entry)
     } catch (error) {
@@ -1453,6 +1566,12 @@ async function flushPendingTrash(ctx) {
           }],
         })
         trace('trash', 'purge-ok', `id=${id}`)
+        appendOperation({
+          action: 'flush-purge',
+          sessionId: id,
+          title: typeof record.title === 'string' ? record.title : null,
+          role: typeof record.role === 'string' ? record.role : 'root',
+        })
         continue
       }
       const deletedAt = Date.now()
@@ -1495,6 +1614,12 @@ async function flushPendingTrash(ctx) {
         deferred: true,
       }, null, 2))
       trace('trash', 'deferred-ok', `id=${id}`)
+      appendOperation({
+        action: 'flush-trash',
+        sessionId: id,
+        title: typeof record.title === 'string' ? record.title : null,
+        role: typeof record.role === 'string' ? record.role : 'root',
+      })
     } catch (error) {
       remaining[id] = record
       trace('trash', 'deferred-fail', `id=${id} ${describeError(error)}`)
@@ -1600,6 +1725,23 @@ export function apply(ctx) {
           const body = await readJsonBody(request)
           const results = await purgeTrashEntries(body.entryNames)
           return jsonResponse({ ok: true, results })
+        },
+      },
+      {
+        path: LOGS_PATH,
+        label: 'logs',
+        handler: async (request) => {
+          const body = await readJsonBody(request)
+          return jsonResponse({ ok: true, entries: readOperations(body.limit) })
+        },
+      },
+      {
+        path: LOGS_CLEAR_PATH,
+        label: 'logs-clear',
+        handler: async () => {
+          clearOperations()
+          trace('logs', 'cleared', '')
+          return jsonResponse({ ok: true })
         },
       },
     ]
