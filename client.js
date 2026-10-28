@@ -253,6 +253,10 @@ window.__ModuleLoader__.load({
       '.sl-btn:hover { background: color-mix(in srgb, currentColor 8%, transparent); }',
       '.sl-btn:disabled { cursor: not-allowed; opacity: 0.5; }',
       '.sl-fab:hover:not(:disabled) { background: color-mix(in srgb, currentColor 18%, Canvas); }',
+      // Export dock backdrop: dark edges over a light theme, light edges over a
+      // dark theme, so the strip stays visible in both palettes.
+      '.sl-dock { background: linear-gradient(180deg, rgba(28, 32, 38, 0.16) 0%, rgba(110, 116, 126, 0.10) 26%, rgba(235, 238, 243, 0.06) 50%, rgba(110, 116, 126, 0.10) 74%, rgba(28, 32, 38, 0.16) 100%); }',
+      'body[data-ds-dark-theme] .sl-dock { background: linear-gradient(180deg, rgba(243, 246, 249, 0.16) 0%, rgba(196, 202, 210, 0.10) 26%, rgba(118, 124, 134, 0.08) 50%, rgba(196, 202, 210, 0.10) 74%, rgba(243, 246, 249, 0.16) 100%); }',
       '.sl-input::placeholder { color: color-mix(in srgb, currentColor 45%, transparent); }',
       '.sl-input:focus { outline: 2px solid color-mix(in srgb, currentColor 28%, transparent); outline-offset: -1px; }',
     ].join('\n')
@@ -2315,7 +2319,7 @@ window.__ModuleLoader__.load({
           view === 'library'
             ? h(
                 'div',
-                { style: exportDockStyle },
+                { className: 'sl-dock', style: exportDockStyle },
                 h(
                   'button',
                   {
@@ -2637,12 +2641,6 @@ window.__ModuleLoader__.load({
       alignItems: 'center',
       justifyContent: 'flex-end',
       padding: '0 20px',
-      background: 'linear-gradient(180deg, '
-        + 'rgba(243, 246, 249, 0.16) 0%, '
-        + 'rgba(196, 202, 210, 0.10) 26%, '
-        + 'rgba(118, 124, 134, 0.08) 50%, '
-        + 'rgba(196, 202, 210, 0.10) 74%, '
-        + 'rgba(243, 246, 249, 0.16) 100%)',
       backdropFilter: 'blur(8px)',
       WebkitBackdropFilter: 'blur(8px)',
       pointerEvents: 'none',
