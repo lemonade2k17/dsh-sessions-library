@@ -202,7 +202,7 @@ window.__ModuleLoader__.load({
     }
 
     const CSS = [
-      '.sl-root { height: 100%; min-height: 0; display: flex; flex-direction: column; color: inherit; }',
+      '.sl-root { position: relative; height: 100%; min-height: 0; display: flex; flex-direction: column; color: inherit; }',
       '.sl-root * { box-sizing: border-box; }',
       '.sl-scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 4px 24px 24px; }',
       '.sl-scroll::-webkit-scrollbar { width: 10px; }',
@@ -210,6 +210,8 @@ window.__ModuleLoader__.load({
       '.sl-group-head:hover { background: color-mix(in srgb, currentColor 6%, transparent); }',
       '.sl-row:hover { background: color-mix(in srgb, currentColor 8%, transparent); }',
       '.sl-btn:hover { background: color-mix(in srgb, currentColor 8%, transparent); }',
+      '.sl-btn:disabled { cursor: not-allowed; opacity: 0.5; }',
+      '.sl-fab:hover:not(:disabled) { background: color-mix(in srgb, currentColor 18%, Canvas); }',
       '.sl-input::placeholder { color: color-mix(in srgb, currentColor 45%, transparent); }',
       '.sl-input:focus { outline: 2px solid color-mix(in srgb, currentColor 28%, transparent); outline-offset: -1px; }',
     ].join('\n')
@@ -1859,17 +1861,6 @@ window.__ModuleLoader__.load({
                 `清除选择 ${selectedCount}`,
               )
             : null,
-          selectedCount > 0
-            ? h(
-                'button',
-                {
-                  className: 'sl-btn',
-                  style: actionButtonStyle,
-                  onClick: beginExport,
-                },
-                `导出所选 ${selectedCount}`,
-              )
-            : null,
           h(
             'button',
             {
@@ -2080,6 +2071,24 @@ window.__ModuleLoader__.load({
             ? h('div', { style: warnStyle }, `刷新失败：${refreshError}（显示的是上次读取的结果）`)
             : null,
           h('div', { className: 'sl-scroll' }, body),
+          // Always-visible export action at the bottom right: disabled while the
+          // selection is empty so it cannot be triggered by accident.
+          view === 'library'
+            ? h(
+                'button',
+                {
+                  type: 'button',
+                  className: 'sl-btn sl-fab',
+                  style: selectedCount > 0 ? fabButtonStyle : fabDisabledStyle,
+                  disabled: selectedCount === 0,
+                  title: selectedCount > 0
+                    ? `导出所选的 ${selectedCount} 个会话`
+                    : '请先勾选要导出的会话',
+                  onClick: beginExport,
+                },
+                selectedCount > 0 ? `导出所选 ${selectedCount}` : '导出所选',
+              )
+            : null,
           sources !== ''
             ? h('div', { style: footerStyle }, sources)
             : null,
@@ -2356,6 +2365,30 @@ window.__ModuleLoader__.load({
       lineHeight: 1.5,
       wordBreak: 'break-all',
       userSelect: 'text',
+    }
+    // Floating export action pinned to the page's bottom-right corner.
+    const fabButtonStyle = {
+      position: 'absolute',
+      right: 24,
+      bottom: 20,
+      zIndex: 30,
+      height: 38,
+      padding: '0 18px',
+      borderRadius: 999,
+      border: '1px solid color-mix(in srgb, currentColor 24%, transparent)',
+      background: 'color-mix(in srgb, currentColor 12%, Canvas)',
+      color: 'inherit',
+      font: 'inherit',
+      fontSize: 13,
+      fontWeight: 600,
+      boxShadow: '0 6px 20px rgba(0, 0, 0, 0.28)',
+      cursor: 'pointer',
+    }
+    const fabDisabledStyle = {
+      ...fabButtonStyle,
+      opacity: 0.45,
+      cursor: 'not-allowed',
+      boxShadow: 'none',
     }
     const overlayStyle = {
       position: 'fixed',
