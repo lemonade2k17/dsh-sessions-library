@@ -211,6 +211,20 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * Format a timestamp as a local, second-precise wall-clock label.
+     *
+     * @param {number} timestamp epoch milliseconds.
+     * @returns {string} `YYYY-MM-DD HH:mm:ss`, or an empty string for no value.
+     */
+    function formatAbsolute(timestamp) {
+      if (typeof timestamp !== 'number' || timestamp <= 0) return ''
+      const date = new Date(timestamp)
+      const pad = (value) => String(value).padStart(2, '0')
+      return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} `
+        + `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
+    }
+
+    /**
      * Order pinned sessions first, then most recently active first.
      *
      * @param {object} left session.
@@ -1054,7 +1068,7 @@ window.__ModuleLoader__.load({
                     rootEntry.title && rootEntry.title.trim() !== '' ? rootEntry.title : rootEntry.sessionId,
                   ),
                   h('span', { style: badgeStyle }, `${family.entries.length} 个会话`),
-                  h('span', { style: trashMetaStyle }, formatRelative(family.deletedAt)),
+                  h('span', { style: trashMetaStyle }, formatAbsolute(family.deletedAt)),
                   h('span', { style: trashMetaStyle }, `${(family.totalBytes / 1048576).toFixed(1)} MB`),
                   // A queued permanent delete offers exactly one action: abandon
                   // it and stay in the bin. Restoring is only offered once the
@@ -1099,6 +1113,11 @@ window.__ModuleLoader__.load({
                     { style: sessionTitleStyle },
                     entry.title && entry.title.trim() !== '' ? entry.title : entry.sessionId,
                   ),
+                  // Members of one delete share the family timestamp; only a
+                  // pending member (or a mixed family) carries its own.
+                  entry.deletedAt !== family.deletedAt
+                    ? h('span', { style: trashMetaStyle }, formatAbsolute(entry.deletedAt))
+                    : null,
                   h('span', { style: trashMetaStyle }, `${(entry.sizeBytes / 1048576).toFixed(1)} MB`),
                 )),
               )
