@@ -322,6 +322,9 @@ window.__ModuleLoader__.load({
         // The effect reads the newest snapshot without depending on it.
         const snapshotRef = React.useRef(snapshot)
         snapshotRef.current = snapshot
+        // The poll reads the current view without restarting its interval.
+        const viewRef = React.useRef(view)
+        viewRef.current = view
 
         React.useEffect(() => {
           let cancelled = false
@@ -358,9 +361,10 @@ window.__ModuleLoader__.load({
           }
         }, [reloadToken])
 
-        // Visible-page polling: archiving happens in the native sidebar, so the
-        // library re-reads the whole snapshot every 15s while it is on screen.
-        // Hidden tabs pause; coming back refreshes once immediately.
+        // Visible-page polling: archiving happens in the native sidebar, files
+        // move on other views, and the startup flush turns deferred deletions
+        // into real bin entries. The view that is on screen re-reads its data
+        // every 15s; hidden tabs pause and refresh once when they come back.
         React.useEffect(() => {
           let timer = null
           const isVisible = () => document.visibilityState !== 'hidden'
@@ -370,16 +374,23 @@ window.__ModuleLoader__.load({
               timer = null
             }
           }
+          const tick = () => {
+            if (!isVisible()) return
+            if (viewRef.current === 'trash') {
+              // Silent: a poll must not flash the loading or error placeholder.
+              refreshTrash({ silent: true })
+            } else {
+              setReloadToken((token) => token + 1)
+            }
+          }
           const start = () => {
             if (timer !== null || !isVisible()) return
-            timer = setInterval(() => {
-              if (isVisible()) setReloadToken((token) => token + 1)
-            }, 15000)
+            timer = setInterval(tick, 15000)
           }
           const onVisibility = () => {
             if (isVisible()) {
               start()
-              setReloadToken((token) => token + 1)
+              tick()
             } else {
               stop()
             }
@@ -635,9 +646,20 @@ window.__ModuleLoader__.load({
           return ids
         }
 
-        async function refreshTrash() {
-          setTrashPhase('loading')
-          setTrashError(null)
+        /**
+         * Re-read the recycle bin.
+         *
+         * @param {{ silent?: boolean }} [options] silent keeps the current list on
+         *   screen: it backs the visible-page poll, which must not flash the
+         *   loading or error placeholder every time it ticks.
+         * @returns {Promise<void>} resolution after the list was refreshed.
+         */
+        async function refreshTrash(options = {}) {
+          const silent = options.silent === true
+          if (!silent) {
+            setTrashPhase('loading')
+            setTrashError(null)
+          }
           try {
             const payload = await postJson('api/sessions-library/trash-list', {})
             const entries = Array.isArray(payload.entries) ? payload.entries : []
@@ -650,6 +672,9 @@ window.__ModuleLoader__.load({
             })
             setTrashPhase('ready')
           } catch (failure) {
+            // A silent failure keeps the last good list instead of replacing it
+            // with an error screen the user did not ask for.
+            if (silent) return
             setTrashPhase('error')
             setTrashError(failure && failure.message ? failure.message : String(failure))
           }
@@ -668,6 +693,9 @@ window.__ModuleLoader__.load({
           setView('library')
           setTrashNotice(null)
           setTrashSelected({})
+          // Time spent in the bin may have changed the library (restores and
+          // purges), so pull a fresh snapshot when the library comes back.
+          setReloadToken((token) => token + 1)
         }
 
         async function beginDelete(includeForks) {
@@ -714,7 +742,11 @@ window.__ModuleLoader__.load({
             })
             const results = Array.isArray(payload.results) ? payload.results : []
             const trashedIds = results.filter((result) => result.status === 'trashed').map((result) => result.id)
+            const deferredCount = results.filter((result) => result.status === 'deferred').length
             setDialog((current) => ({ ...(current || {}), phase: 'done', results }))
+            // Keep the bin warm without leaving the library: the next visit sees
+            // the new entries, and a deferred one is listed as pending at once.
+            if (trashedIds.length > 0 || deferredCount > 0) refreshTrash({ silent: true })
             if (trashedIds.length > 0) {
               setSelected((current) => {
                 const next = { ...current }
