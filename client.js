@@ -54,6 +54,15 @@ window.__ModuleLoader__.load({
       }
     }
 
+    /** Forget the chosen export directory (a DSH restart starts from default). */
+    function clearExportDir() {
+      try {
+        window.localStorage.removeItem(EXPORT_DIR_STORAGE_KEY)
+      } catch {
+        // Storage is best effort.
+      }
+    }
+
     /**
      * Token identifying one delete batch's live progress on the Host.
      *
@@ -787,7 +796,7 @@ window.__ModuleLoader__.load({
 
         /**
          * Restore the first-visit defaults: unarchived view, every group
-         * collapsed, nothing selected.
+         * collapsed, nothing selected, and the default export location.
          */
         function resetViewState() {
           const emptyExpansion = { unarchived: {}, all: {} }
@@ -797,6 +806,9 @@ window.__ModuleLoader__.load({
           setFilter('unarchived')
           setSelected({})
           setShowAll({})
+          // The export destination is remembered only inside one DSH run.
+          clearExportDir()
+          setExportTarget('')
         }
 
         /**
