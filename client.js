@@ -225,6 +225,21 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * Normalize the Host report about how much of a batch the Host accepts.
+     *
+     * @param {any} value raw payload field.
+     * @returns {{ max: number, requested: number, accepted: number } | null} limit info.
+     */
+    function readBatchLimit(value) {
+      if (!value || typeof value !== 'object') return null
+      const max = Number(value.max)
+      const requested = Number(value.requested)
+      const accepted = Number(value.accepted)
+      if (!Number.isFinite(max) || !Number.isFinite(requested) || !Number.isFinite(accepted)) return null
+      return { max, requested, accepted }
+    }
+
+    /**
      * Order pinned sessions first, then most recently active first.
      *
      * @param {object} left session.
@@ -731,7 +746,7 @@ window.__ModuleLoader__.load({
           const ids = selectedVisibleIds()
           if (ids.length === 0) return
           const withForks = includeForks === true
-          setDialog({ phase: 'loading', families: [], results: [], includeForks: withForks, error: null })
+          setDialog({ phase: 'loading', families: [], results: [], includeForks: withForks, error: null, limit: null })
           try {
             const payload = await postJson('api/sessions-library/delete-preflight', {
               sessionIds: ids,
@@ -743,6 +758,7 @@ window.__ModuleLoader__.load({
               results: [],
               includeForks: withForks,
               error: null,
+              limit: readBatchLimit(payload.limit),
             })
           } catch (failure) {
             setDialog({
@@ -751,6 +767,7 @@ window.__ModuleLoader__.load({
               results: [],
               includeForks: withForks,
               error: failure && failure.message ? failure.message : String(failure),
+              limit: null,
             })
           }
         }
@@ -772,7 +789,12 @@ window.__ModuleLoader__.load({
             const results = Array.isArray(payload.results) ? payload.results : []
             const trashedIds = results.filter((result) => result.status === 'trashed').map((result) => result.id)
             const deferredCount = results.filter((result) => result.status === 'deferred').length
-            setDialog((current) => ({ ...(current || {}), phase: 'done', results }))
+            setDialog((current) => ({
+              ...(current || {}),
+              phase: 'done',
+              results,
+              limit: readBatchLimit(payload.limit) || (current && current.limit) || null,
+            }))
             // Keep the bin warm without leaving the library: the next visit sees
             // the new entries, and a deferred one is listed as pending at once.
             if (trashedIds.length > 0 || deferredCount > 0) refreshTrash({ silent: true })
@@ -1156,6 +1178,8 @@ window.__ModuleLoader__.load({
           )
           const forkCandidates = forkTotal + forkIncluded
           const roleLabel = { root: '会话', subagent: '子智能体/队友', fork: '分叉' }
+          const limit = dialog.limit || null
+          const truncated = Boolean(limit && limit.requested > limit.accepted)
 
           const familyBlocks = families.map((family) => h(
             'div',
@@ -1216,6 +1240,15 @@ window.__ModuleLoader__.load({
                   : `将移入 ${memberTotal} 个会话${dialog.includeForks === true ? '（含分叉）' : ''}；子智能体/队友会一并移入，可从回收站恢复，不会彻底删除文件。`,
               ),
               dialog.phase === 'loading' ? h('div', { style: dialogTextStyle }, '正在检查…') : null,
+              // The Host accepts a bounded batch; never let the rest look
+              // processed when it was silently dropped.
+              truncated
+                ? h(
+                    'div',
+                    { style: loadedHintStyle },
+                    `本次勾选了 ${limit.requested} 个会话，单次最多处理 ${limit.max} 个，因此只会处理前 ${limit.accepted} 个；其余 ${limit.requested - limit.accepted} 个请再删一次。`,
+                  )
+                : null,
               dialog.phase === 'busy' ? h('div', { style: dialogTextStyle }, '正在移入回收站…') : null,
               dialog.phase === 'error' ? h('div', { style: dialogBlockerStyle }, `失败：${dialog.error}`) : null,
               dialog.phase === 'ready' ? h('div', { style: dialogListStyle }, familyBlocks) : null,

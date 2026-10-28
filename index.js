@@ -627,21 +627,31 @@ async function readJsonBody(request) {
 }
 
 /**
+ * Normalize a session-id list and report how much of it the batch accepts.
+ *
+ * @param {any} value raw value.
+ * @returns {{ ids: string[], requested: number }} accepted ids and requested unique count.
+ */
+function normalizeIdList(value) {
+  if (!Array.isArray(value)) return { ids: [], requested: 0 }
+  const unique = []
+  for (const item of value) {
+    if (typeof item !== 'string') continue
+    const id = item.trim()
+    if (id === '' || id.includes('/') || id.includes('\\') || id.includes('..')) continue
+    if (!unique.includes(id)) unique.push(id)
+  }
+  return { ids: unique.slice(0, DELETE_BATCH_LIMIT), requested: unique.length }
+}
+
+/**
  * Normalize a session-id list from a request body.
  *
  * @param {any} value raw value.
  * @returns {string[]} unique safe ids.
  */
 function normalizeIds(value) {
-  if (!Array.isArray(value)) return []
-  const ids = []
-  for (const item of value) {
-    if (typeof item !== 'string') continue
-    const id = item.trim()
-    if (id === '' || id.includes('/') || id.includes('\\') || id.includes('..')) continue
-    ids.push(id)
-  }
-  return [...new Set(ids)].slice(0, DELETE_BATCH_LIMIT)
+  return normalizeIdList(value).ids
 }
 
 /**
@@ -1466,13 +1476,25 @@ export function apply(ctx) {
         label: 'delete-preflight',
         handler: async (request) => {
           const body = await readJsonBody(request)
+          const normalized = normalizeIdList(body.sessionIds)
+          if (normalized.requested > normalized.ids.length) {
+            trace('delete-preflight', 'limit', `requested=${normalized.requested} accepted=${normalized.ids.length}`)
+          }
           const families = await buildDeletePreflight(
             ctx,
-            normalizeIds(body.sessionIds),
+            normalized.ids,
             request.signal,
             body.includeForks === true,
           )
-          return jsonResponse({ ok: true, families })
+          return jsonResponse({
+            ok: true,
+            families,
+            limit: {
+              max: DELETE_BATCH_LIMIT,
+              requested: normalized.requested,
+              accepted: normalized.ids.length,
+            },
+          })
         },
       },
       {
@@ -1480,8 +1502,21 @@ export function apply(ctx) {
         label: 'delete',
         handler: async (request) => {
           const body = await readJsonBody(request)
-          const outcome = await trashSessions(ctx, body.sessionIds, request.signal, body.includeForks === true)
-          return jsonResponse({ ok: true, results: outcome.results, families: outcome.families })
+          const normalized = normalizeIdList(body.sessionIds)
+          if (normalized.requested > normalized.ids.length) {
+            trace('delete', 'limit', `requested=${normalized.requested} accepted=${normalized.ids.length}`)
+          }
+          const outcome = await trashSessions(ctx, normalized.ids, request.signal, body.includeForks === true)
+          return jsonResponse({
+            ok: true,
+            results: outcome.results,
+            families: outcome.families,
+            limit: {
+              max: DELETE_BATCH_LIMIT,
+              requested: normalized.requested,
+              accepted: normalized.ids.length,
+            },
+          })
         },
       },
       {
