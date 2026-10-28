@@ -986,7 +986,10 @@ window.__ModuleLoader__.load({
          */
         async function pickExportDirectory() {
           try {
-            const picker = ctx.remote && ctx.remote.directoryPicker
+            // Services are reached through ctx.get: reading `ctx.remote` directly
+            // throws unless the plugin declared it in its inject list.
+            const remote = ctx.get('remote')
+            const picker = remote && remote.directoryPicker
             if (!picker || typeof picker.pick !== 'function') {
               setExportDialog((current) => (current
                 ? { ...current, error: '当前环境不支持文件夹选择；可以直接输入路径，或留空使用默认位置。' }
