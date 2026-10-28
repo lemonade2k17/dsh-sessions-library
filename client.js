@@ -2583,14 +2583,12 @@ window.__ModuleLoader__.load({
       textOverflow: 'ellipsis',
       whiteSpace: 'nowrap',
     }
+    // Result path: plain selectable text, not a boxed field.
     const exportPathStyle = {
-      margin: '10px 0',
-      padding: '8px 10px',
-      borderRadius: 6,
-      border: '1px solid color-mix(in srgb, currentColor 16%, transparent)',
+      margin: '8px 0 10px',
       fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
       fontSize: 12,
-      lineHeight: 1.5,
+      lineHeight: 1.7,
       wordBreak: 'break-all',
       userSelect: 'text',
     }
