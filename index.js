@@ -60,6 +60,7 @@ const TRASH_RESTORE_PATH = '/api/sessions-library/trash-restore'
 const TRASH_PURGE_PATH = '/api/sessions-library/trash-purge'
 const LOGS_PATH = '/api/sessions-library/logs'
 const LOGS_CLEAR_PATH = '/api/sessions-library/logs-clear'
+const DELETE_PROGRESS_PATH = '/api/sessions-library/delete-progress'
 const DELETE_BATCH_LIMIT = 100
 const PURGE_AUDIT_FILE = join(DSH_HOME, 'sessions-library', 'audit.log')
 // Sessions deleted while still loaded are queued here and moved on next start.
@@ -164,6 +165,32 @@ function clearOperations() {
   } catch {
     // A failed clear leaves the old history in place.
   }
+}
+
+// Live progress for running delete batches: one entry per Client-supplied
+// token, polled by the dialog while the delete request is in flight.
+const DELETE_PROGRESS_TTL_MS = 120000
+const deleteProgress = new Map()
+
+/** Drop finished or abandoned progress entries. */
+function pruneDeleteProgress() {
+  const now = Date.now()
+  for (const [token, entry] of deleteProgress) {
+    if (now - entry.at > DELETE_PROGRESS_TTL_MS) deleteProgress.delete(token)
+  }
+}
+
+/**
+ * Advance one batch's progress.
+ *
+ * @param {object | null} progress live progress entry.
+ * @param {unknown} current title of the session just handled.
+ */
+function bumpDeleteProgress(progress, current) {
+  if (!progress || typeof progress !== 'object') return
+  progress.done += 1
+  progress.current = typeof current === 'string' ? current : ''
+  progress.at = Date.now()
 }
 
 /**
@@ -1123,13 +1150,20 @@ function readTrashEntries() {
  * @param {any} rawIds requested root session ids.
  * @param {AbortSignal} signal request cancellation.
  * @param {boolean} includeForks whether fork children travel with the family.
+ * @param {object | null} [progress] live progress entry the Client polls.
  * @returns {Promise<{ results: Array<object>, families: Array<object> }>} per-member results and family summaries.
  */
-async function trashSessions(ctx, rawIds, signal, includeForks) {
+async function trashSessions(ctx, rawIds, signal, includeForks, progress = null) {
   const ids = normalizeIds(rawIds)
   if (ids.length === 0) return { results: [], families: [] }
 
   const preflight = await buildDeletePreflight(ctx, ids, signal, includeForks)
+  if (progress) {
+    // Total work is one step per family member; skipped families count too so
+    // the bar still reaches the end when everything was blocked.
+    progress.total = preflight.reduce((sum, family) => sum + family.members.length, 0)
+    progress.at = Date.now()
+  }
   const baseline = await readWorkspaceBaseline(ctx, 'trash')
   const archived = new Set(baseline.baseline.archivedSessionIds)
   const pinned = new Set(baseline.baseline.pinnedSessionIds)
@@ -1148,6 +1182,7 @@ async function trashSessions(ctx, rawIds, signal, includeForks) {
           status: 'skipped',
           reason: family.blockers.map((blocker) => blocker.message).join('；'),
         })
+        bumpDeleteProgress(progress, member.title)
       }
       continue
     }
@@ -1184,12 +1219,14 @@ async function trashSessions(ctx, rawIds, signal, includeForks) {
         trace('trash', 'deferred', `id=${member.id} family=${family.rootId}`)
         appendOperation({ action: 'defer', sessionId: member.id, title: member.title, role: member.role })
         results.push({ id: member.id, familyRoot: family.rootId, role: member.role, status: 'deferred' })
+        bumpDeleteProgress(progress, member.title)
         continue
       }
       try {
         const dir = findSessionDir(member.id)
         if (!dir) {
           results.push({ id: member.id, familyRoot: family.rootId, status: 'failed', reason: '找不到会话目录' })
+          bumpDeleteProgress(progress, member.title)
           continue
         }
         const entryName = `${deletedAt}-${member.id}`
@@ -1236,9 +1273,11 @@ async function trashSessions(ctx, rawIds, signal, includeForks) {
         trace('trash', 'end', `ok id=${member.id} family=${family.rootId} role=${member.role} entry=${entryName}`)
         appendOperation({ action: 'trash', sessionId: member.id, title: member.title, role: member.role })
         results.push({ id: member.id, familyRoot: family.rootId, role: member.role, status: 'trashed', entryName })
+        bumpDeleteProgress(progress, member.title)
       } catch (error) {
         trace('trash', 'end', `throw id=${member.id} ${describeError(error)}`)
         results.push({ id: member.id, familyRoot: family.rootId, status: 'failed', reason: describeError(error) })
+        bumpDeleteProgress(progress, member.title)
       }
     }
 
@@ -1687,18 +1726,62 @@ export function apply(ctx) {
           if (normalized.requested > normalized.ids.length) {
             trace('delete', 'limit', `requested=${normalized.requested} accepted=${normalized.ids.length}`)
           }
+          const token = typeof body.progressToken === 'string' && body.progressToken.length > 0
+            && body.progressToken.length <= 64
+            ? body.progressToken
+            : null
+          let progress = null
+          if (token !== null) {
+            pruneDeleteProgress()
+            progress = { done: 0, total: 0, current: '', finished: false, at: Date.now() }
+            deleteProgress.set(token, progress)
+          }
           const deleteStartedAt = Date.now()
-          const outcome = await trashSessions(ctx, normalized.ids, request.signal, body.includeForks === true)
-          trace('delete', 'done', `results=${outcome.results.length} ms=${Date.now() - deleteStartedAt}`)
+          try {
+            const outcome = await trashSessions(
+              ctx,
+              normalized.ids,
+              request.signal,
+              body.includeForks === true,
+              progress,
+            )
+            trace('delete', 'done', `results=${outcome.results.length} ms=${Date.now() - deleteStartedAt}`)
+            return jsonResponse({
+              ok: true,
+              results: outcome.results,
+              families: outcome.families,
+              limit: {
+                max: DELETE_BATCH_LIMIT,
+                requested: normalized.requested,
+                accepted: normalized.ids.length,
+              },
+            })
+          } finally {
+            if (progress) {
+              progress.finished = true
+              progress.at = Date.now()
+            }
+          }
+        },
+      },
+      {
+        path: DELETE_PROGRESS_PATH,
+        label: 'delete-progress',
+        handler: async (request) => {
+          const body = await readJsonBody(request)
+          const token = typeof body.token === 'string' ? body.token : ''
+          pruneDeleteProgress()
+          const entry = token !== '' ? deleteProgress.get(token) : undefined
           return jsonResponse({
             ok: true,
-            results: outcome.results,
-            families: outcome.families,
-            limit: {
-              max: DELETE_BATCH_LIMIT,
-              requested: normalized.requested,
-              accepted: normalized.ids.length,
-            },
+            progress: entry
+              ? {
+                  done: entry.done,
+                  total: entry.total,
+                  current: entry.current,
+                  finished: entry.finished === true,
+                }
+              : null,
           })
         },
       },

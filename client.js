@@ -19,6 +19,21 @@ window.__ModuleLoader__.load({
     const LOGS_PATH = 'api/sessions-library/logs'
     const LOGS_CLEAR_PATH = 'api/sessions-library/logs-clear'
     const LOGS_LIMIT = 500
+    const DELETE_PROGRESS_PATH = 'api/sessions-library/delete-progress'
+
+    /**
+     * Token identifying one delete batch's live progress on the Host.
+     *
+     * @returns {string} a short unique token.
+     */
+    function makeProgressToken() {
+      try {
+        if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') return crypto.randomUUID()
+      } catch {
+        // Fall through to the timestamp token.
+      }
+      return `t-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
+    }
 
     // Human text for every action the Host records in the operation history.
     const LOG_ACTION_TEXT = {
@@ -912,11 +927,45 @@ window.__ModuleLoader__.load({
           const ids = selectedVisibleIds()
           if (ids.length === 0) return
           const withForks = dialog === null || dialog.includeForks === true
-          setDialog((current) => ({ ...(current || {}), phase: 'busy' }))
+          const progressToken = makeProgressToken()
+          setDialog((current) => ({
+            ...(current || {}),
+            phase: 'busy',
+            progress: { done: 0, total: 0, current: '' },
+          }))
+          let pollTimer = null
+          const stopPolling = () => {
+            if (pollTimer !== null) {
+              clearInterval(pollTimer)
+              pollTimer = null
+            }
+          }
+          const pollProgress = async () => {
+            try {
+              const payload = await postJson(DELETE_PROGRESS_PATH, { token: progressToken })
+              const progress = payload && payload.progress
+              if (!progress || typeof progress !== 'object') return
+              setDialog((current) => (current && current.phase === 'busy'
+                ? {
+                    ...current,
+                    progress: {
+                      done: Number(progress.done) || 0,
+                      total: Number(progress.total) || 0,
+                      current: typeof progress.current === 'string' ? progress.current : '',
+                    },
+                  }
+                : current))
+            } catch {
+              // Progress is cosmetic; a failed poll must not break the delete.
+            }
+          }
+          pollTimer = setInterval(pollProgress, 350)
+          pollProgress()
           try {
             const payload = await postJson('api/sessions-library/delete', {
               sessionIds: ids,
               includeForks: withForks,
+              progressToken,
             })
             const results = Array.isArray(payload.results) ? payload.results : []
             const trashedIds = results.filter((result) => result.status === 'trashed').map((result) => result.id)
@@ -947,6 +996,8 @@ window.__ModuleLoader__.load({
               phase: 'error',
               error: failure && failure.message ? failure.message : String(failure),
             }))
+          } finally {
+            stopPolling()
           }
         }
 
@@ -1333,6 +1384,35 @@ window.__ModuleLoader__.load({
           )
         }
 
+        /**
+         * Render the live progress of a running delete batch.
+         *
+         * @param {{ done?: number, total?: number, current?: string } | null} progress live progress.
+         * @returns {object} React element.
+         */
+        function renderDeleteProgress(progress) {
+          const total = progress && Number(progress.total) > 0 ? Number(progress.total) : 0
+          const done = progress ? Math.max(0, Number(progress.done) || 0) : 0
+          const pct = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 0
+          return h(
+            'div',
+            { style: progressBlockStyle },
+            h(
+              'div',
+              { style: progressLabelStyle },
+              total > 0 ? `正在移入回收站… ${done} / ${total}` : '正在检查并移入回收站…',
+            ),
+            h(
+              'div',
+              { style: progressTrackStyle },
+              h('div', { style: progressFillStyle(pct) }),
+            ),
+            progress && progress.current
+              ? h('div', { style: progressCurrentStyle }, progress.current)
+              : null,
+          )
+        }
+
         function renderDialog() {
           const families = dialog.families || []
           const results = dialog.results || []
@@ -1422,7 +1502,7 @@ window.__ModuleLoader__.load({
                     `本次勾选了 ${limit.requested} 个会话，单次最多处理 ${limit.max} 个，因此只会处理前 ${limit.accepted} 个；其余 ${limit.requested - limit.accepted} 个请再删一次。`,
                   )
                 : null,
-              dialog.phase === 'busy' ? h('div', { style: dialogTextStyle }, '正在移入回收站…') : null,
+              dialog.phase === 'busy' ? renderDeleteProgress(dialog.progress) : null,
               dialog.phase === 'error' ? h('div', { style: dialogBlockerStyle }, `失败：${dialog.error}`) : null,
               dialog.phase === 'ready' ? h('div', { style: dialogListStyle }, familyBlocks) : null,
               dialog.phase === 'ready' && forkCandidates > 0
@@ -2143,6 +2223,29 @@ window.__ModuleLoader__.load({
     const logsTextStyle = {
       flex: '1 1 auto',
       minWidth: 0,
+      overflow: 'hidden',
+      textOverflow: 'ellipsis',
+      whiteSpace: 'nowrap',
+    }
+    const progressBlockStyle = { margin: '8px 0 2px' }
+    const progressLabelStyle = { fontSize: 12, opacity: 0.75, marginBottom: 6 }
+    const progressTrackStyle = {
+      height: 6,
+      borderRadius: 999,
+      overflow: 'hidden',
+      background: 'color-mix(in srgb, currentColor 14%, transparent)',
+    }
+    const progressFillStyle = (pct) => ({
+      height: '100%',
+      width: `${pct}%`,
+      borderRadius: 999,
+      background: 'color-mix(in srgb, currentColor 55%, transparent)',
+      transition: 'width 0.2s linear',
+    })
+    const progressCurrentStyle = {
+      fontSize: 12,
+      opacity: 0.5,
+      marginTop: 6,
       overflow: 'hidden',
       textOverflow: 'ellipsis',
       whiteSpace: 'nowrap',
