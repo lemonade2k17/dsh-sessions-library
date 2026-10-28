@@ -1064,38 +1064,42 @@ window.__ModuleLoader__.load({
                   ),
                   h(
                     'span',
-                    { style: sessionTitleStyle },
+                    { style: trashTitleStyle },
                     rootEntry.title && rootEntry.title.trim() !== '' ? rootEntry.title : rootEntry.sessionId,
                   ),
                   h('span', { style: badgeStyle }, `${family.entries.length} 个会话`),
                   h('span', { style: trashTimeStyle }, formatAbsolute(family.deletedAt)),
                   h('span', { style: trashMetaStyle }, `${(family.totalBytes / 1048576).toFixed(1)} MB`),
-                  // A queued permanent delete offers exactly one action: abandon
-                  // it and stay in the bin. Restoring is only offered once the
-                  // entry is no longer queued for deletion.
-                  queuedNames.length > 0
-                    ? h(
-                        'button',
-                        {
-                          className: 'sl-btn',
-                          style: actionButtonStyle,
-                          onClick: () => cancelQueuedPurge(queuedNames),
-                        },
-                        '放弃永久删除（留在回收站）',
-                      )
-                    : canRestore
+                  h(
+                    'div',
+                    { style: trashActionsStyle },
+                    // A queued permanent delete offers exactly one action: abandon
+                    // it and stay in the bin. Restoring is only offered once the
+                    // entry is no longer queued for deletion.
+                    queuedNames.length > 0
                       ? h(
                           'button',
                           {
                             className: 'sl-btn',
                             style: actionButtonStyle,
-                            onClick: () => restoreFamily(family.entries.map((entry) => entry.entryName)),
+                            onClick: () => cancelQueuedPurge(queuedNames),
                           },
-                          family.entries.length > 1
-                            ? `恢复会话（回到会话库，${family.entries.length} 个）`
-                            : '恢复会话（回到会话库）',
+                          '放弃永久删除（留在回收站）',
                         )
-                      : h('span', { style: badgeStyle }, '数据缺失'),
+                      : canRestore
+                        ? h(
+                            'button',
+                            {
+                              className: 'sl-btn',
+                              style: actionButtonStyle,
+                              onClick: () => restoreFamily(family.entries.map((entry) => entry.entryName)),
+                            },
+                            family.entries.length > 1
+                              ? `恢复会话（回到会话库，${family.entries.length} 个）`
+                              : '恢复会话（回到会话库）',
+                          )
+                        : h('span', { style: badgeStyle }, '数据缺失'),
+                  ),
                 ),
                 family.entries.map((entry) => h(
                   'div',
@@ -1110,7 +1114,7 @@ window.__ModuleLoader__.load({
                     : null,
                   h(
                     'span',
-                    { style: sessionTitleStyle },
+                    { style: trashTitleStyle },
                     entry.title && entry.title.trim() !== '' ? entry.title : entry.sessionId,
                   ),
                   // Members of one delete share the family timestamp; only a
@@ -1776,6 +1780,17 @@ window.__ModuleLoader__.load({
       opacity: 0.5,
       whiteSpace: 'nowrap',
       fontVariantNumeric: 'tabular-nums',
+    }
+    // In the bin the title occupies a fixed column: the count, timestamp and
+    // size start at the same left position on every row instead of being glued
+    // to titles of different lengths, or pushed to the far edge.
+    const trashTitleStyle = { ...sessionTitleStyle, flex: '0 1 320px' }
+    const trashActionsStyle = {
+      display: 'flex',
+      alignItems: 'center',
+      gap: 8,
+      flex: '0 0 auto',
+      marginLeft: 'auto',
     }
     const overlayStyle = {
       position: 'fixed',
