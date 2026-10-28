@@ -2310,22 +2310,26 @@ window.__ModuleLoader__.load({
             ? h('div', { style: warnStyle }, `刷新失败：${refreshError}（显示的是上次读取的结果）`)
             : null,
           h('div', { className: 'sl-scroll' }, body),
-          // Always-visible export action at the bottom right: disabled while the
-          // selection is empty so it cannot be triggered by accident.
+          // Floating export dock: a soft gradient panel hovering over the session
+          // rows, with the action disabled until something is selected.
           view === 'library'
             ? h(
-                'button',
-                {
-                  type: 'button',
-                  className: 'sl-btn sl-fab',
-                  style: selectedCount > 0 ? fabButtonStyle : fabDisabledStyle,
-                  disabled: selectedCount === 0,
-                  title: selectedCount > 0
-                    ? `导出所选的 ${selectedCount} 个会话`
-                    : '请先勾选要导出的会话',
-                  onClick: openExportDialog,
-                },
-                selectedCount > 0 ? `导出所选 ${selectedCount}` : '导出所选',
+                'div',
+                { style: exportDockStyle },
+                h(
+                  'button',
+                  {
+                    type: 'button',
+                    className: 'sl-btn sl-fab',
+                    style: selectedCount > 0 ? fabButtonStyle : fabDisabledStyle,
+                    disabled: selectedCount === 0,
+                    title: selectedCount > 0
+                      ? `导出所选的 ${selectedCount} 个会话`
+                      : '请先勾选要导出的会话',
+                    onClick: openExportDialog,
+                  },
+                  selectedCount > 0 ? `导出所选 ${selectedCount}` : '导出所选',
+                ),
               )
             : null,
           sources !== ''
@@ -2618,12 +2622,28 @@ window.__ModuleLoader__.load({
       font: 'inherit',
       fontSize: 13,
     }
-    // Floating export action pinned to the page's bottom-right corner.
-    const fabButtonStyle = {
+    // Floating export dock: pinned above the footer and to the right, with a
+    // horizontal gradient so the session rows fade under it instead of being cut.
+    const exportDockStyle = {
       position: 'absolute',
-      right: 24,
-      bottom: 20,
+      right: 12,
+      bottom: 52,
       zIndex: 30,
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'flex-end',
+      padding: '6px 6px 6px 56px',
+      borderRadius: 999,
+      background: 'linear-gradient(90deg, transparent 0%, '
+        + 'color-mix(in srgb, Canvas 55%, transparent) 32%, '
+        + 'color-mix(in srgb, Canvas 88%, transparent) 62%, Canvas 100%)',
+      backdropFilter: 'blur(10px)',
+      WebkitBackdropFilter: 'blur(10px)',
+      pointerEvents: 'none',
+    }
+    const fabButtonStyle = {
+      position: 'relative',
+      zIndex: 1,
       height: 38,
       padding: '0 18px',
       borderRadius: 999,
@@ -2635,6 +2655,7 @@ window.__ModuleLoader__.load({
       fontWeight: 600,
       boxShadow: '0 6px 20px rgba(0, 0, 0, 0.28)',
       cursor: 'pointer',
+      pointerEvents: 'auto',
     }
     const fabDisabledStyle = {
       ...fabButtonStyle,
