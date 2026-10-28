@@ -255,8 +255,8 @@ window.__ModuleLoader__.load({
       '.sl-fab:hover:not(:disabled) { background: color-mix(in srgb, currentColor 18%, Canvas); }',
       // Export dock backdrop: dark edges over a light theme, light edges over a
       // dark theme, so the strip stays visible in both palettes.
-      '.sl-dock { background: linear-gradient(180deg, rgba(28, 32, 38, 0.08) 0%, rgba(110, 116, 126, 0.05) 26%, rgba(235, 238, 243, 0.03) 50%, rgba(110, 116, 126, 0.05) 74%, rgba(28, 32, 38, 0.08) 100%); }',
-      'body[data-ds-dark-theme] .sl-dock { background: linear-gradient(180deg, rgba(243, 246, 249, 0.08) 0%, rgba(196, 202, 210, 0.05) 26%, rgba(118, 124, 134, 0.04) 50%, rgba(196, 202, 210, 0.05) 74%, rgba(243, 246, 249, 0.08) 100%); }',
+      '.sl-dock { background: linear-gradient(180deg, rgba(28, 32, 38, 0.04) 0%, rgba(110, 116, 126, 0.025) 26%, rgba(235, 238, 243, 0.015) 50%, rgba(110, 116, 126, 0.025) 74%, rgba(28, 32, 38, 0.04) 100%); }',
+      'body[data-ds-dark-theme] .sl-dock { background: linear-gradient(180deg, rgba(243, 246, 249, 0.04) 0%, rgba(196, 202, 210, 0.025) 26%, rgba(118, 124, 134, 0.02) 50%, rgba(196, 202, 210, 0.025) 74%, rgba(243, 246, 249, 0.04) 100%); }',
       '.sl-input::placeholder { color: color-mix(in srgb, currentColor 45%, transparent); }',
       '.sl-input:focus { outline: 2px solid color-mix(in srgb, currentColor 28%, transparent); outline-offset: -1px; }',
     ].join('\n')
