@@ -67,6 +67,24 @@ const PENDING_TRASH_FILE = join(DSH_HOME, 'sessions-library', 'pending-trash.jso
 // last time: a different value means DSH restarted, so view state resets.
 const BOOT_AT = Date.now()
 
+// Titles already resolved by a page snapshot. The delete dialog needs titles for
+// the selected families, and re-reading them per open is what made the dialog
+// slow; an unknown id still falls back to one bounded batch read.
+const TITLE_CACHE_LIMIT = 4000
+const titleCache = new Map()
+
+/**
+ * Remember one resolved title for later delete preflights.
+ *
+ * @param {string} id session id.
+ * @param {unknown} title resolved title.
+ */
+function rememberTitle(id, title) {
+  if (typeof id !== 'string' || typeof title !== 'string' || title.trim() === '') return
+  if (titleCache.size >= TITLE_CACHE_LIMIT) titleCache.clear()
+  titleCache.set(id, title)
+}
+
 /**
  * Describe an unknown error as one line.
  *
@@ -519,6 +537,8 @@ async function buildSnapshot(ctx, signal, requestId) {
   for (const session of sessions) {
     if (session.title === null) session.title = titleResult.titles.get(session.id) ?? null
   }
+  // Feed the delete preflight: a page snapshot already paid for these reads.
+  for (const session of sessions) rememberTitle(session.id, session.title)
 
   /**
    * Decorate one session for the Client.
@@ -790,11 +810,32 @@ function collectFamily(rootId, byId, childrenByParent, includeForks) {
  * @returns {Promise<Array<object>>} one family per requested root.
  */
 async function buildDeletePreflight(ctx, ids, signal, includeForks) {
+  const startedAt = Date.now()
   const persistence = ctx.get('sessionPersistence')
-  let snapshots = []
-  if (persistence && typeof persistence.list === 'function') {
-    const outcome = await withTimeout(Promise.resolve().then(() => persistence.list({ signal })), SUMMARIES_TIMEOUT_MS)
-    if (!outcome.timedOut && !outcome.error && Array.isArray(outcome.value)) snapshots = outcome.value
+  const controller = ctx.get('sessionController')
+  // Both listings are independent, so the dialog waits for the slower one
+  // instead of for their sum.
+  const [persistedOutcome, summaryOutcome] = await Promise.all([
+    persistence && typeof persistence.list === 'function'
+      ? withTimeout(Promise.resolve().then(() => persistence.list({ signal })), SUMMARIES_TIMEOUT_MS)
+      : Promise.resolve({ timedOut: false, value: undefined }),
+    controller && typeof controller.list === 'function'
+      ? withTimeout(Promise.resolve().then(() => controller.list({}, signal)), SUMMARIES_TIMEOUT_MS)
+      : Promise.resolve({ timedOut: false, value: undefined }),
+  ])
+  const listsMs = Date.now() - startedAt
+  const snapshots = !persistedOutcome.timedOut
+    && !persistedOutcome.error
+    && Array.isArray(persistedOutcome.value)
+    ? persistedOutcome.value
+    : []
+
+  const runningById = new Map()
+  if (!summaryOutcome.timedOut
+    && !summaryOutcome.error
+    && summaryOutcome.value
+    && Array.isArray(summaryOutcome.value.items)) {
+    for (const item of summaryOutcome.value.items) runningById.set(String(item.sessionId), item.running === true)
   }
 
   const byId = new Map(snapshots.map((snapshot) => [String(snapshot.header.id), snapshot]))
@@ -811,14 +852,6 @@ async function buildDeletePreflight(ctx, ids, signal, includeForks) {
   }
 
   const agents = ctx.get('agents')
-  const controller = ctx.get('sessionController')
-  const runningById = new Map()
-  if (controller && typeof controller.list === 'function') {
-    const outcome = await withTimeout(Promise.resolve().then(() => controller.list({}, signal)), SUMMARIES_TIMEOUT_MS)
-    if (!outcome.timedOut && !outcome.error && outcome.value && Array.isArray(outcome.value.items)) {
-      for (const item of outcome.value.items) runningById.set(String(item.sessionId), item.running === true)
-    }
-  }
 
   // Drop requested ids that sit inside another requested id's family: the
   // ancestor's family already covers them.
@@ -836,7 +869,30 @@ async function buildDeletePreflight(ctx, ids, signal, includeForks) {
 
   const collected = roots.map((rootId) => collectFamily(rootId, byId, childrenByParent, includeForks))
   const memberIds = [...new Set(collected.flatMap((family) => family.members.map((member) => member.id)))]
-  const titleResult = await readTitles(ctx, memberIds, signal, 'delete-preflight')
+  // Titles the page snapshot already resolved cost nothing here; only unknown
+  // ids fall back to one bounded batch read.
+  const titles = new Map()
+  const unknownTitleIds = []
+  for (const id of memberIds) {
+    const cached = titleCache.get(id)
+    if (typeof cached === 'string') titles.set(id, cached)
+    else unknownTitleIds.push(id)
+  }
+  const titlesStartedAt = Date.now()
+  if (unknownTitleIds.length > 0) {
+    const titleResult = await readTitles(ctx, unknownTitleIds, signal, 'delete-preflight')
+    for (const [id, title] of titleResult.titles) {
+      titles.set(id, title)
+      rememberTitle(id, title)
+    }
+  }
+  trace(
+    'delete-preflight',
+    'scan',
+    `ids=${ids.length} roots=${roots.length} members=${memberIds.length} `
+      + `lists=${listsMs}ms titles=${Date.now() - titlesStartedAt}ms `
+      + `cached=${memberIds.length - unknownTitleIds.length} total=${Date.now() - startedAt}ms`,
+  )
 
   const families = []
   for (let index = 0; index < roots.length; index += 1) {
@@ -864,7 +920,7 @@ async function buildDeletePreflight(ctx, ids, signal, includeForks) {
       members.push({
         id: entry.id,
         role: entry.role,
-        title: titleResult.titles.get(entry.id) ?? null,
+        title: titles.get(entry.id) ?? null,
         running,
         loaded,
         sizeBytes: dir ? dirSize(dir) : 0,
@@ -876,7 +932,7 @@ async function buildDeletePreflight(ctx, ids, signal, includeForks) {
       const dir = findSessionDir(forkId)
       return {
         id: forkId,
-        title: titleResult.titles.get(forkId) ?? null,
+        title: titles.get(forkId) ?? null,
         sizeBytes: dir ? dirSize(dir) : 0,
       }
     })
@@ -891,7 +947,7 @@ async function buildDeletePreflight(ctx, ids, signal, includeForks) {
 
     families.push({
       rootId,
-      rootTitle: titleResult.titles.get(rootId) ?? null,
+      rootTitle: titles.get(rootId) ?? null,
       members,
       forks,
       memberCount: members.length,
@@ -1506,7 +1562,9 @@ export function apply(ctx) {
           if (normalized.requested > normalized.ids.length) {
             trace('delete', 'limit', `requested=${normalized.requested} accepted=${normalized.ids.length}`)
           }
+          const deleteStartedAt = Date.now()
           const outcome = await trashSessions(ctx, normalized.ids, request.signal, body.includeForks === true)
+          trace('delete', 'done', `results=${outcome.results.length} ms=${Date.now() - deleteStartedAt}`)
           return jsonResponse({
             ok: true,
             results: outcome.results,
