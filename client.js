@@ -1068,7 +1068,7 @@ window.__ModuleLoader__.load({
                     rootEntry.title && rootEntry.title.trim() !== '' ? rootEntry.title : rootEntry.sessionId,
                   ),
                   h('span', { style: badgeStyle }, `${family.entries.length} 个会话`),
-                  h('span', { style: trashMetaStyle }, formatAbsolute(family.deletedAt)),
+                  h('span', { style: trashTimeStyle }, formatAbsolute(family.deletedAt)),
                   h('span', { style: trashMetaStyle }, `${(family.totalBytes / 1048576).toFixed(1)} MB`),
                   // A queued permanent delete offers exactly one action: abandon
                   // it and stay in the bin. Restoring is only offered once the
@@ -1116,7 +1116,7 @@ window.__ModuleLoader__.load({
                   // Members of one delete share the family timestamp; only a
                   // pending member (or a mixed family) carries its own.
                   entry.deletedAt !== family.deletedAt
-                    ? h('span', { style: trashMetaStyle }, formatAbsolute(entry.deletedAt))
+                    ? h('span', { style: trashTimeStyle }, formatAbsolute(entry.deletedAt))
                     : null,
                   h('span', { style: trashMetaStyle }, `${(entry.sizeBytes / 1048576).toFixed(1)} MB`),
                 )),
@@ -1767,6 +1767,15 @@ window.__ModuleLoader__.load({
       opacity: 0.5,
       width: 88,
       textAlign: 'right',
+    }
+    // Deletion timestamps are long enough to wrap inside the fixed meta column,
+    // so they get their own single-line slot.
+    const trashTimeStyle = {
+      flex: '0 0 auto',
+      fontSize: 12,
+      opacity: 0.5,
+      whiteSpace: 'nowrap',
+      fontVariantNumeric: 'tabular-nums',
     }
     const overlayStyle = {
       position: 'fixed',
