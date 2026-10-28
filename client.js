@@ -404,10 +404,23 @@ window.__ModuleLoader__.load({
         if (response.status === 404) {
           throw new Error('插件 Host 端尚未加载新版本，请重启桌面应用后重试')
         }
-        if (!response.ok) throw new Error(`HTTP ${response.status}`)
-        const payload = await response.json()
-        if (payload && payload.ok === false) {
-          throw new Error(payload.error?.message || 'request failed')
+        // Domain errors answer with a JSON body even on a 5xx status, so read it
+        // first and surface its message plus the stable code.
+        let payload = null
+        try {
+          payload = await response.json()
+        } catch {
+          payload = null
+        }
+        if (!response.ok || (payload && payload.ok === false)) {
+          const message = payload && payload.error && payload.error.message
+            ? payload.error.message
+            : `HTTP ${response.status}`
+          const error = new Error(message)
+          if (payload && payload.error && typeof payload.error.code === 'string') {
+            error.code = payload.error.code
+          }
+          throw error
         }
         return payload
       } finally {
@@ -448,6 +461,8 @@ window.__ModuleLoader__.load({
         const [clearLogsDialog, setClearLogsDialog] = React.useState(false)
         const [exportDialog, setExportDialog] = React.useState(null)
         const [exportTarget, setExportTarget] = React.useState(loadExportDir)
+        // Non-null while asking whether a missing export folder should be created.
+        const [createDirPrompt, setCreateDirPrompt] = React.useState(null)
         const [trashQuery, setTrashQuery] = React.useState('')
         const [trashSort, setTrashSort] = React.useState('newest')
         const [logsQuery, setLogsQuery] = React.useState('')
@@ -1017,9 +1032,10 @@ window.__ModuleLoader__.load({
         /**
          * Package the selected sessions into the chosen directory.
          *
+         * @param {boolean} [createDir] whether a missing destination may be created.
          * @returns {Promise<void>} resolution after the dialog state settled.
          */
-        async function beginExport() {
+        async function beginExport(createDir = false) {
           const ids = selectedVisibleIds()
           if (ids.length === 0) return
           const targetDir = exportTarget.trim()
@@ -1028,6 +1044,7 @@ window.__ModuleLoader__.load({
             const payload = await postJson(EXPORT_PATH, {
               sessionIds: ids,
               ...(targetDir !== '' ? { targetDir } : {}),
+              ...(createDir === true ? { createDir: true } : {}),
             })
             saveExportDir(targetDir)
             setExportDialog({
@@ -1040,6 +1057,13 @@ window.__ModuleLoader__.load({
               error: null,
             })
           } catch (failure) {
+            // A missing folder is not a hard failure: ask the user whether to
+            // create it, and keep the chooser open instead of showing an error.
+            if (failure && failure.code === 'export-dir-missing' && targetDir !== '') {
+              setCreateDirPrompt({ targetDir })
+              setExportDialog((current) => (current ? { ...current, phase: 'choose', error: null } : current))
+              return
+            }
             setExportDialog({
               phase: 'error',
               path: '',
@@ -1857,7 +1881,7 @@ window.__ModuleLoader__.load({
             ))
             actions.push(h(
               'button',
-              { key: 'start', className: 'sl-btn', style: actionButtonStyle, onClick: beginExport },
+              { key: 'start', className: 'sl-btn', style: actionButtonStyle, onClick: () => beginExport(false) },
               '开始导出',
             ))
           } else if (failed) {
@@ -1943,6 +1967,56 @@ window.__ModuleLoader__.load({
               actions.length > 0
                 ? h('div', { style: dialogActionsStyle }, actions)
                 : null,
+            ),
+          )
+        }
+
+        /**
+         * Ask whether a missing export destination should be created.
+         *
+         * @returns {object} React element.
+         */
+        function renderCreateDirPrompt() {
+          const targetDir = createDirPrompt && typeof createDirPrompt.targetDir === 'string'
+            ? createDirPrompt.targetDir
+            : ''
+          return h(
+            'div',
+            { style: overlayStyle, onClick: () => setCreateDirPrompt(null) },
+            h(
+              'div',
+              { style: dialogStyle, onClick: (event) => event.stopPropagation() },
+              h('h2', { style: dialogTitleStyle }, '文件夹不存在'),
+              h(
+                'p',
+                { style: dialogHintStyle },
+                `导出位置不存在：${targetDir}。是否创建该文件夹？`,
+              ),
+              h(
+                'div',
+                { style: dialogActionsStyle },
+                h(
+                  'button',
+                  {
+                    className: 'sl-btn',
+                    style: actionButtonStyle,
+                    onClick: () => setCreateDirPrompt(null),
+                  },
+                  '否',
+                ),
+                h(
+                  'button',
+                  {
+                    className: 'sl-btn',
+                    style: actionButtonStyle,
+                    onClick: () => {
+                      setCreateDirPrompt(null)
+                      beginExport(true)
+                    },
+                  },
+                  '是，创建并导出',
+                ),
+              ),
             ),
           )
         }
@@ -2249,6 +2323,7 @@ window.__ModuleLoader__.load({
           purgeDialog !== null ? renderPurgeDialog() : null,
           clearLogsDialog ? renderClearLogsDialog() : null,
           exportDialog !== null ? renderExportDialog() : null,
+          createDirPrompt !== null ? renderCreateDirPrompt() : null,
         )
       }
     }

@@ -1718,14 +1718,17 @@ async function purgeTrashEntries(rawNames) {
  * @param {object} ctx Cordis context.
  * @param {any} rawIds requested root session ids.
  * @param {AbortSignal} signal request cancellation.
- * @param {{ targetDir?: string }} [options] destination directory chosen by the user.
+ * @param {{ targetDir?: string, createDir?: boolean }} [options] destination, and
+ *   whether a missing destination may be created.
  * @returns {Promise<object>} archive description.
  */
 async function exportSessions(ctx, rawIds, signal, options = {}) {
   const ids = normalizeIds(rawIds)
   if (ids.length === 0) throw new Error('请先勾选要导出的会话')
 
-  // Resolve and validate the destination before doing any reading work.
+  // Resolve and validate the destination before doing any reading work. A
+  // missing directory is reported with its own code so the Client can ask the
+  // user whether to create it.
   let targetDir = EXPORT_DIR
   const requestedDir = typeof options.targetDir === 'string' ? options.targetDir.trim() : ''
   if (requestedDir !== '') {
@@ -1734,9 +1737,23 @@ async function exportSessions(ctx, rawIds, signal, options = {}) {
     try {
       stats = statSync(targetDir)
     } catch {
-      throw new Error(`导出位置不存在：${targetDir}`)
+      stats = null
     }
-    if (!stats.isDirectory()) throw new Error(`导出位置不是文件夹：${targetDir}`)
+    if (stats === null) {
+      if (options.createDir === true) {
+        try {
+          mkdirSync(targetDir, { recursive: true })
+        } catch (error) {
+          throw new Error(`无法创建导出位置：${describeError(error)}`)
+        }
+      } else {
+        const missing = new Error(`导出位置不存在：${targetDir}`)
+        missing.code = 'export-dir-missing'
+        throw missing
+      }
+    } else if (!stats.isDirectory()) {
+      throw new Error(`导出位置不是文件夹：${targetDir}`)
+    }
   }
 
   const persistence = ctx.get('sessionPersistence')
@@ -2181,6 +2198,7 @@ export function apply(ctx) {
           const body = await readJsonBody(request)
           const result = await exportSessions(ctx, body.sessionIds, request.signal, {
             targetDir: typeof body.targetDir === 'string' ? body.targetDir : undefined,
+            createDir: body.createDir === true,
           })
           return jsonResponse({ ok: true, ...result })
         },
@@ -2197,9 +2215,14 @@ export function apply(ctx) {
             return await route.handler(request)
           } catch (error) {
             trace('route', route.label, describeError(error))
+            // Domain errors may carry their own stable code so the Client can
+            // react differently (for example: destination folder missing).
+            const code = error && typeof error.code === 'string' && error.code !== ''
+              ? error.code
+              : `${route.label}-failed`
             return jsonResponse({
               ok: false,
-              error: { code: `${route.label}-failed`, message: describeError(error) },
+              error: { code, message: describeError(error) },
             }, 500)
           }
         },
