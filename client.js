@@ -16,6 +16,37 @@ window.__ModuleLoader__.load({
     /** Sessions shown per group before "view all". */
     const PREVIEW_LIMIT = 5
     const SNAPSHOT_PATH = 'api/sessions-library/snapshot'
+    const LOGS_PATH = 'api/sessions-library/logs'
+    const LOGS_CLEAR_PATH = 'api/sessions-library/logs-clear'
+    const LOGS_LIMIT = 500
+
+    // Human text for every action the Host records in the operation history.
+    const LOG_ACTION_TEXT = {
+      trash: '被移入回收站',
+      defer: '被移入回收站（重启后完成整理）',
+      'flush-trash': '已完成延迟整理，移入回收站',
+      restore: '被恢复',
+      purge: '被永久删除',
+      'flush-purge': '被永久删除（延迟执行）',
+      'queue-purge': '被排队永久删除（重启后执行）',
+      'cancel-purge': '取消了排队永久删除',
+    }
+
+    /**
+     * Render one operation record as a sentence.
+     *
+     * @param {object} entry operation record.
+     * @returns {string} the sentence.
+     */
+    function formatLogEntry(entry) {
+      const title = entry && typeof entry.title === 'string' && entry.title.trim() !== ''
+        ? entry.title
+        : (entry && typeof entry.sessionId === 'string' && entry.sessionId !== '' ? entry.sessionId : '未知会话')
+      const role = entry && typeof entry.role === 'string' ? entry.role : 'root'
+      const roleSuffix = role === 'subagent' ? '（子智能体/队友）' : role === 'fork' ? '（分叉）' : ''
+      const action = entry && typeof entry.action === 'string' ? entry.action : ''
+      return `「${title}」${roleSuffix}${LOG_ACTION_TEXT[action] || '有一条操作记录'}`
+    }
 
     // Last successful snapshot: a re-opened panel renders it immediately and
     // refreshes in the background, so only the very first open waits.
@@ -217,7 +248,7 @@ window.__ModuleLoader__.load({
      * @returns {string} `YYYY-MM-DD HH:mm:ss`, or an empty string for no value.
      */
     function formatAbsolute(timestamp) {
-      if (typeof timestamp !== 'number' || timestamp <= 0) return ''
+      if (typeof timestamp !== 'number' || !Number.isFinite(timestamp) || timestamp <= 0) return ''
       const date = new Date(timestamp)
       const pad = (value) => String(value).padStart(2, '0')
       return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} `
@@ -360,6 +391,14 @@ window.__ModuleLoader__.load({
         const [dialog, setDialog] = React.useState(null)
         const [trashSelected, setTrashSelected] = React.useState({})
         const [purgeDialog, setPurgeDialog] = React.useState(null)
+        const [logs, setLogs] = React.useState([])
+        const [logsPhase, setLogsPhase] = React.useState('idle')
+        const [logsError, setLogsError] = React.useState(null)
+        const [clearLogsDialog, setClearLogsDialog] = React.useState(false)
+        const [trashQuery, setTrashQuery] = React.useState('')
+        const [trashSort, setTrashSort] = React.useState('newest')
+        const [logsQuery, setLogsQuery] = React.useState('')
+        const [logsSort, setLogsSort] = React.useState('newest')
         const [query, setQuery] = React.useState('')
         const [reloadToken, setReloadToken] = React.useState(0)
 
@@ -423,6 +462,8 @@ window.__ModuleLoader__.load({
             if (viewRef.current === 'trash') {
               // Silent: a poll must not flash the loading or error placeholder.
               refreshTrash({ silent: true })
+            } else if (viewRef.current === 'logs') {
+              refreshLogs({ silent: true })
             } else {
               setReloadToken((token) => token + 1)
             }
@@ -497,8 +538,10 @@ window.__ModuleLoader__.load({
           return result
         }, [allGroups, filter, query])
 
-        // Recycle-bin entries grouped into the families they were deleted as.
+        // Recycle-bin entries grouped into the families they were deleted as,
+        // then narrowed by the bin search and ordered by the chosen sort.
         const trashFamilies = React.useMemo(() => {
+          const lowered = trashQuery.trim().toLowerCase()
           const families = []
           const byFamily = new Map()
           for (const entry of trash) {
@@ -513,9 +556,46 @@ window.__ModuleLoader__.load({
             family.deletedAt = Math.max(family.deletedAt, entry.deletedAt || 0)
             family.totalBytes += entry.sizeBytes || 0
           }
-          families.sort((left, right) => right.deletedAt - left.deletedAt)
-          return families
-        }, [trash])
+          const matches = (family) => lowered === '' || family.entries.some((entry) => {
+            const title = typeof entry.title === 'string' ? entry.title.toLowerCase() : ''
+            const id = typeof entry.sessionId === 'string' ? entry.sessionId.toLowerCase() : ''
+            return title.includes(lowered) || id.includes(lowered)
+          })
+          const visible = families.filter(matches)
+          switch (trashSort) {
+            case 'oldest':
+              visible.sort((left, right) => left.deletedAt - right.deletedAt)
+              break
+            case 'largest':
+              visible.sort((left, right) => right.totalBytes - left.totalBytes)
+              break
+            case 'smallest':
+              visible.sort((left, right) => left.totalBytes - right.totalBytes)
+              break
+            default:
+              visible.sort((left, right) => right.deletedAt - left.deletedAt)
+          }
+          return visible
+        }, [trash, trashQuery, trashSort])
+
+        // Operation-log rows after the query and the time order are applied.
+        const visibleLogs = React.useMemo(() => {
+          const lowered = logsQuery.trim().toLowerCase()
+          const matches = (entry) => {
+            if (lowered === '') return true
+            const message = formatLogEntry(entry).toLowerCase()
+            const title = typeof entry.title === 'string' ? entry.title.toLowerCase() : ''
+            const id = typeof entry.sessionId === 'string' ? entry.sessionId.toLowerCase() : ''
+            return message.includes(lowered) || title.includes(lowered) || id.includes(lowered)
+          }
+          const rows = logs.filter(matches)
+          rows.sort((left, right) => {
+            const leftAt = Date.parse(left && left.at) || 0
+            const rightAt = Date.parse(right && right.at) || 0
+            return logsSort === 'oldest' ? leftAt - rightAt : rightAt - leftAt
+          })
+          return rows
+        }, [logs, logsQuery, logsSort])
 
         const visibleCount = groups.reduce((sum, group) => sum + group.sessions.length, 0)
         // Count only what is on screen, so a filter change cannot show a
@@ -730,6 +810,8 @@ window.__ModuleLoader__.load({
           // A fresh visit starts with nothing selected: a selection carried over
           // from an earlier visit would keep "永久删除" armed with stale intent.
           setTrashSelected({})
+          setTrashQuery('')
+          setTrashSort('newest')
           refreshTrash()
         }
 
@@ -740,6 +822,56 @@ window.__ModuleLoader__.load({
           // Time spent in the bin may have changed the library (restores and
           // purges), so pull a fresh snapshot when the library comes back.
           setReloadToken((token) => token + 1)
+        }
+
+        /**
+         * Read the operation history.
+         *
+         * @param {{ silent?: boolean }} [options] silent keeps the current list on
+         *   screen instead of flashing the loading or error placeholder.
+         * @returns {Promise<void>} resolution after the list was refreshed.
+         */
+        async function refreshLogs(options = {}) {
+          const silent = options.silent === true
+          if (!silent) {
+            setLogsPhase('loading')
+            setLogsError(null)
+          }
+          try {
+            const payload = await postJson(LOGS_PATH, { limit: LOGS_LIMIT })
+            setLogs(Array.isArray(payload.entries) ? payload.entries : [])
+            setLogsPhase('ready')
+          } catch (failure) {
+            if (silent) return
+            setLogsPhase('error')
+            setLogsError(failure && failure.message ? failure.message : String(failure))
+          }
+        }
+
+        function openLogs() {
+          setView('logs')
+          setLogsError(null)
+          setLogsQuery('')
+          setLogsSort('newest')
+          refreshLogs()
+        }
+
+        function closeLogs() {
+          setView('library')
+          setLogsError(null)
+          setReloadToken((token) => token + 1)
+        }
+
+        async function confirmClearLogs() {
+          setClearLogsDialog(false)
+          try {
+            await postJson(LOGS_CLEAR_PATH, {})
+            setLogs([])
+            setLogsPhase('ready')
+            setLogsError(null)
+          } catch (failure) {
+            setLogsError(failure && failure.message ? failure.message : String(failure))
+          }
         }
 
         async function beginDelete(includeForks) {
@@ -1074,6 +1206,9 @@ window.__ModuleLoader__.load({
           if (trash.length === 0) {
             return h('div', { style: placeholderStyle }, '回收站是空的')
           }
+          if (trashFamilies.length === 0) {
+            return h('div', { style: placeholderStyle }, '没有匹配的回收站条目')
+          }
 
           const families = trashFamilies
 
@@ -1155,6 +1290,44 @@ window.__ModuleLoader__.load({
                     : null,
                   h('span', { style: trashMetaStyle }, `${(entry.sizeBytes / 1048576).toFixed(1)} MB`),
                 )),
+              )
+            }),
+          )
+        }
+
+        function renderLogs() {
+          if (logsPhase === 'loading' || logsPhase === 'idle') {
+            return h('div', { style: placeholderStyle }, '正在读取操作日志…')
+          }
+          if (logsPhase === 'error') {
+            return h(
+              'div',
+              { style: placeholderStyle },
+              h('div', { style: { marginBottom: 10 } }, `读取日志失败：${logsError}`),
+              h(
+                'button',
+                { className: 'sl-btn', style: actionButtonStyle, onClick: () => refreshLogs() },
+                '重试',
+              ),
+            )
+          }
+          if (logs.length === 0) {
+            return h('div', { style: placeholderStyle }, '暂无操作日志')
+          }
+          if (visibleLogs.length === 0) {
+            return h('div', { style: placeholderStyle }, '没有匹配的日志')
+          }
+          return h(
+            'div',
+            null,
+            logsError !== null ? h('div', { style: warnStyle }, logsError) : null,
+            visibleLogs.map((entry, index) => {
+              const at = Date.parse(entry && entry.at)
+              return h(
+                'div',
+                { key: `${entry && entry.at ? entry.at : ''}-${index}`, style: logsRowStyle },
+                h('span', { style: logsTextStyle }, formatLogEntry(entry)),
+                h('span', { style: trashTimeStyle }, formatAbsolute(Number.isFinite(at) ? at : 0)),
               )
             }),
           )
@@ -1424,6 +1597,37 @@ window.__ModuleLoader__.load({
           )
         }
 
+        function renderClearLogsDialog() {
+          return h(
+            'div',
+            { style: overlayStyle, onClick: () => setClearLogsDialog(false) },
+            h(
+              'div',
+              { style: dialogStyle, onClick: (event) => event.stopPropagation() },
+              h('h2', { style: dialogTitleStyle }, '清空操作日志'),
+              h(
+                'p',
+                { style: dialogHintStyle },
+                `将删除全部 ${logs.length} 条操作日志。已经执行的删除、恢复操作本身不受影响。`,
+              ),
+              h(
+                'div',
+                { style: dialogActionsStyle },
+                h(
+                  'button',
+                  { className: 'sl-btn', style: actionButtonStyle, onClick: () => setClearLogsDialog(false) },
+                  '取消',
+                ),
+                h(
+                  'button',
+                  { className: 'sl-btn', style: dangerButtonStyle, onClick: confirmClearLogs },
+                  '清空日志',
+                ),
+              ),
+            ),
+          )
+        }
+
         const filterButton = (value, label, count) => h(
           'button',
           {
@@ -1432,6 +1636,25 @@ window.__ModuleLoader__.load({
             onClick: () => changeFilter(value),
           },
           `${label} ${count}`,
+        )
+
+        /**
+         * Build the compact sort selector used by the bin and log views.
+         *
+         * @param {string} value selected option value.
+         * @param {Array<{ value: string, label: string }>} options available options.
+         * @param {Function} onChange selection handler.
+         * @returns {object} React element.
+         */
+        const sortSelect = (value, options, onChange) => h(
+          'select',
+          {
+            className: 'sl-input',
+            style: sortSelectStyle,
+            value,
+            onChange: (event) => onChange(event.target.value),
+          },
+          options.map((option) => h('option', { key: option.value, value: option.value }, option.label)),
         )
 
         const libraryControls = h(
@@ -1499,6 +1722,15 @@ window.__ModuleLoader__.load({
             },
             '回收站',
           ),
+          h(
+            'button',
+            {
+              className: 'sl-btn',
+              style: actionButtonStyle,
+              onClick: openLogs,
+            },
+            '操作日志',
+          ),
         )
 
         const trashControls = h(
@@ -1513,6 +1745,19 @@ window.__ModuleLoader__.load({
             },
             '← 返回会话库',
           ),
+          h('input', {
+            className: 'sl-input',
+            style: searchStyle,
+            value: trashQuery,
+            placeholder: '搜索标题或会话 ID',
+            onChange: (event) => setTrashQuery(event.target.value),
+          }),
+          sortSelect(trashSort, [
+            { value: 'newest', label: '删除时间 新→旧' },
+            { value: 'oldest', label: '删除时间 旧→新' },
+            { value: 'largest', label: '体积 大→小' },
+            { value: 'smallest', label: '体积 小→大' },
+          ], setTrashSort),
           h(
             'button',
             {
@@ -1544,11 +1789,60 @@ window.__ModuleLoader__.load({
             : null,
         )
 
-        const controls = view === 'trash' ? trashControls : libraryControls
+        const logsControls = h(
+          'div',
+          { style: controlsStyle },
+          h(
+            'button',
+            {
+              className: 'sl-btn',
+              style: actionButtonStyle,
+              onClick: closeLogs,
+            },
+            '← 返回会话库',
+          ),
+          h('input', {
+            className: 'sl-input',
+            style: searchStyle,
+            value: logsQuery,
+            placeholder: '搜索日志内容或会话 ID',
+            onChange: (event) => setLogsQuery(event.target.value),
+          }),
+          sortSelect(logsSort, [
+            { value: 'newest', label: '时间 新→旧' },
+            { value: 'oldest', label: '时间 旧→新' },
+          ], setLogsSort),
+          h(
+            'button',
+            {
+              className: 'sl-btn',
+              style: actionButtonStyle,
+              onClick: () => refreshLogs(),
+            },
+            '刷新日志',
+          ),
+          h(
+            'button',
+            {
+              className: 'sl-btn',
+              style: dangerButtonStyle,
+              onClick: () => setClearLogsDialog(true),
+            },
+            '清空日志',
+          ),
+        )
+
+        const controls = view === 'trash'
+          ? trashControls
+          : view === 'logs'
+            ? logsControls
+            : libraryControls
 
         let body = null
         if (view === 'trash') {
           body = renderTrash()
+        } else if (view === 'logs') {
+          body = renderLogs()
         } else if (phase === 'loading') {
           body = h('div', { style: placeholderStyle }, '正在读取会话…')
         } else if (phase === 'error') {
@@ -1591,8 +1885,10 @@ window.__ModuleLoader__.load({
                 'span',
                 { style: subtitleStyle },
                 view === 'trash'
-                  ? `回收站 · ${trash.length} 个会话`
-                  : snapshot
+                  ? `回收站 · ${trashFamilies.length} 组 · ${trash.length} 个会话`
+                  : view === 'logs'
+                    ? `操作日志 · ${visibleLogs.length} 条${logsQuery.trim() !== '' ? ` / 共 ${logs.length} 条` : ''}`
+                    : snapshot
                     ? [
                         `${visibleCount} 个会话 · ${groups.length} 个工作区`,
                         selectedCount > 0 ? `已选 ${selectedCount}` : '',
@@ -1614,6 +1910,7 @@ window.__ModuleLoader__.load({
             : null,
           dialog !== null ? renderDialog() : null,
           purgeDialog !== null ? renderPurgeDialog() : null,
+          clearLogsDialog ? renderClearLogsDialog() : null,
         )
       }
     }
@@ -1746,6 +2043,18 @@ window.__ModuleLoader__.load({
       font: 'inherit',
       fontSize: 13,
     }
+    const sortSelectStyle = {
+      flex: '0 0 auto',
+      height: 30,
+      padding: '0 8px',
+      borderRadius: 6,
+      border: '1px solid color-mix(in srgb, currentColor 18%, transparent)',
+      background: 'Canvas',
+      color: 'inherit',
+      font: 'inherit',
+      fontSize: 12,
+      cursor: 'pointer',
+    }
     const segmentedStyle = {
       display: 'flex',
       flex: '0 0 auto',
@@ -1822,6 +2131,21 @@ window.__ModuleLoader__.load({
       opacity: 0.5,
       whiteSpace: 'nowrap',
       fontVariantNumeric: 'tabular-nums',
+    }
+    const logsRowStyle = {
+      display: 'flex',
+      alignItems: 'baseline',
+      gap: 12,
+      padding: '8px 10px',
+      borderBottom: '1px solid color-mix(in srgb, currentColor 10%, transparent)',
+      fontSize: 13,
+    }
+    const logsTextStyle = {
+      flex: '1 1 auto',
+      minWidth: 0,
+      overflow: 'hidden',
+      textOverflow: 'ellipsis',
+      whiteSpace: 'nowrap',
     }
     const overlayStyle = {
       position: 'fixed',
