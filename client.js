@@ -2636,9 +2636,10 @@ window.__ModuleLoader__.load({
       justifyContent: 'flex-end',
       padding: '0 24px',
       background: 'linear-gradient(180deg, '
-        + 'transparent 0%, '
-        + 'color-mix(in srgb, Canvas 45%, transparent) 40%, '
-        + 'color-mix(in srgb, Canvas 88%, transparent) 78%, Canvas 100%)',
+        + 'rgba(255, 255, 255, 0) 0%, '
+        + 'rgba(212, 216, 222, 0.16) 38%, '
+        + 'rgba(226, 230, 236, 0.32) 74%, '
+        + 'rgba(240, 243, 247, 0.46) 100%)',
       backdropFilter: 'blur(8px)',
       WebkitBackdropFilter: 'blur(8px)',
       pointerEvents: 'none',
