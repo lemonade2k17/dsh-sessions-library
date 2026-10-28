@@ -21,6 +21,38 @@ window.__ModuleLoader__.load({
     const LOGS_LIMIT = 500
     const DELETE_PROGRESS_PATH = 'api/sessions-library/delete-progress'
     const EXPORT_PATH = 'api/sessions-library/export'
+    const EXPORT_DIR_STORAGE_KEY = 'dsh-sessions-library:export-dir'
+
+    /**
+     * Read the last chosen export directory.
+     *
+     * @returns {string} saved path, or an empty string for the default location.
+     */
+    function loadExportDir() {
+      try {
+        const stored = window.localStorage.getItem(EXPORT_DIR_STORAGE_KEY)
+        return typeof stored === 'string' ? stored : ''
+      } catch {
+        return ''
+      }
+    }
+
+    /**
+     * Remember the chosen export directory for the next export.
+     *
+     * @param {string} path chosen directory, empty for the default location.
+     */
+    function saveExportDir(path) {
+      try {
+        if (typeof path === 'string' && path.trim() !== '') {
+          window.localStorage.setItem(EXPORT_DIR_STORAGE_KEY, path.trim())
+        } else {
+          window.localStorage.removeItem(EXPORT_DIR_STORAGE_KEY)
+        }
+      } catch {
+        // Remembering the path is cosmetic.
+      }
+    }
 
     /**
      * Token identifying one delete batch's live progress on the Host.
@@ -415,6 +447,7 @@ window.__ModuleLoader__.load({
         const [logsError, setLogsError] = React.useState(null)
         const [clearLogsDialog, setClearLogsDialog] = React.useState(false)
         const [exportDialog, setExportDialog] = React.useState(null)
+        const [exportTarget, setExportTarget] = React.useState(loadExportDir)
         const [trashQuery, setTrashQuery] = React.useState('')
         const [trashSort, setTrashSort] = React.useState('newest')
         const [logsQuery, setLogsQuery] = React.useState('')
@@ -929,16 +962,71 @@ window.__ModuleLoader__.load({
         }
 
         /**
-         * Package the selected sessions (with their workspace membership).
+         * Open the export dialog, defaulting to the last used directory.
+         *
+         * @returns {void}
+         */
+        function openExportDialog() {
+          if (selectedVisibleIds().length === 0) return
+          setExportDialog({
+            phase: 'choose',
+            path: '',
+            fileName: '',
+            sessionCount: 0,
+            workspaceCount: 0,
+            bytes: 0,
+            error: null,
+          })
+        }
+
+        /**
+         * Ask the native directory picker for an export destination.
+         *
+         * @returns {Promise<void>} resolution after the picker settled.
+         */
+        async function pickExportDirectory() {
+          try {
+            const picker = ctx.remote && ctx.remote.directoryPicker
+            if (!picker || typeof picker.pick !== 'function') {
+              setExportDialog((current) => (current
+                ? { ...current, error: '当前环境不支持文件夹选择；可以直接输入路径，或留空使用默认位置。' }
+                : current))
+              return
+            }
+            const result = await picker.pick()
+            if (!result || result.ok !== true) {
+              const message = result && result.error && result.error.message
+                ? result.error.message
+                : '选择文件夹失败'
+              setExportDialog((current) => (current ? { ...current, error: message } : current))
+              return
+            }
+            if (typeof result.value !== 'string' || result.value.trim() === '') return
+            setExportTarget(result.value)
+            setExportDialog((current) => (current ? { ...current, error: null } : current))
+          } catch (failure) {
+            setExportDialog((current) => (current
+              ? { ...current, error: failure && failure.message ? failure.message : String(failure) }
+              : current))
+          }
+        }
+
+        /**
+         * Package the selected sessions into the chosen directory.
          *
          * @returns {Promise<void>} resolution after the dialog state settled.
          */
         async function beginExport() {
           const ids = selectedVisibleIds()
           if (ids.length === 0) return
-          setExportDialog({ phase: 'busy', path: '', fileName: '', sessionCount: 0, error: null })
+          const targetDir = exportTarget.trim()
+          setExportDialog((current) => ({ ...(current || {}), phase: 'busy', error: null }))
           try {
-            const payload = await postJson(EXPORT_PATH, { sessionIds: ids })
+            const payload = await postJson(EXPORT_PATH, {
+              sessionIds: ids,
+              ...(targetDir !== '' ? { targetDir } : {}),
+            })
+            saveExportDir(targetDir)
             setExportDialog({
               phase: 'done',
               fileName: typeof payload.fileName === 'string' ? payload.fileName : '',
@@ -1745,25 +1833,95 @@ window.__ModuleLoader__.load({
         }
 
         /**
-         * Render the export result dialog.
+         * Render the export dialog: destination choice, progress, result or error.
          *
          * @returns {object} React element.
          */
         function renderExportDialog() {
-          const done = exportDialog.phase === 'done'
+          const phase = exportDialog.phase
+          const done = phase === 'done'
+          const choosing = phase === 'choose'
+          const busy = phase === 'busy'
+          const failed = phase === 'error'
           const bytes = Number(exportDialog.bytes) || 0
+          const title = done ? '已导出会话' : failed ? '导出失败' : '导出会话'
+          const actions = []
+          if (choosing) {
+            actions.push(h(
+              'button',
+              { key: 'cancel', className: 'sl-btn', style: actionButtonStyle, onClick: () => setExportDialog(null) },
+              '取消',
+            ))
+            actions.push(h(
+              'button',
+              { key: 'start', className: 'sl-btn', style: actionButtonStyle, onClick: beginExport },
+              '开始导出',
+            ))
+          } else if (failed) {
+            actions.push(h(
+              'button',
+              { key: 'back', className: 'sl-btn', style: actionButtonStyle, onClick: () => setExportDialog((current) => ({ ...(current || {}), phase: 'choose', error: null })) },
+              '返回修改位置',
+            ))
+            actions.push(h(
+              'button',
+              { key: 'close', className: 'sl-btn', style: actionButtonStyle, onClick: () => setExportDialog(null) },
+              '关闭',
+            ))
+          } else if (done) {
+            actions.push(h(
+              'button',
+              { key: 'close', className: 'sl-btn', style: actionButtonStyle, onClick: () => setExportDialog(null) },
+              '关闭',
+            ))
+          }
           return h(
             'div',
-            { style: overlayStyle, onClick: () => setExportDialog(null) },
+            { style: overlayStyle, onClick: () => { if (!busy) setExportDialog(null) } },
             h(
               'div',
               { style: dialogStyle, onClick: (event) => event.stopPropagation() },
-              h('h2', { style: dialogTitleStyle }, done ? '已导出会话' : '导出会话'),
-              exportDialog.phase === 'busy'
+              h('h2', { style: dialogTitleStyle }, title),
+              choosing
+                ? h(
+                    'div',
+                    { style: exportChooserStyle },
+                    h('p', { style: dialogHintStyle }, '选择保存位置后开始导出；留空则保存到插件默认目录（~/.dsh/sessions-library/exports）。'),
+                    h('div', { style: dialogHintStyle }, '导出位置'),
+                    h('input', {
+                      className: 'sl-input',
+                      style: exportInputStyle,
+                      value: exportTarget,
+                      placeholder: '留空使用默认目录',
+                      onChange: (event) => setExportTarget(event.target.value),
+                    }),
+                    h(
+                      'div',
+                      { style: exportChooserActionsStyle },
+                      h(
+                        'button',
+                        { className: 'sl-btn', style: actionButtonStyle, onClick: pickExportDirectory },
+                        '选择文件夹…',
+                      ),
+                      exportTarget !== ''
+                        ? h(
+                            'button',
+                            {
+                              className: 'sl-btn',
+                              style: actionButtonStyle,
+                              onClick: () => setExportTarget(''),
+                            },
+                            '使用默认位置',
+                          )
+                        : null,
+                    ),
+                  )
+                : null,
+              busy
                 ? h('p', { style: dialogHintStyle }, '正在打包会话日志与工作区信息…')
                 : null,
-              exportDialog.phase === 'error'
-                ? h('div', { style: dialogBlockerStyle }, `导出失败：${exportDialog.error}`)
+              exportDialog.error
+                ? h('div', { style: dialogBlockerStyle }, exportDialog.error)
                 : null,
               done
                 ? h(
@@ -1779,17 +1937,9 @@ window.__ModuleLoader__.load({
                     h('p', { style: dialogHintStyle }, '会话日志按原存储格式逐字节复制；导入功能尚未实现，这个包用于先备份或跨机器携带。'),
                   )
                 : null,
-              exportDialog.phase === 'busy'
-                ? null
-                : h(
-                    'div',
-                    { style: dialogActionsStyle },
-                    h(
-                      'button',
-                      { className: 'sl-btn', style: actionButtonStyle, onClick: () => setExportDialog(null) },
-                      '关闭',
-                    ),
-                  ),
+              actions.length > 0
+                ? h('div', { style: dialogActionsStyle }, actions)
+                : null,
             ),
           )
         }
@@ -2084,7 +2234,7 @@ window.__ModuleLoader__.load({
                   title: selectedCount > 0
                     ? `导出所选的 ${selectedCount} 个会话`
                     : '请先勾选要导出的会话',
-                  onClick: beginExport,
+                  onClick: openExportDialog,
                 },
                 selectedCount > 0 ? `导出所选 ${selectedCount}` : '导出所选',
               )
@@ -2365,6 +2515,20 @@ window.__ModuleLoader__.load({
       lineHeight: 1.5,
       wordBreak: 'break-all',
       userSelect: 'text',
+    }
+    const exportChooserStyle = { margin: '4px 0 10px' }
+    const exportChooserActionsStyle = { display: 'flex', gap: 8, marginTop: 8 }
+    const exportInputStyle = {
+      width: '100%',
+      height: 32,
+      marginTop: 6,
+      padding: '0 10px',
+      borderRadius: 6,
+      border: '1px solid color-mix(in srgb, currentColor 22%, transparent)',
+      background: 'transparent',
+      color: 'inherit',
+      font: 'inherit',
+      fontSize: 13,
     }
     // Floating export action pinned to the page's bottom-right corner.
     const fabButtonStyle = {

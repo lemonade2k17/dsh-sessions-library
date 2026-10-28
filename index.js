@@ -1718,11 +1718,26 @@ async function purgeTrashEntries(rawNames) {
  * @param {object} ctx Cordis context.
  * @param {any} rawIds requested root session ids.
  * @param {AbortSignal} signal request cancellation.
+ * @param {{ targetDir?: string }} [options] destination directory chosen by the user.
  * @returns {Promise<object>} archive description.
  */
-async function exportSessions(ctx, rawIds, signal) {
+async function exportSessions(ctx, rawIds, signal, options = {}) {
   const ids = normalizeIds(rawIds)
   if (ids.length === 0) throw new Error('请先勾选要导出的会话')
+
+  // Resolve and validate the destination before doing any reading work.
+  let targetDir = EXPORT_DIR
+  const requestedDir = typeof options.targetDir === 'string' ? options.targetDir.trim() : ''
+  if (requestedDir !== '') {
+    targetDir = resolve(requestedDir)
+    let stats = null
+    try {
+      stats = statSync(targetDir)
+    } catch {
+      throw new Error(`导出位置不存在：${targetDir}`)
+    }
+    if (!stats.isDirectory()) throw new Error(`导出位置不是文件夹：${targetDir}`)
+  }
 
   const persistence = ctx.get('sessionPersistence')
   if (!persistence || typeof persistence.list !== 'function') throw new Error('会话持久化服务不可用')
@@ -1845,14 +1860,18 @@ async function exportSessions(ctx, rawIds, signal) {
   })
 
   const archive = buildStoredZip(entries)
-  mkdirSync(EXPORT_DIR, { recursive: true })
+  try {
+    mkdirSync(targetDir, { recursive: true })
+  } catch (error) {
+    throw new Error(`无法写入导出位置：${describeError(error)}`)
+  }
   const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\..+$/, '').replace('T', '-')
   // Two exports in the same second must not overwrite each other.
   let fileName = `dsh-sessions-${stamp}.zip`
-  let target = join(EXPORT_DIR, fileName)
+  let target = join(targetDir, fileName)
   for (let index = 2; existsSync(target); index += 1) {
     fileName = `dsh-sessions-${stamp}-${index}.zip`
-    target = join(EXPORT_DIR, fileName)
+    target = join(targetDir, fileName)
   }
   writeFileSync(target, archive)
   for (const session of sessions) {
@@ -2160,7 +2179,9 @@ export function apply(ctx) {
         label: 'export',
         handler: async (request) => {
           const body = await readJsonBody(request)
-          const result = await exportSessions(ctx, body.sessionIds, request.signal)
+          const result = await exportSessions(ctx, body.sessionIds, request.signal, {
+            targetDir: typeof body.targetDir === 'string' ? body.targetDir : undefined,
+          })
           return jsonResponse({ ok: true, ...result })
         },
       },
