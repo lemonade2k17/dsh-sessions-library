@@ -1091,9 +1091,7 @@ window.__ModuleLoader__.load({
                             style: actionButtonStyle,
                             onClick: () => restoreFamily(family.entries.map((entry) => entry.entryName)),
                           },
-                          family.entries.length > 1
-                            ? `恢复会话（回到会话库，${family.entries.length} 个）`
-                            : '恢复会话（回到会话库）',
+                          '恢复会话（回到会话库）',
                         )
                       : h('span', { style: badgeStyle }, '数据缺失'),
                 ),
