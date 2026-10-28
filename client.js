@@ -2626,15 +2626,17 @@ window.__ModuleLoader__.load({
     // list, with the action pinned to its right edge.
     const exportDockStyle = {
       position: 'absolute',
-      left: 0,
-      right: 0,
-      bottom: 30,
-      height: 88,
+      left: 12,
+      right: 12,
+      bottom: 24,
+      height: 80,
+      borderRadius: 20,
+      overflow: 'hidden',
       zIndex: 30,
       display: 'flex',
       alignItems: 'center',
       justifyContent: 'flex-end',
-      padding: '0 24px',
+      padding: '0 20px',
       background: 'linear-gradient(180deg, '
         + 'rgba(255, 255, 255, 0) 0%, '
         + 'rgba(212, 216, 222, 0.16) 38%, '
