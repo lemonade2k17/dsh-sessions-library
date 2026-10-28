@@ -245,7 +245,7 @@ window.__ModuleLoader__.load({
     const CSS = [
       '.sl-root { position: relative; height: 100%; min-height: 0; display: flex; flex-direction: column; color: inherit; }',
       '.sl-root * { box-sizing: border-box; }',
-      '.sl-scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 4px 24px 24px; }',
+      '.sl-scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 4px 24px 106px; }',
       '.sl-scroll::-webkit-scrollbar { width: 10px; }',
       '.sl-scroll::-webkit-scrollbar-thumb { background: color-mix(in srgb, currentColor 18%, transparent); border-radius: 8px; border: 3px solid transparent; background-clip: content-box; }',
       '.sl-group-head:hover { background: color-mix(in srgb, currentColor 6%, transparent); }',
@@ -2622,23 +2622,25 @@ window.__ModuleLoader__.load({
       font: 'inherit',
       fontSize: 13,
     }
-    // Floating export dock: pinned above the footer and to the right, with a
-    // horizontal gradient so the session rows fade under it instead of being cut.
+    // Full-width export dock: a bottom gradient strip floating over the session
+    // list, with the action pinned to its right edge.
     const exportDockStyle = {
       position: 'absolute',
-      right: 12,
-      bottom: 52,
+      left: 0,
+      right: 0,
+      bottom: 30,
+      height: 88,
       zIndex: 30,
       display: 'flex',
       alignItems: 'center',
       justifyContent: 'flex-end',
-      padding: '6px 6px 6px 56px',
-      borderRadius: 999,
-      background: 'linear-gradient(90deg, transparent 0%, '
-        + 'color-mix(in srgb, Canvas 55%, transparent) 32%, '
-        + 'color-mix(in srgb, Canvas 88%, transparent) 62%, Canvas 100%)',
-      backdropFilter: 'blur(10px)',
-      WebkitBackdropFilter: 'blur(10px)',
+      padding: '0 24px',
+      background: 'linear-gradient(180deg, '
+        + 'transparent 0%, '
+        + 'color-mix(in srgb, Canvas 45%, transparent) 40%, '
+        + 'color-mix(in srgb, Canvas 88%, transparent) 78%, Canvas 100%)',
+      backdropFilter: 'blur(8px)',
+      WebkitBackdropFilter: 'blur(8px)',
       pointerEvents: 'none',
     }
     const fabButtonStyle = {
