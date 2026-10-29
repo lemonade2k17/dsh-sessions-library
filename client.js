@@ -3107,8 +3107,13 @@ window.__ModuleLoader__.load({
       pointerEvents: 'none',
     }
     const dockSecondaryButtonStyle = {
+      display: 'inline-flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      // Same fixed box as the export action so the dock reads as one row.
+      width: 148,
       height: 38,
-      padding: '0 16px',
+      padding: 0,
       borderRadius: 999,
       border: '1px solid color-mix(in srgb, currentColor 22%, transparent)',
       background: 'color-mix(in srgb, currentColor 8%, Canvas)',
