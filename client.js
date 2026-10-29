@@ -1855,13 +1855,6 @@ window.__ModuleLoader__.load({
             'div',
             null,
             logsError !== null ? h('div', { style: warnStyle }, logsError) : null,
-            logsSelectable
-              ? null
-              : h(
-                  'div',
-                  { style: warnStyle },
-                  '当前运行的 Host 端（宿主端）还是旧版本，日志暂时不能勾选：完全退出并重新打开 DSH 后，这里会出现勾选框和「删除所选」。',
-                ),
             visibleLogs.map((entry, index) => {
               const at = Date.parse(entry && entry.at)
               const rowId = entry && typeof entry.id === 'string' ? entry.id : ''
