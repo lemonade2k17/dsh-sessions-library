@@ -1010,6 +1010,7 @@ window.__ModuleLoader__.load({
             path: '',
             dir: '',
             files: [],
+            ignored: [],
             report: null,
             mapping: {},
             outcome: null,
@@ -1032,6 +1033,7 @@ window.__ModuleLoader__.load({
                   ...current,
                   dir: typeof payload.dir === 'string' ? payload.dir : '',
                   files: Array.isArray(payload.files) ? payload.files : [],
+                  ignored: Array.isArray(payload.ignored) ? payload.ignored : [],
                 }
               : current))
           } catch (failure) {
@@ -2146,10 +2148,16 @@ window.__ModuleLoader__.load({
                                 ? { ...current, path: file.path, error: null }
                                 : current)),
                             },
-                            `${file.name} · ${(Number(file.size) / 1048576).toFixed(2)} MB`,
+                            `${file.name} · ${Number(file.sessionCount) || 0} 个会话 · ${(Number(file.size) / 1048576).toFixed(2)} MB`,
                           )),
                         )
-                      : h('p', { style: dialogHintStyle }, '默认目录里没有 .zip，可直接填写路径或选择其他文件夹。'),
+                      : h(
+                          'p',
+                          { style: dialogHintStyle },
+                          importDialog.dir === ''
+                            ? '默认目录里没有会话包，可直接填写路径或选择其他文件夹。'
+                            : '这个文件夹里没有可识别的会话包，可直接填写路径或换一个文件夹。',
+                        ),
                   )
                 : null,
 
