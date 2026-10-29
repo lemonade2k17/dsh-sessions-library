@@ -2690,17 +2690,6 @@ window.__ModuleLoader__.load({
             },
             allTrashSelected ? '取消全选' : '全选',
           ),
-          selectedTrashCount > 0
-            ? h(
-                'button',
-                {
-                  className: 'sl-btn',
-                  style: dangerButtonStyle,
-                  onClick: openPurgeDialog,
-                },
-                `永久删除 ${selectedTrashCount} 个会话`,
-              )
-            : null,
         )
 
         const logsControls = h(
@@ -2822,8 +2811,8 @@ window.__ModuleLoader__.load({
             ? h('div', { style: infoStyle }, unarchiveNotice)
             : null,
           h('div', { className: 'sl-scroll' }, body),
-          // Floating export dock: a soft gradient panel hovering over the session
-          // rows, with the action disabled until something is selected.
+          // Floating action docks: a soft gradient panel hovering over the rows,
+          // each action disabled until something is selected.
           view === 'library'
             ? h(
                 'div',
@@ -2854,6 +2843,33 @@ window.__ModuleLoader__.load({
                       onClick: openExportDialog,
                     },
                     selectedCount > 0 ? `导出所选 ${selectedCount}` : '导出所选',
+                  ),
+                ),
+              )
+            : null,
+          // The permanent-delete action lives in the same dock so it stays put
+          // while scrolling; it mirrors the export action: dim with nothing
+          // selected, highlighted once something is.
+          view === 'trash'
+            ? h(
+                'div',
+                { className: 'sl-dock', style: exportDockStyle },
+                h(
+                  'div',
+                  { style: dockActionsStyle },
+                  h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'sl-btn sl-fab',
+                      style: selectedTrashCount > 0 ? fabButtonStyle : fabDisabledStyle,
+                      disabled: selectedTrashCount === 0,
+                      title: selectedTrashCount > 0
+                        ? `永久删除所选的 ${selectedTrashCount} 个会话`
+                        : '请先勾选要永久删除的会话',
+                      onClick: openPurgeDialog,
+                    },
+                    selectedTrashCount > 0 ? `永久删除 ${selectedTrashCount}` : '永久删除',
                   ),
                 ),
               )
