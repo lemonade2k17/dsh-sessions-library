@@ -18,6 +18,7 @@ window.__ModuleLoader__.load({
     const SNAPSHOT_PATH = 'api/sessions-library/snapshot'
     const LOGS_PATH = 'api/sessions-library/logs'
     const LOGS_CLEAR_PATH = 'api/sessions-library/logs-clear'
+    const LOGS_DELETE_PATH = 'api/sessions-library/logs-delete'
     const LOGS_LIMIT = 500
     const DELETE_PROGRESS_PATH = 'api/sessions-library/delete-progress'
     const EXPORT_PATH = 'api/sessions-library/export'
@@ -477,6 +478,10 @@ window.__ModuleLoader__.load({
         const [logsPhase, setLogsPhase] = React.useState('idle')
         const [logsError, setLogsError] = React.useState(null)
         const [clearLogsDialog, setClearLogsDialog] = React.useState(false)
+        // Log-page selection and its delete confirmation; ids come from the Host
+        // so a trim of the history file cannot point at the wrong row.
+        const [logsSelected, setLogsSelected] = React.useState({})
+        const [logsDeleteDialog, setLogsDeleteDialog] = React.useState(null)
         const [exportDialog, setExportDialog] = React.useState(null)
         const [exportTarget, setExportTarget] = React.useState(loadExportDir)
         // Non-null while asking whether a missing export folder should be created.
@@ -695,6 +700,12 @@ window.__ModuleLoader__.load({
           })
           return rows
         }, [logs, logsQuery, logsSort])
+
+        // Selected log rows, restricted to what the current filter shows so a
+        // hidden selection can never be deleted by accident.
+        const selectedLogs = visibleLogs.filter((entry) => entry && logsSelected[entry.id] === true)
+        const selectedLogsCount = selectedLogs.length
+        const allLogsSelected = visibleLogs.length > 0 && selectedLogsCount === visibleLogs.length
 
         const visibleCount = groups.reduce((sum, group) => sum + group.sessions.length, 0)
         // Count only what is on screen, so a filter change cannot show a
@@ -979,7 +990,25 @@ window.__ModuleLoader__.load({
           }
           try {
             const payload = await postJson(LOGS_PATH, { limit: LOGS_LIMIT })
-            setLogs(Array.isArray(payload.entries) ? payload.entries : [])
+            const entries = Array.isArray(payload.entries) ? payload.entries : []
+            setLogs(entries)
+            // Keep the selection for rows that still exist: the visible-page poll
+            // refreshes this list every 15s and must not silently drop what the
+            // user just picked, nor keep ids that are gone.
+            const alive = new Set(entries
+              .map((entry) => (entry && typeof entry.id === 'string' ? entry.id : ''))
+              .filter((id) => id !== ''))
+            setLogsSelected((current) => {
+              const next = {}
+              let changed = false
+              for (const id of Object.keys(current)) {
+                if (alive.has(id)) next[id] = true
+                else changed = true
+              }
+              // Same object when nothing was dropped: the 15s poll must not
+              // re-render the whole list for an unchanged selection.
+              return changed ? next : current
+            })
             setLogsPhase('ready')
           } catch (failure) {
             if (silent) return
@@ -993,12 +1022,16 @@ window.__ModuleLoader__.load({
           setLogsError(null)
           setLogsQuery('')
           setLogsSort('newest')
+          setLogsSelected({})
+          setLogsDeleteDialog(null)
           refreshLogs()
         }
 
         function closeLogs() {
           setView('library')
           setLogsError(null)
+          setLogsSelected({})
+          setLogsDeleteDialog(null)
           setReloadToken((token) => token + 1)
         }
 
@@ -1007,6 +1040,7 @@ window.__ModuleLoader__.load({
           try {
             await postJson(LOGS_CLEAR_PATH, {})
             setLogs([])
+            setLogsSelected({})
             setLogsPhase('ready')
             setLogsError(null)
           } catch (failure) {
@@ -1460,6 +1494,59 @@ window.__ModuleLoader__.load({
           setTrashSelected(next)
         }
 
+        function toggleLogSelection(id) {
+          if (typeof id !== 'string' || id === '') return
+          setLogsSelected((current) => {
+            const next = { ...current }
+            if (next[id] === true) delete next[id]
+            else next[id] = true
+            return next
+          })
+        }
+
+        function toggleLogsSelectAll() {
+          if (allLogsSelected) {
+            setLogsSelected({})
+            return
+          }
+          const next = {}
+          for (const entry of visibleLogs) {
+            if (entry && typeof entry.id === 'string' && entry.id !== '') next[entry.id] = true
+          }
+          setLogsSelected(next)
+        }
+
+        function openLogsDeleteDialog() {
+          if (selectedLogs.length === 0) return
+          setLogsDeleteDialog({
+            ids: selectedLogs.map((entry) => entry.id),
+            busy: false,
+            error: null,
+          })
+        }
+
+        async function confirmDeleteLogs() {
+          const pendingDialog = logsDeleteDialog
+          if (!pendingDialog || pendingDialog.busy === true) return
+          const ids = Array.isArray(pendingDialog.ids) ? pendingDialog.ids : []
+          if (ids.length === 0) {
+            setLogsDeleteDialog(null)
+            return
+          }
+          setLogsDeleteDialog({ ...pendingDialog, busy: true, error: null })
+          try {
+            await postJson(LOGS_DELETE_PATH, { ids })
+            setLogsDeleteDialog(null)
+            setLogsError(null)
+            await refreshLogs()
+          } catch (failure) {
+            const message = failure && failure.message ? failure.message : String(failure)
+            setLogsDeleteDialog((current) => (current
+              ? { ...current, busy: false, error: message }
+              : current))
+          }
+        }
+
         function openPurgeDialog() {
           if (selectedTrashEntries.length === 0) return
           setPurgeDialog({
@@ -1767,9 +1854,20 @@ window.__ModuleLoader__.load({
             logsError !== null ? h('div', { style: warnStyle }, logsError) : null,
             visibleLogs.map((entry, index) => {
               const at = Date.parse(entry && entry.at)
+              const rowId = entry && typeof entry.id === 'string' ? entry.id : ''
+              const checked = rowId !== '' && logsSelected[rowId] === true
               return h(
                 'div',
-                { key: `${entry && entry.at ? entry.at : ''}-${index}`, style: logsRowStyle },
+                {
+                  key: rowId !== '' ? rowId : `${entry && entry.at ? entry.at : ''}-${index}`,
+                  style: rowId !== ''
+                    ? { ...logsRowStyle, cursor: 'pointer' }
+                    : logsRowStyle,
+                  onClick: rowId !== '' ? () => toggleLogSelection(rowId) : undefined,
+                },
+                rowId !== ''
+                  ? renderCheckbox(checked ? 'all' : 'none', () => toggleLogSelection(rowId), '勾选这条日志')
+                  : null,
                 h('span', { style: logsTextStyle }, formatLogEntry(entry)),
                 h('span', { style: trashTimeStyle }, formatAbsolute(Number.isFinite(at) ? at : 0)),
               )
@@ -2095,6 +2193,57 @@ window.__ModuleLoader__.load({
                   'button',
                   { className: 'sl-btn', style: dangerButtonStyle, onClick: confirmClearLogs },
                   '清空日志',
+                ),
+              ),
+            ),
+          )
+        }
+
+        /**
+         * Render the confirmation for deleting the selected log rows.
+         *
+         * @returns {object} React element.
+         */
+        function renderLogsDeleteDialog() {
+          const busy = logsDeleteDialog.busy === true
+          const count = Array.isArray(logsDeleteDialog.ids) ? logsDeleteDialog.ids.length : 0
+          return h(
+            'div',
+            { style: overlayStyle, onClick: () => { if (!busy) setLogsDeleteDialog(null) } },
+            h(
+              'div',
+              { style: dialogStyle, onClick: (event) => event.stopPropagation() },
+              h('h2', { style: dialogTitleStyle }, '删除所选日志'),
+              h(
+                'p',
+                { style: dialogHintStyle },
+                `将删除所选的 ${count} 条操作日志（共 ${logs.length} 条）。已经执行的删除、恢复操作本身不受影响。`,
+              ),
+              logsDeleteDialog.error
+                ? h('div', { style: dialogBlockerStyle }, `失败：${logsDeleteDialog.error}`)
+                : null,
+              h(
+                'div',
+                { style: dialogActionsStyle },
+                h(
+                  'button',
+                  {
+                    className: 'sl-btn',
+                    style: actionButtonStyle,
+                    disabled: busy,
+                    onClick: () => setLogsDeleteDialog(null),
+                  },
+                  '取消',
+                ),
+                h(
+                  'button',
+                  {
+                    className: 'sl-btn',
+                    style: dangerButtonStyle,
+                    disabled: busy,
+                    onClick: confirmDeleteLogs,
+                  },
+                  busy ? '正在删除…' : `删除 ${count} 条`,
                 ),
               ),
             ),
@@ -2728,10 +2877,10 @@ window.__ModuleLoader__.load({
             'button',
             {
               className: 'sl-btn',
-              style: dangerButtonStyle,
-              onClick: () => setClearLogsDialog(true),
+              style: actionButtonStyle,
+              onClick: toggleLogsSelectAll,
             },
-            '清空日志',
+            allLogsSelected ? '取消全选' : '全选',
           ),
         )
 
@@ -2790,7 +2939,7 @@ window.__ModuleLoader__.load({
                 view === 'trash'
                   ? `回收站 · ${trashFamilies.length} 组 · ${trash.length} 个会话`
                   : view === 'logs'
-                    ? `操作日志 · ${visibleLogs.length} 条${logsQuery.trim() !== '' ? ` / 共 ${logs.length} 条` : ''}`
+                    ? `操作日志 · ${visibleLogs.length} 条${logsQuery.trim() !== '' ? ` / 共 ${logs.length} 条` : ''}${selectedLogsCount > 0 ? ` · 已选 ${selectedLogsCount}` : ''}`
                     : snapshot
                     ? [
                         `${visibleCount} 个会话 · ${groups.length} 个工作区`,
@@ -2874,12 +3023,50 @@ window.__ModuleLoader__.load({
                 ),
               )
             : null,
+          // Log page: the same dock, so the destructive actions sit in one place
+          // on every view. Bulk clear stays secondary; the selected-row delete is
+          // the primary action and follows the same dim/highlight rule.
+          view === 'logs'
+            ? h(
+                'div',
+                { className: 'sl-dock', style: exportDockStyle },
+                h(
+                  'div',
+                  { style: dockActionsStyle },
+                  h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'sl-btn',
+                      style: dockSecondaryButtonStyle,
+                      onClick: () => setClearLogsDialog(true),
+                    },
+                    '清空日志',
+                  ),
+                  h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'sl-btn sl-fab',
+                      style: selectedLogsCount > 0 ? fabButtonStyle : fabDisabledStyle,
+                      disabled: selectedLogsCount === 0,
+                      title: selectedLogsCount > 0
+                        ? `删除所选的 ${selectedLogsCount} 条日志`
+                        : '请先勾选要删除的日志',
+                      onClick: openLogsDeleteDialog,
+                    },
+                    selectedLogsCount > 0 ? `删除所选 ${selectedLogsCount}` : '删除所选',
+                  ),
+                ),
+              )
+            : null,
           sources !== ''
             ? h('div', { style: footerStyle }, sources)
             : null,
           dialog !== null ? renderDialog() : null,
           purgeDialog !== null ? renderPurgeDialog() : null,
           clearLogsDialog ? renderClearLogsDialog() : null,
+          logsDeleteDialog !== null ? renderLogsDeleteDialog() : null,
           exportDialog !== null ? renderExportDialog() : null,
           importDialog !== null ? renderImportDialog() : null,
           createDirPrompt !== null ? renderCreateDirPrompt() : null,
@@ -3134,7 +3321,7 @@ window.__ModuleLoader__.load({
     }
     const logsRowStyle = {
       display: 'flex',
-      alignItems: 'baseline',
+      alignItems: 'center',
       gap: 12,
       padding: '8px 10px',
       borderBottom: '1px solid color-mix(in srgb, currentColor 10%, transparent)',
