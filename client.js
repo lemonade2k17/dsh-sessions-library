@@ -3103,7 +3103,7 @@ window.__ModuleLoader__.load({
       zIndex: 1,
       display: 'flex',
       alignItems: 'center',
-      gap: 10,
+      gap: 15,
       pointerEvents: 'none',
     }
     const dockSecondaryButtonStyle = {
@@ -3111,7 +3111,7 @@ window.__ModuleLoader__.load({
       alignItems: 'center',
       justifyContent: 'center',
       // Same fixed box as the export action so the dock reads as one row.
-      width: 148,
+      width: 132,
       height: 38,
       padding: 0,
       borderRadius: 999,
@@ -3132,7 +3132,7 @@ window.__ModuleLoader__.load({
       justifyContent: 'center',
       // Fixed width: the label gains a count while selecting, and a growing
       // button reads as jitter next to the dock's other action.
-      width: 148,
+      width: 132,
       height: 38,
       padding: 0,
       borderRadius: 999,
