@@ -1,10 +1,10 @@
 {
   "name": "dsh-sessions-library",
-  "version": "0.2.0",
-  "private": true,
-  "type": "module",
-  "description": "会话库：按工作区分组浏览 DSH 会话，并提供会话包导入（迁移）。",
+  "version": "0.3.0",
+  "description": "会话库：按工作区分组浏览 DSH 会话，并提供会话包导出/导入（迁移）、回收站与操作日志。",
   "icon": "icon.svg",
+  "type": "module",
+  "license": "MIT",
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",
@@ -17,7 +17,23 @@
     "cordis.patch.yml",
     "locale/*.json",
     "icon.svg",
-    "README.md"
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0",
+    "dsh": ">=0.2.1-rc.3 <0.3.0-0"
+  },
+  "scripts": {
+    "check": "node --check index.js && node --check client.js"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "cordis",
+    "plugin",
+    "sessions",
+    "migration"
   ],
   "dsh": {
     "bundle": {
@@ -27,6 +43,11 @@
       "platform": "web",
       "immediately": true,
       "inject": []
+    },
+    "compatibility": {
+      "dshReleases": {
+        "0.2.1-rc.3": "compatible"
+      }
     }
   }
 }
