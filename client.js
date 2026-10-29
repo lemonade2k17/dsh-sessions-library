@@ -2138,18 +2138,23 @@ window.__ModuleLoader__.load({
                       ? h(
                           'div',
                           { style: importListStyle },
-                          sourceFiles.map((file) => h(
-                            'button',
-                            {
-                              key: file.path,
-                              className: 'sl-btn',
-                              style: importFileButtonStyle,
-                              onClick: () => setImportDialog((current) => (current
-                                ? { ...current, path: file.path, error: null }
-                                : current)),
-                            },
-                            `${file.name} · ${Number(file.sessionCount) || 0} 个会话 · ${(Number(file.size) / 1048576).toFixed(2)} MB`,
-                          )),
+                          sourceFiles.map((file) => {
+                            const selected = importDialog.path === file.path
+                            const label = `${file.name} · ${Number(file.sessionCount) || 0} 个会话 · ${(Number(file.size) / 1048576).toFixed(2)} MB`
+                            return h(
+                              'button',
+                              {
+                                key: file.path,
+                                className: 'sl-btn',
+                                style: selected ? importFileButtonSelectedStyle : importFileButtonStyle,
+                                'aria-pressed': selected ? 'true' : 'false',
+                                onClick: () => setImportDialog((current) => (current
+                                  ? { ...current, path: file.path, error: null }
+                                  : current)),
+                              },
+                              selected ? `✓ ${label}` : label,
+                            )
+                          }),
                         )
                       : h(
                           'p',
@@ -3067,6 +3072,12 @@ window.__ModuleLoader__.load({
       overflow: 'hidden',
       textOverflow: 'ellipsis',
       whiteSpace: 'nowrap',
+    }
+    const importFileButtonSelectedStyle = {
+      ...importFileButtonStyle,
+      border: '1px solid color-mix(in srgb, currentColor 55%, transparent)',
+      background: 'color-mix(in srgb, currentColor 14%, transparent)',
+      fontWeight: 600,
     }
     const importSectionTitleStyle = {
       margin: '12px 0 6px',
