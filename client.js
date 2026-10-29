@@ -1584,6 +1584,38 @@ window.__ModuleLoader__.load({
         }
 
         /**
+         * Render one count-driven dock action.
+         *
+         * Every view's dock shares the same rule: dim and unclickable while
+         * nothing is selected, filled and highlighted as soon as a selection
+         * exists, and the count only appears while it means something.
+         *
+         * @param {object} options render inputs.
+         * @param {string} options.label label without a count.
+         * @param {number} options.count selected rows.
+         * @param {Function} options.onClick action.
+         * @param {string} options.idleTitle hint shown while nothing is selected.
+         * @param {string} options.activeTitle hint shown with a selection.
+         * @returns {object} React element.
+         */
+        function dockCountButton(options) {
+          const { label, count, onClick, idleTitle, activeTitle } = options
+          const active = count > 0
+          return h(
+            'button',
+            {
+              type: 'button',
+              className: 'sl-btn sl-fab',
+              style: active ? fabButtonStyle : fabDisabledStyle,
+              disabled: !active,
+              title: active ? activeTitle : idleTitle,
+              onClick,
+            },
+            active ? `${label} ${count}` : label,
+          )
+        }
+
+        /**
          * Render the shared tri-state checkbox.
          *
          * @param {string} state 'none' | 'partial' | 'all'.
@@ -2739,28 +2771,6 @@ window.__ModuleLoader__.load({
             filterButton('unarchived', '未归档会话', totals.active),
             filterButton('all', '全部会话', totals.total),
           ),
-          selectedCount > 0
-            ? h(
-                'button',
-                {
-                  className: 'sl-btn',
-                  style: dangerButtonStyle,
-                  onClick: () => beginDelete(false),
-                },
-                `移入回收站 ${selectedCount}`,
-              )
-            : null,
-          selectedCount > 0
-            ? h(
-                'button',
-                {
-                  className: 'sl-btn',
-                  style: actionButtonStyle,
-                  onClick: clearSelection,
-                },
-                `清除选择 ${selectedCount}`,
-              )
-            : null,
           h(
             'button',
             {
@@ -2983,20 +2993,27 @@ window.__ModuleLoader__.load({
                     },
                     '导入会话',
                   ),
-                  h(
-                    'button',
-                    {
-                      type: 'button',
-                      className: 'sl-btn sl-fab',
-                      style: selectedCount > 0 ? fabButtonStyle : fabDisabledStyle,
-                      disabled: selectedCount === 0,
-                      title: selectedCount > 0
-                        ? `导出所选的 ${selectedCount} 个会话`
-                        : '请先勾选要导出的会话',
-                      onClick: openExportDialog,
-                    },
-                    selectedCount > 0 ? `导出所选 ${selectedCount}` : '导出所选',
-                  ),
+                  dockCountButton({
+                    label: '清除选择',
+                    count: selectedCount,
+                    onClick: clearSelection,
+                    idleTitle: '没有已选的会话',
+                    activeTitle: `清除已选的 ${selectedCount} 个会话`,
+                  }),
+                  dockCountButton({
+                    label: '移入回收站',
+                    count: selectedCount,
+                    onClick: () => beginDelete(false),
+                    idleTitle: '请先勾选要移入回收站的会话',
+                    activeTitle: `把选中的 ${selectedCount} 个会话移入回收站`,
+                  }),
+                  dockCountButton({
+                    label: '导出所选',
+                    count: selectedCount,
+                    onClick: openExportDialog,
+                    idleTitle: '请先勾选要导出的会话',
+                    activeTitle: `导出所选的 ${selectedCount} 个会话`,
+                  }),
                 ),
               )
             : null,
@@ -3010,20 +3027,13 @@ window.__ModuleLoader__.load({
                 h(
                   'div',
                   { style: dockActionsStyle },
-                  h(
-                    'button',
-                    {
-                      type: 'button',
-                      className: 'sl-btn sl-fab',
-                      style: selectedTrashCount > 0 ? fabButtonStyle : fabDisabledStyle,
-                      disabled: selectedTrashCount === 0,
-                      title: selectedTrashCount > 0
-                        ? `永久删除所选的 ${selectedTrashCount} 个会话`
-                        : '请先勾选要永久删除的会话',
-                      onClick: openPurgeDialog,
-                    },
-                    selectedTrashCount > 0 ? `永久删除 ${selectedTrashCount}` : '永久删除',
-                  ),
+                  dockCountButton({
+                    label: '永久删除',
+                    count: selectedTrashCount,
+                    onClick: openPurgeDialog,
+                    idleTitle: '请先勾选要永久删除的会话',
+                    activeTitle: `永久删除所选的 ${selectedTrashCount} 个会话`,
+                  }),
                 ),
               )
             : null,
@@ -3047,20 +3057,13 @@ window.__ModuleLoader__.load({
                     },
                     '清空日志',
                   ),
-                  h(
-                    'button',
-                    {
-                      type: 'button',
-                      className: 'sl-btn sl-fab',
-                      style: selectedLogsCount > 0 ? fabButtonStyle : fabDisabledStyle,
-                      disabled: selectedLogsCount === 0,
-                      title: selectedLogsCount > 0
-                        ? `删除所选的 ${selectedLogsCount} 条日志`
-                        : '请先勾选要删除的日志',
-                      onClick: openLogsDeleteDialog,
-                    },
-                    selectedLogsCount > 0 ? `删除所选 ${selectedLogsCount}` : '删除所选',
-                  ),
+                  dockCountButton({
+                    label: '删除所选',
+                    count: selectedLogsCount,
+                    onClick: openLogsDeleteDialog,
+                    idleTitle: '请先勾选要删除的日志',
+                    activeTitle: `删除所选的 ${selectedLogsCount} 条日志`,
+                  }),
                 ),
               )
             : null,
