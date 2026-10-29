@@ -92,6 +92,7 @@ window.__ModuleLoader__.load({
       'cancel-purge': '取消了排队永久删除',
       export: '被导出为会话包',
       import: '被导入',
+      adopt: '被导入（沿用本地已归档副本，已取消归档）',
     }
 
     /**
@@ -2044,7 +2045,18 @@ window.__ModuleLoader__.load({
           const outcome = importDialog.outcome || null
           const busy = phase === 'checking' || phase === 'importing'
           const reportable = report ? Math.max(0, (report.counts && report.counts.importable) || 0) : 0
-          const conflictLabel = { exists: '本地已存在', pending: '待重启队列中', missing: '包内缺文件' }
+          const conflictLabel = {
+            exists: '本地已存在',
+            pending: '待重启队列中',
+            missing: '包内缺文件',
+            archived: '本地已归档 · 将取消归档',
+          }
+          const outcomeProblems = outcome && Array.isArray(outcome.results)
+            ? outcome.results.filter((result) => (
+              (result.status !== 'imported' && result.status !== 'adopted')
+              || Boolean(result.warning)
+            ))
+            : []
           const actions = []
           if (phase === 'source') {
             actions.push(h(
@@ -2178,7 +2190,9 @@ window.__ModuleLoader__.load({
                       { style: dialogHintStyle },
                       `会话包：${report.fileName}`
                         + `${report.exportedAt ? ` · 导出时间 ${formatAbsolute(Date.parse(report.exportedAt))}` : ''}`
-                        + ` · 会话 ${report.counts.sessions} 个（可导入 ${report.counts.importable} 个，冲突 ${report.counts.conflicts} 个）`,
+                        + ` · 会话 ${report.counts.sessions} 个（可导入 ${report.counts.importable} 个`
+                        + `${report.counts.adoptable > 0 ? `，其中已归档 ${report.counts.adoptable} 个` : ''}`
+                        + `，冲突 ${report.counts.conflicts} 个）`,
                     ),
                     ...(report.warnings || []).map((warning, index) => h(
                       'div',
@@ -2202,9 +2216,11 @@ window.__ModuleLoader__.load({
                           session.role === 'subagent' ? '子智能体/队友' : session.role === 'fork' ? '分叉' : '会话',
                         ),
                         h('span', { style: sessionTitleStyle }, session.title || session.id),
-                        session.conflict
-                          ? h('span', { style: blockedBadgeStyle }, conflictLabel[session.conflict] || session.conflict)
-                          : h('span', { style: badgeStyle }, `${(session.bytes / 1048576).toFixed(1)} MB`),
+                        session.conflict === 'archived'
+                          ? h('span', { style: adoptBadgeStyle }, conflictLabel.archived)
+                          : session.conflict
+                            ? h('span', { style: blockedBadgeStyle }, conflictLabel[session.conflict] || session.conflict)
+                            : h('span', { style: badgeStyle }, `${(session.bytes / 1048576).toFixed(1)} MB`),
                       )),
                     ),
                     report.workspaces.length > 0
@@ -2258,8 +2274,10 @@ window.__ModuleLoader__.load({
                     h(
                       'p',
                       { style: dialogHintStyle },
-                      `已导入 ${outcome.imported} 个会话，跳过 ${outcome.skipped} 个，失败 ${outcome.failed} 个。`
-                        + `${outcome.imported > 0 ? '会话库已刷新，可在列表中查看。' : ''}`,
+                      `已导入 ${outcome.imported} 个会话`
+                        + `${outcome.adopted > 0 ? `，沿用本地已归档副本 ${outcome.adopted} 个（已取消归档）` : ''}`
+                        + `，跳过 ${outcome.skipped} 个，失败 ${outcome.failed} 个。`
+                        + `${outcome.imported > 0 || outcome.adopted > 0 ? '会话库已刷新，可在列表中查看。' : ''}`,
                     ),
                     outcome.results.some((result) => result.rewritten === true)
                       ? h(
@@ -2268,18 +2286,16 @@ window.__ModuleLoader__.load({
                           `${outcome.results.filter((result) => result.rewritten === true).length} 个会话的工作目录已改写为目标工作区目录。`,
                         )
                       : null,
-                    outcome.results.filter((result) => result.status !== 'imported').length > 0
+                    outcomeProblems.length > 0
                       ? h(
                           'div',
                           { style: dialogListStyle },
-                          outcome.results
-                            .filter((result) => result.status !== 'imported')
-                            .map((result) => h(
-                              'div',
-                              { key: result.id, style: dialogRowStyle },
-                              h('span', { style: sessionTitleStyle }, result.title || result.id),
-                              h('span', { style: blockedBadgeStyle }, result.reason || result.status),
-                            )),
+                          outcomeProblems.map((result) => h(
+                            'div',
+                            { key: result.id, style: dialogRowStyle },
+                            h('span', { style: sessionTitleStyle }, result.title || result.id),
+                            h('span', { style: blockedBadgeStyle }, result.reason || result.warning || result.status),
+                          )),
                         )
                       : null,
                   )
@@ -2963,6 +2979,19 @@ window.__ModuleLoader__.load({
       borderRadius: 999,
       border: '1px solid color-mix(in srgb, #f06a6a 55%, transparent)',
       color: '#f08a8a',
+      opacity: 0.9,
+    }
+    // Neutral sibling of the blocked badge: the row is importable, it just needs
+    // the session un-archived first, so it must not read as an error.
+    const adoptBadgeStyle = {
+      flex: '0 0 auto',
+      fontSize: 11,
+      lineHeight: '16px',
+      padding: '0 6px',
+      borderRadius: 999,
+      border: '1px solid color-mix(in srgb, currentColor 34%, transparent)',
+      background: 'color-mix(in srgb, currentColor 10%, Canvas)',
+      whiteSpace: 'nowrap',
       opacity: 0.9,
     }
     const dangerButtonStyle = {

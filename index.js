@@ -1262,6 +1262,31 @@ function findSessionLogFile(sessionDir) {
 }
 
 /**
+ * Read the cwd one stored session records in its header.
+ *
+ * Only the first zstd frame is decoded: that frame carries the session header,
+ * and the event frames after it are never touched.
+ *
+ * @param {string} sessionDir session directory.
+ * @returns {string | null} recorded cwd, or null when it cannot be read.
+ */
+function readSessionHeaderCwd(sessionDir) {
+  const logFile = findSessionLogFile(sessionDir)
+  if (logFile === undefined) return null
+  try {
+    const buffer = readFileSync(logFile)
+    const frameLength = firstZstdFrameLength(buffer)
+    const frameText = zstdDecompressSync(buffer.subarray(0, frameLength)).toString('utf8')
+    const line = frameText.split('\n').find((candidate) => candidate.trim() !== '')
+    if (line === undefined) return null
+    const header = JSON.parse(line)
+    return typeof header.cwd === 'string' && header.cwd !== '' ? header.cwd : null
+  } catch {
+    return null
+  }
+}
+
+/**
  * Rewrite the stored session header's cwd so the session can belong to a
  * workspace whose directory differs from the source machine's path.
  *
@@ -1516,17 +1541,25 @@ async function inspectImport(ctx, rawPath) {
       .map((workspace) => [workspace.path.toLowerCase(), workspace.workspaceId]),
   )
   const pending = readPendingTrash()
+  // Archived sessions hide from both the Native sidebar and the library's
+  // default view, so a local duplicate in that state is adoptable instead of a
+  // blocking conflict.
+  const baseline = await readWorkspaceBaseline(ctx, 'import-inspect')
+  const archivedLocal = new Set(baseline.baseline.archivedSessionIds)
   const packageIds = new Set(manifest.sessions.map((session) => session.id))
   const sessions = []
   let conflicts = 0
+  let adoptable = 0
   for (const session of manifest.sessions) {
     const files = bySession.get(session.id) ?? []
     const pendingHere = pending[session.id] !== undefined
+    const localDir = findSessionDir(session.id)
     let conflict = null
     if (files.length === 0) conflict = 'missing'
-    else if (findSessionDir(session.id) !== undefined) conflict = 'exists'
     else if (pendingHere) conflict = 'pending'
-    if (conflict !== null) conflicts += 1
+    else if (localDir !== undefined) conflict = archivedLocal.has(session.id) ? 'archived' : 'exists'
+    if (conflict !== null && conflict !== 'archived') conflicts += 1
+    if (conflict === 'archived') adoptable += 1
     const parentSession = typeof session.parentSession === 'string' ? session.parentSession : null
     const missingParent = parentSession !== null && parentSession !== ''
       && !packageIds.has(parentSession)
@@ -1566,6 +1599,9 @@ async function inspectImport(ctx, rawPath) {
   if (missingParentCount > 0) warnings.push(`${missingParentCount} 个会话的父会话不在包内，导入后可能无法继续对话`)
   if (unknown.length > 0) warnings.push(`包内有 ${unknown.length} 个无法识别的文件，将被忽略`)
   if (unknownWorkspaceIds.length > 0) warnings.push(`${unknownWorkspaceIds.length} 个源工作区没有元数据，相关会话将放入未分组`)
+  if (adoptable > 0) {
+    warnings.push(`${adoptable} 个会话在本地已存在且处于归档状态：导入会取消归档，并尽量归入所选目标工作区`)
+  }
 
   return {
     path: pkg.zipPath,
@@ -1582,9 +1618,122 @@ async function inspectImport(ctx, rawPath) {
     counts: {
       sessions: sessions.length,
       conflicts,
+      adoptable,
       importable: sessions.length - conflicts,
       workspaces: workspaces.length,
     },
+  }
+}
+
+/**
+ * Adopt the local copy of a package session instead of importing a duplicate.
+ *
+ * A session that already exists locally is normally skipped. When that copy is
+ * archived, importing would leave it invisible in both the Native sidebar and
+ * the library's default view, so adoption un-archives it and, when the user
+ * mapped its source workspace to a local one, re-homes it into that workspace
+ * directory (header cwd rewrite only; the event frames stay byte-identical).
+ *
+ * @param {object} options adoption inputs.
+ * @param {string} options.id session id.
+ * @param {string | null} options.title session title.
+ * @param {string} options.role session role.
+ * @param {string} options.localDir existing session directory.
+ * @param {string[]} options.targetWorkspaceIds mapped local workspace ids.
+ * @param {string | null} options.targetCwd mapped workspace directory; null keeps the copy in place.
+ * @param {object | undefined} options.registry workspace registry service.
+ * @returns {Promise<object>} per-session result.
+ */
+async function adoptLocalSession(options) {
+  const { id, title, role, localDir, targetWorkspaceIds, targetCwd, registry } = options
+  const localCwd = readSessionHeaderCwd(localDir)
+  const warnings = []
+  let moved = false
+  let rewritten = false
+  const attached = []
+
+  // Un-archive first: adoption exists to make the session visible again, and
+  // nothing below may leave it hidden when it fails.
+  if (!registry || typeof registry.unarchiveSession !== 'function') {
+    return { id, title, role, status: 'failed', reason: '工作区服务不可用，无法取消归档' }
+  }
+  try {
+    await registry.unarchiveSession(id)
+  } catch (error) {
+    return { id, title, role, status: 'failed', reason: `取消归档失败：${describeError(error)}` }
+  }
+
+  const targetPath = typeof targetCwd === 'string' && targetCwd !== '' ? targetCwd : null
+  // Moving the directory without rewriting the header would leave the store
+  // unable to find the session again, so an unreadable header stays in place.
+  if (targetPath !== null && localCwd === null) {
+    warnings.push('无法读取会话日志头，未迁移目录')
+  } else if (targetPath !== null) {
+    const projectDir = join(SESSIONS_ROOT, projectKey(targetPath))
+    const targetDir = join(projectDir, id)
+    const inPlace = resolve(targetDir).toLowerCase() === resolve(localDir).toLowerCase()
+    let activeDir = localDir
+    if (!inPlace) {
+      try {
+        if (existsSync(targetDir)) throw new Error('目标工作区目录已存在同 id 会话')
+        mkdirSync(projectDir, { recursive: true })
+        // A live Agent keeps its log open, so Windows refuses the move and the
+        // session simply stays in its current directory.
+        renameSync(localDir, targetDir)
+        activeDir = targetDir
+        moved = true
+      } catch (error) {
+        warnings.push(`目录未迁移：${describeError(error)}`)
+      }
+    }
+    // The store derives the project directory from the header cwd, so the two
+    // may only disagree when the move succeeded or was unnecessary.
+    if (moved || inPlace) {
+      const logFile = findSessionLogFile(activeDir)
+      if (logFile === undefined) {
+        warnings.push('找不到会话日志，工作目录未改写')
+      } else {
+        try {
+          rewritten = rewriteSessionHeaderCwd(logFile, targetPath)
+        } catch (error) {
+          warnings.push(`工作目录未改写：${describeError(error)}`)
+        }
+      }
+      if (registry && typeof registry.get === 'function') {
+        // Moving the log means the previous membership no longer describes it.
+        try {
+          await detachFromWorkspaces(registry, id)
+        } catch {
+          // Accounting cleanup is best effort.
+        }
+        for (const workspaceId of targetWorkspaceIds) {
+          try {
+            const workspace = registry.get(workspaceId)
+            if (workspace && typeof workspace.attachSession === 'function') {
+              await workspace.attachSession(id)
+              attached.push(workspaceId)
+            }
+          } catch {
+            // Membership is best effort; the session is already visible.
+          }
+        }
+      }
+    }
+  }
+
+  titleCache.delete(id)
+  appendOperation({ action: 'adopt', sessionId: id, title, role })
+  trace('import', 'adopted', `id=${id} moved=${moved} rewritten=${rewritten} attached=${attached.length}`)
+  return {
+    id,
+    title,
+    role,
+    status: 'adopted',
+    workspaceIds: attached,
+    moved,
+    rewritten,
+    cwd: targetPath !== null ? targetPath : localCwd,
+    warning: warnings.length > 0 ? warnings.join('；') : null,
   }
 }
 
@@ -1623,8 +1772,11 @@ async function importPackage(ctx, rawPath, rawMapping) {
   }
   const results = []
   let imported = 0
+  let adopted = 0
   let skipped = 0
   let failed = 0
+  const baseline = await readWorkspaceBaseline(ctx, 'import-run')
+  const archivedLocal = new Set(baseline.baseline.archivedSessionIds)
 
   for (const session of manifest.sessions) {
     const id = session.id
@@ -1636,16 +1788,6 @@ async function importPackage(ctx, rawPath, rawMapping) {
       results.push({ id, title, status: 'failed', reason: '包内缺少该会话的文件' })
       continue
     }
-    if (findSessionDir(id) !== undefined) {
-      skipped += 1
-      results.push({ id, title, status: 'skipped', reason: '本地已存在同 id 会话' })
-      continue
-    }
-    if (pending[id] !== undefined) {
-      skipped += 1
-      results.push({ id, title, status: 'skipped', reason: '该会话正在待重启整理队列中' })
-      continue
-    }
     const targetWorkspaceIds = [...new Set(
       (Array.isArray(session.workspaceIds) ? session.workspaceIds : [])
         .map((sourceId) => mapping[String(sourceId)])
@@ -1655,13 +1797,50 @@ async function importPackage(ctx, rawPath, rawMapping) {
     // header records: the registry only attaches sessions whose cwd equals the
     // workspace directory, so a cross-directory mapping rewrites the header.
     let targetCwd = typeof session.cwd === 'string' && session.cwd !== '' ? session.cwd : null
+    let mappedCwd = null
     let rewrite = false
     if (targetWorkspaceIds.length > 0) {
       const targetPath = workspacePathById.get(targetWorkspaceIds[0])
       if (typeof targetPath === 'string' && targetPath !== '') {
         rewrite = targetCwd !== targetPath
         targetCwd = targetPath
+        mappedCwd = targetPath
       }
+    }
+    if (pending[id] !== undefined) {
+      skipped += 1
+      results.push({ id, title, status: 'skipped', reason: '该会话正在待重启整理队列中' })
+      continue
+    }
+    const localDir = findSessionDir(id)
+    if (localDir !== undefined) {
+      // A visible duplicate still blocks the import; an archived one is adopted
+      // so the package ends up usable instead of silently staying hidden.
+      if (!archivedLocal.has(id)) {
+        skipped += 1
+        results.push({ id, title, status: 'skipped', reason: '本地已存在同 id 会话' })
+        continue
+      }
+      try {
+        const outcome = await adoptLocalSession({
+          id,
+          title,
+          role,
+          localDir,
+          targetWorkspaceIds,
+          // Only a mapped workspace re-homes the local copy: the package's own
+          // recorded cwd belongs to the source machine and may not exist here.
+          targetCwd: mappedCwd,
+          registry,
+        })
+        if (outcome.status === 'adopted') adopted += 1
+        else failed += 1
+        results.push(outcome)
+      } catch (error) {
+        failed += 1
+        results.push({ id, title, status: 'failed', reason: describeError(error) })
+      }
+      continue
     }
     // The storage backend derives the project directory from the header cwd, so
     // the package's recorded directory name is only a fallback for sessions that
@@ -1705,13 +1884,10 @@ async function importPackage(ctx, rawPath, rawMapping) {
           // Membership is best effort; the session still imports.
         }
       }
-      if (session.archived === true) {
-        try {
-          if (registry && typeof registry.archiveSession === 'function') await registry.archiveSession(id)
-        } catch {
-          // Archive state is cosmetic.
-        }
-      } else if (session.pinned === true) {
+      // An imported session must never stay archived: an archived session is
+      // hidden from the Native sidebar and from the library's default view, so
+      // the user would see a successful import with nothing to show for it.
+      if (session.pinned === true) {
         try {
           if (registry && typeof registry.pinSession === 'function') await registry.pinSession(id)
         } catch {
@@ -1726,7 +1902,8 @@ async function importPackage(ctx, rawPath, rawMapping) {
         title,
         status: 'imported',
         workspaceIds: attached,
-        archived: session.archived === true,
+        archived: false,
+        unarchivedFromPackage: session.archived === true,
         rewritten: rewrite,
         cwd: targetCwd,
       })
@@ -1744,8 +1921,8 @@ async function importPackage(ctx, rawPath, rawMapping) {
     }
   }
 
-  trace('import', 'end', `imported=${imported} skipped=${skipped} failed=${failed}`)
-  return { results, imported, skipped, failed, fileName: pkg.fileName }
+  trace('import', 'end', `imported=${imported} adopted=${adopted} skipped=${skipped} failed=${failed}`)
+  return { results, imported, adopted, skipped, failed, fileName: pkg.fileName }
 }
 
 /**
