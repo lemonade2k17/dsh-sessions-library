@@ -64,6 +64,7 @@ const TRASH_RESTORE_PATH = '/api/sessions-library/trash-restore'
 const TRASH_PURGE_PATH = '/api/sessions-library/trash-purge'
 const LOGS_PATH = '/api/sessions-library/logs'
 const LOGS_CLEAR_PATH = '/api/sessions-library/logs-clear'
+const LOGS_DELETE_PATH = '/api/sessions-library/logs-delete'
 const DELETE_PROGRESS_PATH = '/api/sessions-library/delete-progress'
 const EXPORT_PATH = '/api/sessions-library/export'
 const IMPORT_LIST_PATH = '/api/sessions-library/import-list'
@@ -144,32 +145,106 @@ function trimOperations() {
 }
 
 /**
- * Read the most recent operations, newest first.
+ * Stable id for one stored history line.
  *
- * @param {any} limit requested row count.
- * @returns {Array<object>} operation records.
+ * A line index cannot identify a record: the file is trimmed from the front, so
+ * every remaining index shifts. A content hash plus an occurrence counter stays
+ * put — identical records can only appear when the same action lands in the same
+ * millisecond, and the counter keeps even those distinguishable.
+ *
+ * @param {string} line raw JSONL line.
+ * @param {number} occurrence 0-based position among identical lines, newest first.
+ * @returns {string} the id.
  */
-function readOperations(limit) {
+function operationLineId(line, occurrence) {
+  return `${crc32(Buffer.from(line, 'utf8')).toString(16)}#${occurrence}`
+}
+
+/**
+ * Parse the history file into id-tagged rows, newest first.
+ *
+ * @returns {Array<{ id: string, line: string }>} rows.
+ */
+function readOperationLines() {
   let lines = []
   try {
     lines = readFileSync(OPERATIONS_FILE, 'utf8').split('\n').filter((line) => line.trim() !== '')
   } catch {
     return []
   }
+  const rows = []
+  const occurrences = new Map()
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const line = lines[index]
+    const seen = occurrences.get(line) ?? 0
+    occurrences.set(line, seen + 1)
+    rows.push({ id: operationLineId(line, seen), line })
+  }
+  return rows
+}
+
+/**
+ * Read the most recent operations, newest first.
+ *
+ * @param {any} limit requested row count.
+ * @returns {Array<object>} operation records, each carrying its stable `id`.
+ */
+function readOperations(limit) {
   const parsedLimit = Number(limit)
   const wanted = Number.isFinite(parsedLimit) && parsedLimit > 0
     ? Math.min(OPERATIONS_LIMIT, Math.floor(parsedLimit))
     : OPERATIONS_LIMIT
   const entries = []
-  for (let index = lines.length - 1; index >= 0 && entries.length < wanted; index -= 1) {
+  for (const row of readOperationLines()) {
+    if (entries.length >= wanted) break
     try {
-      const value = JSON.parse(lines[index])
-      if (value && typeof value === 'object') entries.push(value)
+      const value = JSON.parse(row.line)
+      if (value && typeof value === 'object') entries.push({ ...value, id: row.id })
     } catch {
       // Skip a corrupt line instead of dropping the whole history.
     }
   }
   return entries
+}
+
+/**
+ * Delete the selected history rows.
+ *
+ * Everything else is rewritten through a temporary file and a rename so a crash
+ * cannot leave half a history behind. Trimming is unnecessary: the file only
+ * shrinks here.
+ *
+ * @param {any} rawIds requested row ids.
+ * @returns {number} how many rows were removed.
+ */
+function deleteOperations(rawIds) {
+  const wanted = new Set(
+    (Array.isArray(rawIds) ? rawIds : [])
+      .filter((id) => typeof id === 'string' && id !== '')
+      .slice(0, OPERATIONS_LIMIT),
+  )
+  if (wanted.size === 0) return 0
+  const rows = readOperationLines()
+  if (rows.length === 0) return 0
+  const kept = rows.filter((row) => !wanted.has(row.id))
+  const removed = rows.length - kept.length
+  if (removed === 0) return 0
+  const temporary = `${OPERATIONS_FILE}.tmp`
+  try {
+    mkdirSync(dirname(OPERATIONS_FILE), { recursive: true })
+    // Rows are newest first; the file keeps its oldest-first order.
+    const body = kept.map((row) => row.line).reverse()
+    writeFileSync(temporary, body.length > 0 ? `${body.join('\n')}\n` : '')
+    renameSync(temporary, OPERATIONS_FILE)
+  } catch {
+    try {
+      rmSync(temporary, { force: true })
+    } catch {
+      // A leftover temporary file is harmless; the history is untouched.
+    }
+    return 0
+  }
+  return removed
 }
 
 /** Remove the operation history. */
@@ -3131,6 +3206,16 @@ export function apply(ctx) {
           clearOperations()
           trace('logs', 'cleared', '')
           return jsonResponse({ ok: true })
+        },
+      },
+      {
+        path: LOGS_DELETE_PATH,
+        label: 'logs-delete',
+        handler: async (request) => {
+          const body = await readJsonBody(request)
+          const removed = deleteOperations(body.ids)
+          trace('logs', 'deleted', `rows=${removed}`)
+          return jsonResponse({ ok: true, removed })
         },
       },
       {
