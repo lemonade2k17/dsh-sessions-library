@@ -2199,6 +2199,13 @@ window.__ModuleLoader__.load({
                       : null,
                     report.workspaces.length > 0
                       ? h(
+                          'p',
+                          { style: dialogHintStyle },
+                          '选择目标工作区：若它与会话记录的工作目录不同，导入会把该会话的工作目录改写为目标工作区的目录（只改日志头信息，历史事件保持不变）。',
+                        )
+                      : null,
+                    report.workspaces.length > 0
+                      ? h(
                           'div',
                           { style: dialogListStyle },
                           report.workspaces.map((workspace) => h(
@@ -2241,6 +2248,13 @@ window.__ModuleLoader__.load({
                       `已导入 ${outcome.imported} 个会话，跳过 ${outcome.skipped} 个，失败 ${outcome.failed} 个。`
                         + `${outcome.imported > 0 ? '会话库已刷新，可在列表中查看。' : ''}`,
                     ),
+                    outcome.results.some((result) => result.rewritten === true)
+                      ? h(
+                          'p',
+                          { style: dialogHintStyle },
+                          `${outcome.results.filter((result) => result.rewritten === true).length} 个会话的工作目录已改写为目标工作区目录。`,
+                        )
+                      : null,
                     outcome.results.filter((result) => result.status !== 'imported').length > 0
                       ? h(
                           'div',

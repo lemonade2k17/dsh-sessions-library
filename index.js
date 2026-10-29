@@ -29,7 +29,7 @@ import {
 } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, dirname, join, resolve, sep } from 'node:path'
-import { inflateRawSync } from 'node:zlib'
+import { inflateRawSync, zstdCompressSync, zstdDecompressSync } from 'node:zlib'
 
 export const name = 'dsh-sessions-library'
 
@@ -1173,6 +1173,127 @@ function safeProjectDirName(value) {
 }
 
 /**
+ * Build the readable project directory key for one cwd, matching the storage
+ * backend's convention so DSH groups the imported session under that folder.
+ *
+ * @param {string} cwd project directory.
+ * @returns {string} one safe path segment.
+ */
+function projectKey(cwd) {
+  if (typeof cwd !== 'string' || cwd === '') throw new Error('会话工作目录为空')
+  let readable = ''
+  let separatorRun = false
+  for (let index = 0; index < cwd.length; index += 1) {
+    const code = cwd.charCodeAt(index)
+    const ch = String.fromCharCode(code)
+    if (ch === '/' || ch === '\\' || ch === ':') {
+      if (!separatorRun) readable += '-'
+      separatorRun = true
+    } else if (ch !== '~' && /^[A-Za-z0-9._-]$/.test(ch)) {
+      readable += ch
+      separatorRun = false
+    } else {
+      readable += `~${code.toString(16).toUpperCase().padStart(4, '0')}`
+      separatorRun = false
+    }
+  }
+  const trimmed = readable.replace(/^-+/, '') || 'root'
+  return `--${trimmed.slice(0, 251)}--`
+}
+
+/**
+ * Measure one zstd frame at the start of a buffer.
+ *
+ * @param {Buffer} buffer file bytes starting at a frame magic.
+ * @returns {number} frame length in bytes.
+ */
+function firstZstdFrameLength(buffer) {
+  if (buffer.length < 6 || buffer.readUInt32LE(0) !== 0xfd2fb528) {
+    throw new Error('会话日志不是 zstd 格式，无法改写工作目录')
+  }
+  const descriptor = buffer[4]
+  const fcsFlag = descriptor >> 6
+  const singleSegment = (descriptor & 0x20) !== 0
+  const checksum = (descriptor & 0x04) !== 0
+  const dictionaryFlag = descriptor & 0x03
+  let offset = 5
+  if (!singleSegment) offset += 1
+  offset += dictionaryFlag === 0 ? 0 : dictionaryFlag === 1 ? 1 : dictionaryFlag === 2 ? 2 : 4
+  offset += fcsFlag === 0 ? (singleSegment ? 1 : 0) : fcsFlag === 1 ? 2 : fcsFlag === 2 ? 4 : 8
+  for (let blocks = 0; blocks < 1000000; blocks += 1) {
+    if (offset + 3 > buffer.length) throw new Error('会话日志帧头损坏')
+    const blockHeader = buffer.readUIntLE(offset, 3)
+    offset += 3
+    const isLast = (blockHeader & 1) === 1
+    const blockType = (blockHeader >> 1) & 3
+    const blockSize = blockHeader >> 3
+    offset += blockType === 1 ? 1 : blockSize
+    if (offset > buffer.length) throw new Error('会话日志帧数据越界')
+    if (isLast) break
+  }
+  if (checksum) offset += 4
+  if (offset > buffer.length) throw new Error('会话日志帧校验越界')
+  return offset
+}
+
+/**
+ * Locate the stored log file inside one session directory.
+ *
+ * @param {string} sessionDir session directory.
+ * @returns {string | undefined} log path.
+ */
+function findSessionLogFile(sessionDir) {
+  let children = []
+  try {
+    children = readdirSync(sessionDir, { withFileTypes: true })
+  } catch {
+    return undefined
+  }
+  for (const child of children) {
+    if (child.isFile() && child.name.endsWith('.jsonl.zstd')) return join(sessionDir, child.name)
+  }
+  for (const child of children) {
+    if (child.isFile() && child.name.startsWith('session.')) return join(sessionDir, child.name)
+  }
+  return undefined
+}
+
+/**
+ * Rewrite the stored session header's cwd so the session can belong to a
+ * workspace whose directory differs from the source machine's path.
+ *
+ * Only the first zstd frame is re-encoded; every following frame is preserved
+ * byte for byte, so the event history is untouched.
+ *
+ * @param {string} filePath stored session log path.
+ * @param {string} targetCwd workspace directory to record.
+ * @returns {boolean} whether the header changed.
+ */
+function rewriteSessionHeaderCwd(filePath, targetCwd) {
+  const buffer = readFileSync(filePath)
+  const frameLength = firstZstdFrameLength(buffer)
+  const frameText = zstdDecompressSync(buffer.subarray(0, frameLength)).toString('utf8')
+  const lines = frameText.split('\n')
+  const index = lines.findIndex((line) => line.trim() !== '')
+  if (index < 0) throw new Error('会话日志首帧为空，无法改写工作目录')
+  let header = null
+  try {
+    header = JSON.parse(lines[index])
+  } catch {
+    header = null
+  }
+  if (!header || header.type !== 'session' || typeof header.id !== 'string') {
+    throw new Error('会话日志首行不是会话头，无法改写工作目录')
+  }
+  if (header.cwd === targetCwd) return false
+  header.cwd = targetCwd
+  lines[index] = JSON.stringify(header)
+  const nextFrame = zstdCompressSync(Buffer.from(lines.join('\n'), 'utf8'))
+  writeFileSync(filePath, Buffer.concat([nextFrame, buffer.subarray(frameLength)]))
+  return true
+}
+
+/**
  * List ZIP packages available in one folder, newest first.
  *
  * @param {any} rawDir folder to scan; empty means the default export folder.
@@ -1323,6 +1444,19 @@ async function importPackage(ctx, rawPath, rawMapping) {
     : {}
   const registry = ctx.get('workspaceRegistry')
   const pending = readPendingTrash()
+  const workspacePathById = new Map()
+  if (registry && typeof registry.list === 'function') {
+    try {
+      for (const workspace of registry.list()) {
+        workspacePathById.set(
+          String(workspace.id),
+          typeof workspace.path === 'string' ? workspace.path : '',
+        )
+      }
+    } catch {
+      // Unknown paths only cost the cwd rewrite and workspace membership.
+    }
+  }
   const results = []
   let imported = 0
   let skipped = 0
@@ -1348,8 +1482,32 @@ async function importPackage(ctx, rawPath, rawMapping) {
       results.push({ id, title, status: 'skipped', reason: '该会话正在待重启整理队列中' })
       continue
     }
-    const projectDir = join(SESSIONS_ROOT, safeProjectDirName(session.projectDirName))
+    const targetWorkspaceIds = [...new Set(
+      (Array.isArray(session.workspaceIds) ? session.workspaceIds : [])
+        .map((sourceId) => mapping[String(sourceId)])
+        .filter((targetId) => typeof targetId === 'string' && targetId !== ''),
+    )]
+    // A mapped workspace also decides where the log lives and which cwd the
+    // header records: the registry only attaches sessions whose cwd equals the
+    // workspace directory, so a cross-directory mapping rewrites the header.
+    let targetCwd = typeof session.cwd === 'string' && session.cwd !== '' ? session.cwd : null
+    let rewrite = false
+    if (targetWorkspaceIds.length > 0) {
+      const targetPath = workspacePathById.get(targetWorkspaceIds[0])
+      if (typeof targetPath === 'string' && targetPath !== '') {
+        rewrite = targetCwd !== targetPath
+        targetCwd = targetPath
+      }
+    }
+    // The storage backend derives the project directory from the header cwd, so
+    // the package's recorded directory name is only a fallback for sessions that
+    // carry no cwd at all.
+    const projectDirName = targetCwd !== null
+      ? projectKey(targetCwd)
+      : safeProjectDirName(session.projectDirName)
+    const projectDir = join(SESSIONS_ROOT, projectDirName)
     const sessionDir = join(projectDir, id)
+    let createdSessionDir = false
     try {
       if (existsSync(sessionDir)) {
         skipped += 1
@@ -1357,6 +1515,7 @@ async function importPackage(ctx, rawPath, rawMapping) {
         continue
       }
       mkdirSync(sessionDir, { recursive: true })
+      createdSessionDir = true
       const rootResolved = resolve(sessionDir)
       for (const file of files) {
         const target = resolve(join(sessionDir, ...file.segments))
@@ -1364,12 +1523,12 @@ async function importPackage(ctx, rawPath, rawMapping) {
         mkdirSync(dirname(target), { recursive: true })
         writeFileSync(target, file.data)
       }
+      if (rewrite) {
+        const logFile = findSessionLogFile(sessionDir)
+        if (logFile === undefined) throw new Error('包内没有可改写的会话日志')
+        rewriteSessionHeaderCwd(logFile, targetCwd)
+      }
 
-      const targetWorkspaceIds = [...new Set(
-        (Array.isArray(session.workspaceIds) ? session.workspaceIds : [])
-          .map((sourceId) => mapping[String(sourceId)])
-          .filter((targetId) => typeof targetId === 'string' && targetId !== ''),
-      )]
       const attached = []
       for (const workspaceId of targetWorkspaceIds) {
         try {
@@ -1404,9 +1563,19 @@ async function importPackage(ctx, rawPath, rawMapping) {
         status: 'imported',
         workspaceIds: attached,
         archived: session.archived === true,
+        rewritten: rewrite,
+        cwd: targetCwd,
       })
     } catch (error) {
       failed += 1
+      // A half-written session must not stay behind as a broken import.
+      if (createdSessionDir) {
+        try {
+          rmSync(sessionDir, { recursive: true, force: true })
+        } catch {
+          // Leaving it is still better than masking the original failure.
+        }
+      }
       results.push({ id, title, status: 'failed', reason: describeError(error) })
     }
   }
