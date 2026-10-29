@@ -2534,15 +2534,6 @@ window.__ModuleLoader__.load({
             },
             '操作日志',
           ),
-          h(
-            'button',
-            {
-              className: 'sl-btn',
-              style: actionButtonStyle,
-              onClick: openImportDialog,
-            },
-            '导入会话',
-          ),
         )
 
         const trashControls = h(
@@ -2724,18 +2715,32 @@ window.__ModuleLoader__.load({
                 'div',
                 { className: 'sl-dock', style: exportDockStyle },
                 h(
-                  'button',
-                  {
-                    type: 'button',
-                    className: 'sl-btn sl-fab',
-                    style: selectedCount > 0 ? fabButtonStyle : fabDisabledStyle,
-                    disabled: selectedCount === 0,
-                    title: selectedCount > 0
-                      ? `导出所选的 ${selectedCount} 个会话`
-                      : '请先勾选要导出的会话',
-                    onClick: openExportDialog,
-                  },
-                  selectedCount > 0 ? `导出所选 ${selectedCount}` : '导出所选',
+                  'div',
+                  { style: dockActionsStyle },
+                  h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'sl-btn',
+                      style: dockSecondaryButtonStyle,
+                      onClick: openImportDialog,
+                    },
+                    '导入会话',
+                  ),
+                  h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'sl-btn sl-fab',
+                      style: selectedCount > 0 ? fabButtonStyle : fabDisabledStyle,
+                      disabled: selectedCount === 0,
+                      title: selectedCount > 0
+                        ? `导出所选的 ${selectedCount} 个会话`
+                        : '请先勾选要导出的会话',
+                      onClick: openExportDialog,
+                    },
+                    selectedCount > 0 ? `导出所选 ${selectedCount}` : '导出所选',
+                  ),
                 ),
               )
             : null,
@@ -3092,6 +3097,27 @@ window.__ModuleLoader__.load({
       backdropFilter: 'blur(8px)',
       WebkitBackdropFilter: 'blur(8px)',
       pointerEvents: 'none',
+    }
+    const dockActionsStyle = {
+      position: 'relative',
+      zIndex: 1,
+      display: 'flex',
+      alignItems: 'center',
+      gap: 10,
+      pointerEvents: 'none',
+    }
+    const dockSecondaryButtonStyle = {
+      height: 38,
+      padding: '0 16px',
+      borderRadius: 999,
+      border: '1px solid color-mix(in srgb, currentColor 22%, transparent)',
+      background: 'color-mix(in srgb, currentColor 8%, Canvas)',
+      color: 'inherit',
+      font: 'inherit',
+      fontSize: 13,
+      fontWeight: 500,
+      cursor: 'pointer',
+      pointerEvents: 'auto',
     }
     const fabButtonStyle = {
       position: 'relative',
