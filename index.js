@@ -2284,6 +2284,13 @@ async function trashSessions(ctx, rawIds, signal, includeForks, progress = null)
       // sidebar hides it immediately, and queue the physical move for the next
       // start, when no Agent is live.
       if (member.loaded === true && member.running !== true) {
+        // A repeat delete of the same session must not read back the archive the
+        // first delete applied: the existing record owns the "was it archived
+        // before anyone touched it" answer, and earlier queued intents (a
+        // pending permanent delete) must survive the second request.
+        const previous = pending[member.id] && typeof pending[member.id] === 'object'
+          ? pending[member.id]
+          : null
         if (registry && typeof registry.archiveSession === 'function' && !archived.has(member.id)) {
           try {
             await registry.archiveSession(member.id, {})
@@ -2291,9 +2298,15 @@ async function trashSessions(ctx, rawIds, signal, includeForks, progress = null)
             // Background work may refuse archiving; the deferred move still applies.
           }
         }
-        const wasArchived = archived.has(member.id)
+        const wasArchived = previous !== null && typeof previous.wasArchived === 'boolean'
+          ? previous.wasArchived
+          : archived.has(member.id)
         pending[member.id] = {
-          requestedAt: Date.now(),
+          ...(previous ?? {}),
+          // Keep the first request's timestamp so the bin entry keeps its age.
+          requestedAt: previous !== null && typeof previous.requestedAt === 'number'
+            ? previous.requestedAt
+            : Date.now(),
           familyRoot: family.rootId,
           role: member.role,
           title: member.title,
@@ -2434,8 +2447,10 @@ async function restoreTrashEntries(ctx, rawNames, signal, options = {}) {
         if (record.wasArchived !== true && registry && typeof registry.unarchiveSession === 'function') {
           await registry.unarchiveSession(pendingId)
         }
-      } catch {
-        // The session was archived only to hide it during deletion.
+      } catch (error) {
+        // The session was archived only to hide it during deletion, so a failure
+        // here leaves it invisible; keep a trace to make that diagnosable.
+        trace('restore', 'unarchive-fail', `id=${pendingId} ${describeError(error)}`)
       }
       trace('restore', 'end', `ok pending id=${pendingId}`)
       appendOperation({
