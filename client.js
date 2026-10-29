@@ -2152,7 +2152,7 @@ window.__ModuleLoader__.load({
                                   ? { ...current, path: file.path, error: null }
                                   : current)),
                               },
-                              selected ? `✓ ${label}` : label,
+                              label,
                             )
                           }),
                         )
@@ -3073,10 +3073,12 @@ window.__ModuleLoader__.load({
       textOverflow: 'ellipsis',
       whiteSpace: 'nowrap',
     }
+    // Same highlight recipe as the dock's enabled export action: a light fill
+    // mixed over Canvas, a slightly stronger border, and semibold text.
     const importFileButtonSelectedStyle = {
       ...importFileButtonStyle,
-      border: '1px solid color-mix(in srgb, currentColor 55%, transparent)',
-      background: 'color-mix(in srgb, currentColor 14%, transparent)',
+      border: '1px solid color-mix(in srgb, currentColor 24%, transparent)',
+      background: 'color-mix(in srgb, currentColor 12%, Canvas)',
       fontWeight: 600,
     }
     const importSectionTitleStyle = {
