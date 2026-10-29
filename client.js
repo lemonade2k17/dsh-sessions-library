@@ -489,6 +489,9 @@ window.__ModuleLoader__.load({
         const [logsSort, setLogsSort] = React.useState('newest')
         const [query, setQuery] = React.useState('')
         const [reloadToken, setReloadToken] = React.useState(0)
+        // Feedback for the library's "取消归档" action and the ids in flight.
+        const [unarchiveNotice, setUnarchiveNotice] = React.useState(null)
+        const [unarchiving, setUnarchiving] = React.useState({})
 
         // The effect reads the newest snapshot without depending on it.
         const snapshotRef = React.useRef(snapshot)
@@ -575,6 +578,14 @@ window.__ModuleLoader__.load({
             document.removeEventListener('visibilitychange', onVisibility)
           }
         }, [])
+
+        // Keep the un-archive feedback short-lived: it announces one action and
+        // must not linger as permanent chrome.
+        React.useEffect(() => {
+          if (unarchiveNotice === null) return undefined
+          const timer = setTimeout(() => setUnarchiveNotice(null), 5000)
+          return () => clearTimeout(timer)
+        }, [unarchiveNotice])
 
         // Every group, independent of the filter and the query.
         const allGroups = React.useMemo(() => {
@@ -732,6 +743,44 @@ window.__ModuleLoader__.load({
           } catch {
             // Without the session controller the list refreshes on page reload,
             // so a failure here only delays the row.
+          }
+        }
+
+        /**
+         * Un-archive one session straight from the library page.
+         *
+         * The archive flag is owned by the workspace controller, which the Client
+         * half can reach through its `uiWorkspace` service — no plugin route and
+         * therefore no Host round trip is needed. The row comes back into the
+         * Native sidebar only after the native session list is re-pulled.
+         *
+         * @param {object} session archived session row.
+         * @returns {Promise<void>} resolution after the row refreshed.
+         */
+        async function unarchiveSession(session) {
+          if (!session || typeof session.id !== 'string') return
+          if (unarchiving[session.id] === true) return
+          const label = session.title && session.title.trim() !== '' ? session.title : session.id
+          setUnarchiveNotice(null)
+          setUnarchiving((current) => ({ ...current, [session.id]: true }))
+          try {
+            const uiWorkspace = ctx.get('uiWorkspace')
+            if (!uiWorkspace || typeof uiWorkspace.unarchiveSession !== 'function') {
+              throw new Error('当前环境不支持取消归档')
+            }
+            await uiWorkspace.unarchiveSession(session.id)
+            setUnarchiveNotice(`已取消归档：${label}（侧边栏已恢复显示）`)
+            setReloadToken((token) => token + 1)
+            refreshNativeSessionList()
+          } catch (failure) {
+            const message = failure && failure.message ? failure.message : String(failure)
+            setUnarchiveNotice(`取消归档失败：${label} · ${message}`)
+          } finally {
+            setUnarchiving((current) => {
+              const next = { ...current }
+              delete next[session.id]
+              return next
+            })
           }
         }
 
@@ -1492,7 +1541,7 @@ window.__ModuleLoader__.load({
               className: 'sl-row',
               role: 'button',
               tabIndex: 0,
-              style: session.archived ? { ...rowStyle, opacity: 0.55 } : rowStyle,
+              style: session.archived ? { ...rowStyle, opacity: 0.72 } : rowStyle,
               title: session.cwd || session.id,
               onClick: () => openSession(session.id),
               onKeyDown: (event) => {
@@ -1504,6 +1553,25 @@ window.__ModuleLoader__.load({
             renderCheckbox(checked ? 'all' : 'none', () => toggleSession(session.id), `勾选 ${title}`),
             h('span', { style: sessionTitleStyle }, title),
             badges,
+            session.archived
+              ? h(
+                  'button',
+                  {
+                    key: 'unarchive',
+                    type: 'button',
+                    className: 'sl-btn',
+                    style: rowActionStyle,
+                    title: '取消归档后，这个会话会重新出现在侧边栏',
+                    disabled: unarchiving[session.id] === true,
+                    onClick: (event) => {
+                      event.stopPropagation()
+                      unarchiveSession(session)
+                    },
+                    onKeyDown: (event) => event.stopPropagation(),
+                  },
+                  unarchiving[session.id] === true ? '取消归档中…' : '取消归档',
+                )
+              : null,
             h('span', { style: sessionTimeStyle }, formatRelative(session.updatedAt)),
           )
         }
@@ -2750,6 +2818,9 @@ window.__ModuleLoader__.load({
           refreshError !== null
             ? h('div', { style: warnStyle }, `刷新失败：${refreshError}（显示的是上次读取的结果）`)
             : null,
+          view === 'library' && unarchiveNotice !== null
+            ? h('div', { style: infoStyle }, unarchiveNotice)
+            : null,
           h('div', { className: 'sl-scroll' }, body),
           // Floating export dock: a soft gradient panel hovering over the session
           // rows, with the action disabled until something is selected.
@@ -2870,6 +2941,21 @@ window.__ModuleLoader__.load({
       whiteSpace: 'nowrap',
     }
     const sessionTimeStyle = { flex: '0 0 auto', fontSize: 12, opacity: 0.45, width: 72, textAlign: 'right' }
+    // Inline row action (currently only "取消归档"): small, quiet and clearly
+    // separate from the row's own click target.
+    const rowActionStyle = {
+      flex: '0 0 auto',
+      height: 22,
+      padding: '0 9px',
+      borderRadius: 999,
+      border: '1px solid color-mix(in srgb, currentColor 30%, transparent)',
+      background: 'transparent',
+      color: 'inherit',
+      font: 'inherit',
+      fontSize: 11,
+      fontWeight: 500,
+      cursor: 'pointer',
+    }
     const badgeStyle = {
       flex: '0 0 auto',
       fontSize: 11,
