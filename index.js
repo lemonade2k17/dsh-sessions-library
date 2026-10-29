@@ -29,6 +29,7 @@ import {
 } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, dirname, join, resolve, sep } from 'node:path'
+import { inflateRawSync } from 'node:zlib'
 
 export const name = 'dsh-sessions-library'
 
@@ -62,6 +63,9 @@ const LOGS_PATH = '/api/sessions-library/logs'
 const LOGS_CLEAR_PATH = '/api/sessions-library/logs-clear'
 const DELETE_PROGRESS_PATH = '/api/sessions-library/delete-progress'
 const EXPORT_PATH = '/api/sessions-library/export'
+const IMPORT_LIST_PATH = '/api/sessions-library/import-list'
+const IMPORT_PREFLIGHT_PATH = '/api/sessions-library/import-preflight'
+const IMPORT_RUN_PATH = '/api/sessions-library/import-run'
 const DELETE_BATCH_LIMIT = 100
 const PURGE_AUDIT_FILE = join(DSH_HOME, 'sessions-library', 'audit.log')
 // Sessions deleted while still loaded are queued here and moved on next start.
@@ -69,6 +73,9 @@ const PENDING_TRASH_FILE = join(DSH_HOME, 'sessions-library', 'pending-trash.jso
 // Exported session packages land here for the user to move between machines.
 const EXPORT_DIR = join(DSH_HOME, 'sessions-library', 'exports')
 const EXPORT_MAX_BYTES = 512 * 1024 * 1024
+const IMPORT_ZIP_BYTES_LIMIT = 768 * 1024 * 1024
+const IMPORT_UNPACKED_BYTES_LIMIT = 1536 * 1024 * 1024
+const IMPORT_ENTRY_LIMIT = 20000
 
 // Identifies one Host process. The Client compares it with the value it stored
 // last time: a different value means DSH restarted, so view state resets.
@@ -996,6 +1003,416 @@ function collectDirectoryEntries(root, prefix, entries, budget) {
     }
   }
   return used
+}
+
+// --- Import archive support --------------------------------------------------
+
+/**
+ * Split one archive entry name into safe path segments.
+ *
+ * @param {string} name archive entry name.
+ * @returns {string[] | null} segments, or null when the name escapes the root.
+ */
+function safeZipSegments(name) {
+  if (typeof name !== 'string' || name === '') return null
+  const normalized = name.replace(/\\/g, '/')
+  if (normalized.startsWith('/')) return null
+  const segments = normalized.split('/')
+  if (segments.some((segment) => segment === '' || segment === '.' || segment === '..')) return null
+  return segments
+}
+
+/**
+ * Read every member of a ZIP archive.
+ *
+ * Stored and deflated members are supported; ZIP64 is rejected with a clear
+ * message because these packages are small enough to stay in memory.
+ *
+ * @param {Buffer} buffer archive bytes.
+ * @returns {Array<{ name: string, data: Buffer }>} members in directory order.
+ */
+function readZipEntries(buffer) {
+  if (!Buffer.isBuffer(buffer) || buffer.length < 22) throw new Error('不是有效的 ZIP 文件')
+  const searchStart = Math.max(0, buffer.length - 65557)
+  let eocd = -1
+  for (let offset = buffer.length - 22; offset >= searchStart; offset -= 1) {
+    if (buffer.readUInt32LE(offset) === 0x06054b50) {
+      eocd = offset
+      break
+    }
+  }
+  if (eocd < 0) throw new Error('不是有效的 ZIP 文件（找不到目录尾部）')
+  const count = buffer.readUInt16LE(eocd + 10)
+  const centralSize = buffer.readUInt32LE(eocd + 12)
+  const centralOffset = buffer.readUInt32LE(eocd + 16)
+  if (count === 0xffff || centralSize === 0xffffffff || centralOffset === 0xffffffff) {
+    throw new Error('暂不支持 ZIP64 格式的包')
+  }
+  if (count > IMPORT_ENTRY_LIMIT) throw new Error(`包内文件过多（${count} 个）`)
+  if (centralOffset + centralSize > buffer.length) throw new Error('ZIP 目录损坏')
+
+  const entries = []
+  let cursor = centralOffset
+  let unpacked = 0
+  for (let index = 0; index < count; index += 1) {
+    if (buffer.readUInt32LE(cursor) !== 0x02014b50) throw new Error('ZIP 目录损坏')
+    const method = buffer.readUInt16LE(cursor + 10)
+    const compressedSize = buffer.readUInt32LE(cursor + 20)
+    const uncompressedSize = buffer.readUInt32LE(cursor + 24)
+    const nameLength = buffer.readUInt16LE(cursor + 28)
+    const extraLength = buffer.readUInt16LE(cursor + 30)
+    const commentLength = buffer.readUInt16LE(cursor + 32)
+    const localOffset = buffer.readUInt32LE(cursor + 42)
+    const entryName = buffer.toString('utf8', cursor + 46, cursor + 46 + nameLength)
+    cursor += 46 + nameLength + extraLength + commentLength
+    if (compressedSize === 0xffffffff || uncompressedSize === 0xffffffff || localOffset === 0xffffffff) {
+      throw new Error('暂不支持 ZIP64 格式的包')
+    }
+    unpacked += uncompressedSize
+    if (unpacked > IMPORT_UNPACKED_BYTES_LIMIT) throw new Error('包解压后体积超过上限')
+    if (buffer.readUInt32LE(localOffset) !== 0x04034b50) throw new Error('ZIP 本地文件头损坏')
+    const localNameLength = buffer.readUInt16LE(localOffset + 26)
+    const localExtraLength = buffer.readUInt16LE(localOffset + 28)
+    const dataStart = localOffset + 30 + localNameLength + localExtraLength
+    if (dataStart + compressedSize > buffer.length) throw new Error('ZIP 数据越界')
+    const raw = buffer.subarray(dataStart, dataStart + compressedSize)
+    let data
+    if (method === 0) data = raw
+    else if (method === 8) data = inflateRawSync(raw)
+    else throw new Error(`不支持的 ZIP 压缩方式：${method}`)
+    entries.push({ name: entryName, data })
+  }
+  return entries
+}
+
+/**
+ * Load and validate one exported package.
+ *
+ * @param {any} rawPath archive path chosen by the user.
+ * @returns {{ zipPath: string, fileName: string, manifest: object, entries: Array<object> }} package data.
+ */
+function loadImportPackage(rawPath) {
+  if (typeof rawPath !== 'string' || rawPath.trim() === '') throw new Error('请填写会话包路径')
+  const zipPath = resolve(rawPath.trim())
+  let stats = null
+  try {
+    stats = statSync(zipPath)
+  } catch {
+    throw new Error(`找不到会话包：${zipPath}`)
+  }
+  if (!stats.isFile()) throw new Error(`不是文件：${zipPath}`)
+  if (stats.size > IMPORT_ZIP_BYTES_LIMIT) throw new Error('会话包体积超过上限')
+  const entries = readZipEntries(readFileSync(zipPath))
+  const manifestEntry = entries.find((entry) => entry.name === 'manifest.json')
+  if (!manifestEntry) throw new Error('包内缺少 manifest.json，不是本插件导出的会话包')
+  let manifest = null
+  try {
+    manifest = JSON.parse(manifestEntry.data.toString('utf8'))
+  } catch {
+    throw new Error('manifest.json 无法解析')
+  }
+  if (!manifest || manifest.format !== 'dsh-sessions-library-export') {
+    throw new Error('不是本插件导出的会话包（manifest.format 不匹配）')
+  }
+  const version = Number(manifest.version)
+  if (!Number.isFinite(version) || version < 1) throw new Error('会话包缺少有效的版本号')
+  if (version > 1) throw new Error(`不支持的会话包版本：${manifest.version}`)
+  const sessions = Array.isArray(manifest.sessions)
+    ? manifest.sessions.filter((session) => session && typeof session.id === 'string' && session.id !== '')
+    : []
+  if (sessions.length === 0) throw new Error('包内没有可导入的会话')
+  return {
+    zipPath,
+    fileName: basename(zipPath),
+    manifest: {
+      ...manifest,
+      workspaces: Array.isArray(manifest.workspaces) ? manifest.workspaces : [],
+      sessions,
+    },
+    entries,
+  }
+}
+
+/**
+ * Group archive members by the session directory they belong to.
+ *
+ * @param {Array<{ name: string, data: Buffer }>} entries archive members.
+ * @returns {{ bySession: Map<string, Array<object>>, unknown: string[] }} grouped members and ignored names.
+ */
+function indexPackageEntries(entries) {
+  const bySession = new Map()
+  const unknown = []
+  for (const entry of entries) {
+    const segments = safeZipSegments(entry.name)
+    if (!segments) {
+      unknown.push(entry.name)
+      continue
+    }
+    if (segments.length === 1 && segments[0] === 'manifest.json') continue
+    if (segments[0] !== 'sessions' || segments.length < 3) {
+      unknown.push(entry.name)
+      continue
+    }
+    const sessionId = segments[1]
+    if (!bySession.has(sessionId)) bySession.set(sessionId, [])
+    bySession.get(sessionId).push({ segments: segments.slice(2), data: entry.data })
+  }
+  return { bySession, unknown }
+}
+
+/**
+ * Keep a package's project directory name usable as one path segment.
+ *
+ * @param {any} value manifest value.
+ * @returns {string} a safe directory name.
+ */
+function safeProjectDirName(value) {
+  if (typeof value !== 'string' || value === '') return '_no-cwd'
+  if (value.includes('/') || value.includes('\\') || value.includes('..')) return '_no-cwd'
+  return value
+}
+
+/**
+ * List ZIP packages available in one folder, newest first.
+ *
+ * @param {any} rawDir folder to scan; empty means the default export folder.
+ * @returns {{ dir: string, files: Array<object> }} folder and its packages.
+ */
+function listImportCandidates(rawDir) {
+  const dir = typeof rawDir === 'string' && rawDir.trim() !== '' ? resolve(rawDir.trim()) : EXPORT_DIR
+  let children = []
+  try {
+    children = readdirSync(dir, { withFileTypes: true })
+  } catch {
+    return { dir, files: [] }
+  }
+  const files = []
+  for (const child of children) {
+    if (!child.isFile() || !child.name.toLowerCase().endsWith('.zip')) continue
+    const full = join(dir, child.name)
+    let size = 0
+    let modifiedAt = 0
+    try {
+      const stats = statSync(full)
+      size = stats.size
+      modifiedAt = stats.mtimeMs
+    } catch {
+      // A vanished file simply disappears from the list.
+    }
+    files.push({ path: full, name: child.name, size, modifiedAt })
+  }
+  files.sort((left, right) => right.modifiedAt - left.modifiedAt)
+  return { dir, files: files.slice(0, 200) }
+}
+
+/**
+ * Inspect one package without writing anything.
+ *
+ * @param {object} ctx Cordis context.
+ * @param {any} rawPath package path.
+ * @returns {Promise<object>} preflight report for the Client.
+ */
+async function inspectImport(ctx, rawPath) {
+  const pkg = loadImportPackage(rawPath)
+  const { manifest, entries } = pkg
+  const { bySession, unknown } = indexPackageEntries(entries)
+
+  const registry = ctx.get('workspaceRegistry')
+  const localWorkspaces = registry && typeof registry.list === 'function'
+    ? registry.list().map((workspace) => ({
+        workspaceId: String(workspace.id),
+        path: typeof workspace.path === 'string' ? workspace.path : '',
+        title: typeof workspace.title === 'string' ? workspace.title : '',
+      }))
+    : []
+  const localByPath = new Map(
+    localWorkspaces
+      .filter((workspace) => workspace.path !== '')
+      .map((workspace) => [workspace.path.toLowerCase(), workspace.workspaceId]),
+  )
+  const pending = readPendingTrash()
+  const packageIds = new Set(manifest.sessions.map((session) => session.id))
+  const sessions = []
+  let conflicts = 0
+  for (const session of manifest.sessions) {
+    const files = bySession.get(session.id) ?? []
+    const pendingHere = pending[session.id] !== undefined
+    let conflict = null
+    if (files.length === 0) conflict = 'missing'
+    else if (findSessionDir(session.id) !== undefined) conflict = 'exists'
+    else if (pendingHere) conflict = 'pending'
+    if (conflict !== null) conflicts += 1
+    const parentSession = typeof session.parentSession === 'string' ? session.parentSession : null
+    const missingParent = parentSession !== null && parentSession !== ''
+      && !packageIds.has(parentSession)
+      && findSessionDir(parentSession) === undefined
+    sessions.push({
+      id: session.id,
+      title: typeof session.title === 'string' ? session.title : null,
+      role: typeof session.role === 'string' ? session.role : 'root',
+      parentSession,
+      cwd: typeof session.cwd === 'string' ? session.cwd : null,
+      archived: session.archived === true,
+      pinned: session.pinned === true,
+      workspaceIds: Array.isArray(session.workspaceIds) ? session.workspaceIds.map(String) : [],
+      fileCount: files.length,
+      bytes: files.reduce((sum, file) => sum + file.data.length, 0),
+      conflict,
+      missingParent,
+    })
+  }
+  const workspaces = manifest.workspaces.map((workspace) => {
+    const workspaceId = String(workspace.workspaceId ?? '')
+    const path = typeof workspace.path === 'string' ? workspace.path : ''
+    const title = typeof workspace.title === 'string' ? workspace.title : ''
+    const suggested = path !== '' ? localByPath.get(path.toLowerCase()) : undefined
+    return {
+      workspaceId,
+      path,
+      title,
+      sessionCount: sessions.filter((session) => session.workspaceIds.includes(workspaceId)).length,
+      suggestedTargetId: suggested ?? null,
+    }
+  })
+  const unknownWorkspaceIds = [...new Set(sessions.flatMap((session) => session.workspaceIds))]
+    .filter((workspaceId) => !workspaces.some((workspace) => workspace.workspaceId === workspaceId))
+  const warnings = []
+  const missingParentCount = sessions.filter((session) => session.missingParent).length
+  if (missingParentCount > 0) warnings.push(`${missingParentCount} 个会话的父会话不在包内，导入后可能无法继续对话`)
+  if (unknown.length > 0) warnings.push(`包内有 ${unknown.length} 个无法识别的文件，将被忽略`)
+  if (unknownWorkspaceIds.length > 0) warnings.push(`${unknownWorkspaceIds.length} 个源工作区没有元数据，相关会话将放入未分组`)
+
+  return {
+    path: pkg.zipPath,
+    fileName: pkg.fileName,
+    exportedAt: typeof manifest.exportedAt === 'string' ? manifest.exportedAt : null,
+    sourceDshHome: manifest.source && typeof manifest.source.dshHome === 'string'
+      ? manifest.source.dshHome
+      : null,
+    sessions,
+    workspaces,
+    localWorkspaces,
+    unknownEntries: unknown.slice(0, 20),
+    warnings,
+    counts: {
+      sessions: sessions.length,
+      conflicts,
+      importable: sessions.length - conflicts,
+      workspaces: workspaces.length,
+    },
+  }
+}
+
+/**
+ * Write one inspected package into the session store.
+ *
+ * Existing session ids are skipped (never overwritten), and workspace
+ * membership follows the mapping the user chose per source workspace.
+ *
+ * @param {object} ctx Cordis context.
+ * @param {any} rawPath package path.
+ * @param {any} rawMapping source workspace id to local workspace id (or null).
+ * @returns {Promise<object>} per-session results and counters.
+ */
+async function importPackage(ctx, rawPath, rawMapping) {
+  const pkg = loadImportPackage(rawPath)
+  const { manifest, entries } = pkg
+  const { bySession } = indexPackageEntries(entries)
+  const mapping = rawMapping && typeof rawMapping === 'object' && !Array.isArray(rawMapping)
+    ? rawMapping
+    : {}
+  const registry = ctx.get('workspaceRegistry')
+  const pending = readPendingTrash()
+  const results = []
+  let imported = 0
+  let skipped = 0
+  let failed = 0
+
+  for (const session of manifest.sessions) {
+    const id = session.id
+    const files = bySession.get(id) ?? []
+    const title = typeof session.title === 'string' ? session.title : null
+    const role = typeof session.role === 'string' ? session.role : 'root'
+    if (files.length === 0) {
+      failed += 1
+      results.push({ id, title, status: 'failed', reason: '包内缺少该会话的文件' })
+      continue
+    }
+    if (findSessionDir(id) !== undefined) {
+      skipped += 1
+      results.push({ id, title, status: 'skipped', reason: '本地已存在同 id 会话' })
+      continue
+    }
+    if (pending[id] !== undefined) {
+      skipped += 1
+      results.push({ id, title, status: 'skipped', reason: '该会话正在待重启整理队列中' })
+      continue
+    }
+    const projectDir = join(SESSIONS_ROOT, safeProjectDirName(session.projectDirName))
+    const sessionDir = join(projectDir, id)
+    try {
+      if (existsSync(sessionDir)) {
+        skipped += 1
+        results.push({ id, title, status: 'skipped', reason: '目标目录已存在' })
+        continue
+      }
+      mkdirSync(sessionDir, { recursive: true })
+      const rootResolved = resolve(sessionDir)
+      for (const file of files) {
+        const target = resolve(join(sessionDir, ...file.segments))
+        if (!target.startsWith(rootResolved + sep)) throw new Error('包内文件路径越界')
+        mkdirSync(dirname(target), { recursive: true })
+        writeFileSync(target, file.data)
+      }
+
+      const targetWorkspaceIds = [...new Set(
+        (Array.isArray(session.workspaceIds) ? session.workspaceIds : [])
+          .map((sourceId) => mapping[String(sourceId)])
+          .filter((targetId) => typeof targetId === 'string' && targetId !== ''),
+      )]
+      const attached = []
+      for (const workspaceId of targetWorkspaceIds) {
+        try {
+          const workspace = registry && typeof registry.get === 'function' ? registry.get(workspaceId) : undefined
+          if (workspace && typeof workspace.attachSession === 'function') {
+            await workspace.attachSession(id)
+            attached.push(workspaceId)
+          }
+        } catch {
+          // Membership is best effort; the session still imports.
+        }
+      }
+      if (session.archived === true) {
+        try {
+          if (registry && typeof registry.archiveSession === 'function') await registry.archiveSession(id)
+        } catch {
+          // Archive state is cosmetic.
+        }
+      } else if (session.pinned === true) {
+        try {
+          if (registry && typeof registry.pinSession === 'function') await registry.pinSession(id)
+        } catch {
+          // Pin state is cosmetic.
+        }
+      }
+      titleCache.delete(id)
+      appendOperation({ action: 'import', sessionId: id, title, role })
+      imported += 1
+      results.push({
+        id,
+        title,
+        status: 'imported',
+        workspaceIds: attached,
+        archived: session.archived === true,
+      })
+    } catch (error) {
+      failed += 1
+      results.push({ id, title, status: 'failed', reason: describeError(error) })
+    }
+  }
+
+  trace('import', 'end', `imported=${imported} skipped=${skipped} failed=${failed}`)
+  return { results, imported, skipped, failed, fileName: pkg.fileName }
 }
 
 /**
@@ -2201,6 +2618,33 @@ export function apply(ctx) {
             createDir: body.createDir === true,
           })
           return jsonResponse({ ok: true, ...result })
+        },
+      },
+      {
+        path: IMPORT_LIST_PATH,
+        label: 'import-list',
+        handler: async (request) => {
+          const body = await readJsonBody(request)
+          const listing = listImportCandidates(body.dir)
+          return jsonResponse({ ok: true, ...listing })
+        },
+      },
+      {
+        path: IMPORT_PREFLIGHT_PATH,
+        label: 'import-preflight',
+        handler: async (request) => {
+          const body = await readJsonBody(request)
+          const report = await inspectImport(ctx, body.path)
+          return jsonResponse({ ok: true, report })
+        },
+      },
+      {
+        path: IMPORT_RUN_PATH,
+        label: 'import-run',
+        handler: async (request) => {
+          const body = await readJsonBody(request)
+          const outcome = await importPackage(ctx, body.path, body.mapping)
+          return jsonResponse({ ok: true, ...outcome })
         },
       },
     ]

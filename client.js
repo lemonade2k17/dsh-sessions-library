@@ -21,6 +21,9 @@ window.__ModuleLoader__.load({
     const LOGS_LIMIT = 500
     const DELETE_PROGRESS_PATH = 'api/sessions-library/delete-progress'
     const EXPORT_PATH = 'api/sessions-library/export'
+    const IMPORT_LIST_PATH = 'api/sessions-library/import-list'
+    const IMPORT_PREFLIGHT_PATH = 'api/sessions-library/import-preflight'
+    const IMPORT_RUN_PATH = 'api/sessions-library/import-run'
     const EXPORT_DIR_STORAGE_KEY = 'dsh-sessions-library:export-dir'
 
     /**
@@ -88,6 +91,7 @@ window.__ModuleLoader__.load({
       'queue-purge': '被排队永久删除（重启后执行）',
       'cancel-purge': '取消了排队永久删除',
       export: '被导出为会话包',
+      import: '被导入',
     }
 
     /**
@@ -476,6 +480,8 @@ window.__ModuleLoader__.load({
         const [exportTarget, setExportTarget] = React.useState(loadExportDir)
         // Non-null while asking whether a missing export folder should be created.
         const [createDirPrompt, setCreateDirPrompt] = React.useState(null)
+        // Import wizard state: source → preview (with mapping) → done.
+        const [importDialog, setImportDialog] = React.useState(null)
         const [trashQuery, setTrashQuery] = React.useState('')
         const [trashSort, setTrashSort] = React.useState('newest')
         const [logsQuery, setLogsQuery] = React.useState('')
@@ -990,6 +996,155 @@ window.__ModuleLoader__.load({
 
         function toggleIncludeForks() {
           beginDelete(dialog === null || dialog.includeForks !== true)
+        }
+
+        /**
+         * Open the import wizard and preload the packages found in the default
+         * export folder.
+         *
+         * @returns {void}
+         */
+        function openImportDialog() {
+          setImportDialog({
+            phase: 'source',
+            path: '',
+            dir: '',
+            files: [],
+            report: null,
+            mapping: {},
+            outcome: null,
+            error: null,
+          })
+          loadImportCandidates('')
+        }
+
+        /**
+         * List ZIP packages in one folder.
+         *
+         * @param {string} dir folder to scan; empty means the default folder.
+         * @returns {Promise<void>} resolution after the list was refreshed.
+         */
+        async function loadImportCandidates(dir) {
+          try {
+            const payload = await postJson(IMPORT_LIST_PATH, dir === '' ? {} : { dir })
+            setImportDialog((current) => (current && current.phase === 'source'
+              ? {
+                  ...current,
+                  dir: typeof payload.dir === 'string' ? payload.dir : '',
+                  files: Array.isArray(payload.files) ? payload.files : [],
+                }
+              : current))
+          } catch (failure) {
+            setImportDialog((current) => (current
+              ? { ...current, error: failure && failure.message ? failure.message : String(failure) }
+              : current))
+          }
+        }
+
+        /**
+         * Ask the native directory picker for the folder holding the package.
+         *
+         * @returns {Promise<void>} resolution after the picker settled.
+         */
+        async function pickImportFolder() {
+          try {
+            const picker = ctx.get('remote.directoryPicker')
+            if (!picker || typeof picker.pick !== 'function') {
+              setImportDialog((current) => (current
+                ? { ...current, error: '当前环境不支持文件夹选择；可以直接输入会话包路径。' }
+                : current))
+              return
+            }
+            const result = await picker.pick()
+            if (!result || result.ok !== true) {
+              const message = result && result.error && result.error.message
+                ? result.error.message
+                : '选择文件夹失败'
+              setImportDialog((current) => (current ? { ...current, error: message } : current))
+              return
+            }
+            if (typeof result.value !== 'string' || result.value.trim() === '') return
+            await loadImportCandidates(result.value)
+          } catch (failure) {
+            setImportDialog((current) => (current
+              ? { ...current, error: failure && failure.message ? failure.message : String(failure) }
+              : current))
+          }
+        }
+
+        /**
+         * Inspect the chosen package without writing anything.
+         *
+         * @returns {Promise<void>} resolution after the report arrived.
+         */
+        async function runImportPreflight() {
+          const zipPath = importDialog && typeof importDialog.path === 'string' ? importDialog.path.trim() : ''
+          if (zipPath === '') return
+          setImportDialog((current) => (current ? { ...current, phase: 'checking', error: null } : current))
+          try {
+            const payload = await postJson(IMPORT_PREFLIGHT_PATH, { path: zipPath })
+            const report = payload && payload.report ? payload.report : null
+            if (!report) throw new Error('预检没有返回结果')
+            const mapping = {}
+            for (const workspace of report.workspaces || []) {
+              mapping[workspace.workspaceId] = workspace.suggestedTargetId || ''
+            }
+            setImportDialog((current) => (current
+              ? { ...current, phase: 'preview', report, mapping, error: null }
+              : current))
+          } catch (failure) {
+            setImportDialog((current) => (current
+              ? { ...current, phase: 'source', error: failure && failure.message ? failure.message : String(failure) }
+              : current))
+          }
+        }
+
+        /**
+         * Change one source workspace's target workspace.
+         *
+         * @param {string} sourceId source workspace id.
+         * @param {string} targetId local workspace id, empty for ungrouped.
+         * @returns {void}
+         */
+        function setImportMapping(sourceId, targetId) {
+          setImportDialog((current) => (current && current.phase === 'preview'
+            ? { ...current, mapping: { ...current.mapping, [sourceId]: targetId } }
+            : current))
+        }
+
+        /**
+         * Write the package into the session store.
+         *
+         * @returns {Promise<void>} resolution after the import finished.
+         */
+        async function startImport() {
+          if (!importDialog || importDialog.phase !== 'preview') return
+          const zipPath = importDialog.path
+          const mapping = importDialog.mapping || {}
+          setImportDialog((current) => (current ? { ...current, phase: 'importing', error: null } : current))
+          try {
+            const payload = await postJson(IMPORT_RUN_PATH, { path: zipPath, mapping })
+            setImportDialog((current) => (current
+              ? {
+                  ...current,
+                  phase: 'done',
+                  outcome: {
+                    imported: Number(payload.imported) || 0,
+                    skipped: Number(payload.skipped) || 0,
+                    failed: Number(payload.failed) || 0,
+                    results: Array.isArray(payload.results) ? payload.results : [],
+                  },
+                }
+              : current))
+            if ((Number(payload.imported) || 0) > 0) {
+              setReloadToken((token) => token + 1)
+              refreshNativeSessionList()
+            }
+          } catch (failure) {
+            setImportDialog((current) => (current
+              ? { ...current, phase: 'preview', error: failure && failure.message ? failure.message : String(failure) }
+              : current))
+          }
         }
 
         /**
@@ -1876,6 +2031,245 @@ window.__ModuleLoader__.load({
         }
 
         /**
+         * Render the import wizard: source file, dry-run report with workspace
+         * mapping, and the final per-session results.
+         *
+         * @returns {object} React element.
+         */
+        function renderImportDialog() {
+          const phase = importDialog.phase
+          const report = importDialog.report || null
+          const outcome = importDialog.outcome || null
+          const busy = phase === 'checking' || phase === 'importing'
+          const reportable = report ? Math.max(0, (report.counts && report.counts.importable) || 0) : 0
+          const conflictLabel = { exists: '本地已存在', pending: '待重启队列中', missing: '包内缺文件' }
+          const actions = []
+          if (phase === 'source') {
+            actions.push(h(
+              'button',
+              { key: 'cancel', className: 'sl-btn', style: actionButtonStyle, onClick: () => setImportDialog(null) },
+              '取消',
+            ))
+            actions.push(h(
+              'button',
+              {
+                key: 'check',
+                className: 'sl-btn',
+                style: actionButtonStyle,
+                disabled: !importDialog.path || importDialog.path.trim() === '',
+                onClick: runImportPreflight,
+              },
+              '检查会话包',
+            ))
+          } else if (phase === 'preview') {
+            actions.push(h(
+              'button',
+              {
+                key: 'back',
+                className: 'sl-btn',
+                style: actionButtonStyle,
+                onClick: () => setImportDialog((current) => (current
+                  ? { ...current, phase: 'source', report: null, error: null }
+                  : current)),
+              },
+              '返回',
+            ))
+            actions.push(h(
+              'button',
+              {
+                key: 'run',
+                className: 'sl-btn',
+                style: actionButtonStyle,
+                disabled: reportable === 0,
+                onClick: startImport,
+              },
+              `开始导入 ${reportable}`,
+            ))
+          } else if (phase === 'done') {
+            actions.push(h(
+              'button',
+              { key: 'close', className: 'sl-btn', style: actionButtonStyle, onClick: () => setImportDialog(null) },
+              '关闭',
+            ))
+          }
+
+          const sourceFiles = Array.isArray(importDialog.files) ? importDialog.files : []
+          const localWorkspaces = report && Array.isArray(report.localWorkspaces) ? report.localWorkspaces : []
+
+          return h(
+            'div',
+            { style: overlayStyle, onClick: () => { if (!busy) setImportDialog(null) } },
+            h(
+              'div',
+              { style: dialogStyle, onClick: (event) => event.stopPropagation() },
+              h('h2', { style: dialogTitleStyle }, phase === 'done' ? '导入结果' : '导入会话包'),
+
+              phase === 'source'
+                ? h(
+                    'div',
+                    null,
+                    h('p', { style: dialogHintStyle }, '选择本插件导出的会话包（.zip）：可以先检查再导入，导入不会覆盖本地已存在的会话。'),
+                    h('div', { style: dialogHintStyle }, '会话包路径'),
+                    h('input', {
+                      className: 'sl-input',
+                      style: exportInputStyle,
+                      value: importDialog.path,
+                      placeholder: '例如 D:\\backup\\dsh-sessions-20261029-070139.zip',
+                      onChange: (event) => setImportDialog((current) => (current
+                        ? { ...current, path: event.target.value, error: null }
+                        : current)),
+                    }),
+                    h(
+                      'div',
+                      { style: exportChooserActionsStyle },
+                      h('button', { className: 'sl-btn', style: actionButtonStyle, onClick: pickImportFolder }, '选择文件夹…'),
+                      h('button', {
+                        className: 'sl-btn',
+                        style: actionButtonStyle,
+                        onClick: () => loadImportCandidates(importDialog.dir || ''),
+                      }, '刷新列表'),
+                    ),
+                    importDialog.dir !== ''
+                      ? h('p', { style: importPathHintStyle }, `列表来源：${importDialog.dir}`)
+                      : null,
+                    sourceFiles.length > 0
+                      ? h(
+                          'div',
+                          { style: importListStyle },
+                          sourceFiles.map((file) => h(
+                            'button',
+                            {
+                              key: file.path,
+                              className: 'sl-btn',
+                              style: importFileButtonStyle,
+                              onClick: () => setImportDialog((current) => (current
+                                ? { ...current, path: file.path, error: null }
+                                : current)),
+                            },
+                            `${file.name} · ${(Number(file.size) / 1048576).toFixed(2)} MB`,
+                          )),
+                        )
+                      : h('p', { style: dialogHintStyle }, '默认目录里没有 .zip，可直接填写路径或选择其他文件夹。'),
+                  )
+                : null,
+
+              phase === 'checking' ? h('p', { style: dialogHintStyle }, '正在检查会话包…') : null,
+              phase === 'importing' ? h('p', { style: dialogHintStyle }, '正在导入会话…') : null,
+
+              phase === 'preview' && report
+                ? h(
+                    'div',
+                    null,
+                    h(
+                      'p',
+                      { style: dialogHintStyle },
+                      `会话包：${report.fileName}`
+                        + `${report.exportedAt ? ` · 导出时间 ${formatAbsolute(Date.parse(report.exportedAt))}` : ''}`
+                        + ` · 会话 ${report.counts.sessions} 个（可导入 ${report.counts.importable} 个，冲突 ${report.counts.conflicts} 个）`,
+                    ),
+                    ...(report.warnings || []).map((warning, index) => h(
+                      'div',
+                      { key: `warning-${index}`, style: loadedHintStyle },
+                      warning,
+                    )),
+                    h(
+                      'div',
+                      { style: importSectionTitleStyle },
+                      '会话',
+                    ),
+                    h(
+                      'div',
+                      { style: dialogListStyle },
+                      report.sessions.map((session) => h(
+                        'div',
+                        { key: session.id, style: dialogRowStyle },
+                        h(
+                          'span',
+                          { style: badgeStyle },
+                          session.role === 'subagent' ? '子智能体/队友' : session.role === 'fork' ? '分叉' : '会话',
+                        ),
+                        h('span', { style: sessionTitleStyle }, session.title || session.id),
+                        session.conflict
+                          ? h('span', { style: blockedBadgeStyle }, conflictLabel[session.conflict] || session.conflict)
+                          : h('span', { style: badgeStyle }, `${(session.bytes / 1048576).toFixed(1)} MB`),
+                      )),
+                    ),
+                    report.workspaces.length > 0
+                      ? h('div', { style: importSectionTitleStyle }, '工作区归属')
+                      : null,
+                    report.workspaces.length > 0
+                      ? h(
+                          'div',
+                          { style: dialogListStyle },
+                          report.workspaces.map((workspace) => h(
+                            'div',
+                            { key: workspace.workspaceId, style: dialogRowStyle },
+                            h(
+                              'div',
+                              { style: importMappingLabelStyle },
+                              h('div', null, workspace.title || workspace.path || workspace.workspaceId),
+                              h('div', { style: importPathHintStyle }, `${workspace.path || '（无路径）'} · ${workspace.sessionCount} 个会话`),
+                            ),
+                            h(
+                              'select',
+                              {
+                                className: 'sl-input',
+                                style: sortSelectStyle,
+                                value: importDialog.mapping[workspace.workspaceId] || '',
+                                onChange: (event) => setImportMapping(workspace.workspaceId, event.target.value),
+                              },
+                              h('option', { value: '' }, '未分组'),
+                              localWorkspaces.map((local) => h(
+                                'option',
+                                { key: local.workspaceId, value: local.workspaceId },
+                                local.title || local.path || local.workspaceId,
+                              )),
+                            ),
+                          )),
+                        )
+                      : null,
+                  )
+                : null,
+
+              phase === 'done' && outcome
+                ? h(
+                    'div',
+                    null,
+                    h(
+                      'p',
+                      { style: dialogHintStyle },
+                      `已导入 ${outcome.imported} 个会话，跳过 ${outcome.skipped} 个，失败 ${outcome.failed} 个。`
+                        + `${outcome.imported > 0 ? '会话库已刷新，可在列表中查看。' : ''}`,
+                    ),
+                    outcome.results.filter((result) => result.status !== 'imported').length > 0
+                      ? h(
+                          'div',
+                          { style: dialogListStyle },
+                          outcome.results
+                            .filter((result) => result.status !== 'imported')
+                            .map((result) => h(
+                              'div',
+                              { key: result.id, style: dialogRowStyle },
+                              h('span', { style: sessionTitleStyle }, result.title || result.id),
+                              h('span', { style: blockedBadgeStyle }, result.reason || result.status),
+                            )),
+                        )
+                      : null,
+                  )
+                : null,
+
+              importDialog.error
+                ? h('div', { style: dialogBlockerStyle }, importDialog.error)
+                : null,
+
+              actions.length > 0
+                ? h('div', { style: dialogActionsStyle }, actions)
+                : null,
+            ),
+          )
+        }
+
+        /**
          * Render the export dialog: destination choice, progress, result or error.
          *
          * @returns {object} React element.
@@ -2140,6 +2534,15 @@ window.__ModuleLoader__.load({
             },
             '操作日志',
           ),
+          h(
+            'button',
+            {
+              className: 'sl-btn',
+              style: actionButtonStyle,
+              onClick: openImportDialog,
+            },
+            '导入会话',
+          ),
         )
 
         const trashControls = h(
@@ -2343,6 +2746,7 @@ window.__ModuleLoader__.load({
           purgeDialog !== null ? renderPurgeDialog() : null,
           clearLogsDialog ? renderClearLogsDialog() : null,
           exportDialog !== null ? renderExportDialog() : null,
+          importDialog !== null ? renderImportDialog() : null,
           createDirPrompt !== null ? renderCreateDirPrompt() : null,
         )
       }
@@ -2614,6 +3018,50 @@ window.__ModuleLoader__.load({
     }
     const exportChooserStyle = { margin: '4px 0 10px' }
     const exportChooserActionsStyle = { display: 'flex', gap: 8, marginTop: 8 }
+    const importListStyle = {
+      display: 'flex',
+      flexDirection: 'column',
+      gap: 4,
+      margin: '8px 0 4px',
+      maxHeight: 180,
+      overflowY: 'auto',
+    }
+    const importFileButtonStyle = {
+      height: 30,
+      padding: '0 10px',
+      borderRadius: 6,
+      border: '1px solid color-mix(in srgb, currentColor 16%, transparent)',
+      background: 'transparent',
+      color: 'inherit',
+      font: 'inherit',
+      fontSize: 12,
+      textAlign: 'left',
+      cursor: 'pointer',
+      overflow: 'hidden',
+      textOverflow: 'ellipsis',
+      whiteSpace: 'nowrap',
+    }
+    const importSectionTitleStyle = {
+      margin: '12px 0 6px',
+      fontSize: 12,
+      fontWeight: 600,
+      opacity: 0.75,
+    }
+    const importMappingLabelStyle = {
+      flex: '1 1 auto',
+      minWidth: 0,
+      overflow: 'hidden',
+      textOverflow: 'ellipsis',
+      whiteSpace: 'nowrap',
+      fontSize: 13,
+    }
+    const importPathHintStyle = {
+      fontSize: 11,
+      opacity: 0.45,
+      overflow: 'hidden',
+      textOverflow: 'ellipsis',
+      whiteSpace: 'nowrap',
+    }
     const exportInputStyle = {
       width: '100%',
       height: 32,
