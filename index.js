@@ -18,10 +18,13 @@
 
 import {
   appendFileSync,
+  closeSync,
   existsSync,
   mkdirSync,
+  openSync,
   readFileSync,
   readdirSync,
+  readSync,
   renameSync,
   rmSync,
   statSync,
@@ -1294,10 +1297,153 @@ function rewriteSessionHeaderCwd(filePath, targetCwd) {
 }
 
 /**
- * List ZIP packages available in one folder, newest first.
+ * Read exactly `length` bytes at `position` from an open file.
+ *
+ * @param {number} fd open file descriptor.
+ * @param {number} position byte offset.
+ * @param {number} length bytes to read.
+ * @returns {Buffer} the bytes actually read.
+ */
+function readFileRange(fd, position, length) {
+  const buffer = Buffer.alloc(length)
+  let read = 0
+  while (read < length) {
+    const chunk = readSync(fd, buffer, read, length - read, position + read)
+    if (chunk <= 0) break
+    read += chunk
+  }
+  return buffer.subarray(0, read)
+}
+
+/**
+ * Read one archive's member directory without touching member data.
+ *
+ * @param {number} fd open file descriptor.
+ * @param {number} size archive size in bytes.
+ * @returns {Array<object>} member descriptors.
+ */
+function readZipDirectoryFromFile(fd, size) {
+  const tailLength = Math.min(size, 65557)
+  const tail = readFileRange(fd, size - tailLength, tailLength)
+  let eocd = -1
+  for (let offset = tail.length - 22; offset >= 0; offset -= 1) {
+    if (tail.readUInt32LE(offset) === 0x06054b50) {
+      eocd = offset
+      break
+    }
+  }
+  if (eocd < 0) throw new Error('不是有效的 ZIP 文件')
+  const count = tail.readUInt16LE(eocd + 10)
+  const centralSize = tail.readUInt32LE(eocd + 12)
+  const centralOffset = tail.readUInt32LE(eocd + 16)
+  if (count === 0xffff || centralSize === 0xffffffff || centralOffset === 0xffffffff) {
+    throw new Error('暂不支持 ZIP64 格式的包')
+  }
+  if (count > IMPORT_ENTRY_LIMIT) throw new Error(`包内文件过多（${count} 个）`)
+  if (centralOffset + centralSize > size) throw new Error('ZIP 目录损坏')
+  const central = readFileRange(fd, centralOffset, centralSize)
+  const entries = []
+  let cursor = 0
+  for (let index = 0; index < count; index += 1) {
+    if (cursor + 46 > central.length || central.readUInt32LE(cursor) !== 0x02014b50) {
+      throw new Error('ZIP 目录损坏')
+    }
+    const method = central.readUInt16LE(cursor + 10)
+    const compressedSize = central.readUInt32LE(cursor + 20)
+    const uncompressedSize = central.readUInt32LE(cursor + 24)
+    const nameLength = central.readUInt16LE(cursor + 28)
+    const extraLength = central.readUInt16LE(cursor + 30)
+    const commentLength = central.readUInt16LE(cursor + 32)
+    const localOffset = central.readUInt32LE(cursor + 42)
+    const name = central.toString('utf8', cursor + 46, cursor + 46 + nameLength)
+    cursor += 46 + nameLength + extraLength + commentLength
+    entries.push({ name, method, compressedSize, uncompressedSize, localOffset })
+  }
+  return entries
+}
+
+/**
+ * Read one member's data given its directory descriptor.
+ *
+ * @param {number} fd open file descriptor.
+ * @param {object} entry member descriptor.
+ * @returns {Buffer} member data.
+ */
+function readZipMemberFromFile(fd, entry) {
+  if (entry.compressedSize === 0xffffffff || entry.localOffset === 0xffffffff) {
+    throw new Error('暂不支持 ZIP64 格式的包')
+  }
+  const local = readFileRange(fd, entry.localOffset, 30)
+  if (local.length < 30 || local.readUInt32LE(0) !== 0x04034b50) throw new Error('ZIP 本地文件头损坏')
+  const nameLength = local.readUInt16LE(26)
+  const extraLength = local.readUInt16LE(28)
+  const dataStart = entry.localOffset + 30 + nameLength + extraLength
+  const raw = readFileRange(fd, dataStart, entry.compressedSize)
+  if (entry.method === 0) return raw
+  if (entry.method === 8) return inflateRawSync(raw)
+  throw new Error(`不支持的 ZIP 压缩方式：${entry.method}`)
+}
+
+/**
+ * Peek one candidate archive's manifest to tell whether it is a session package.
+ *
+ * Only the archive directory and the small manifest member are read, so listing
+ * a folder full of unrelated zips stays cheap.
+ *
+ * @param {string} zipPath candidate path.
+ * @returns {{ valid: boolean, reason?: string, sessionCount?: number, workspaceCount?: number, exportedAt?: string | null }} package metadata.
+ */
+function peekPackageMeta(zipPath) {
+  let fd = null
+  try {
+    const stats = statSync(zipPath)
+    if (stats.size > IMPORT_ZIP_BYTES_LIMIT) return { valid: false, reason: '体积超过上限' }
+    fd = openSync(zipPath, 'r')
+    const entries = readZipDirectoryFromFile(fd, stats.size)
+    const manifestEntry = entries.find((entry) => entry.name === 'manifest.json')
+    if (!manifestEntry) return { valid: false, reason: '缺少 manifest.json' }
+    if (manifestEntry.uncompressedSize > 4 * 1024 * 1024) return { valid: false, reason: 'manifest 过大' }
+    const data = readZipMemberFromFile(fd, manifestEntry)
+    let manifest = null
+    try {
+      manifest = JSON.parse(data.toString('utf8'))
+    } catch {
+      manifest = null
+    }
+    if (!manifest || manifest.format !== 'dsh-sessions-library-export') {
+      return { valid: false, reason: '不是本插件的会话包' }
+    }
+    const version = Number(manifest.version)
+    if (!Number.isFinite(version) || version < 1 || version > 1) {
+      return { valid: false, reason: `不支持的包版本：${manifest.version}` }
+    }
+    return {
+      valid: true,
+      sessionCount: Array.isArray(manifest.sessions) ? manifest.sessions.length : 0,
+      workspaceCount: Array.isArray(manifest.workspaces) ? manifest.workspaces.length : 0,
+      exportedAt: typeof manifest.exportedAt === 'string' ? manifest.exportedAt : null,
+    }
+  } catch (error) {
+    return { valid: false, reason: describeError(error) }
+  } finally {
+    if (fd !== null) {
+      try {
+        closeSync(fd)
+      } catch {
+        // The descriptor closes with the process either way.
+      }
+    }
+  }
+}
+
+/**
+ * List session packages available in one folder, newest first.
+ *
+ * Candidates are validated by peeking their manifest, so unrelated archives do
+ * not masquerade as importable packages.
  *
  * @param {any} rawDir folder to scan; empty means the default export folder.
- * @returns {{ dir: string, files: Array<object> }} folder and its packages.
+ * @returns {{ dir: string, files: Array<object>, ignored: Array<object> }} folder, packages and rejected archives.
  */
 function listImportCandidates(rawDir) {
   const dir = typeof rawDir === 'string' && rawDir.trim() !== '' ? resolve(rawDir.trim()) : EXPORT_DIR
@@ -1305,9 +1451,10 @@ function listImportCandidates(rawDir) {
   try {
     children = readdirSync(dir, { withFileTypes: true })
   } catch {
-    return { dir, files: [] }
+    return { dir, files: [], ignored: [] }
   }
   const files = []
+  const ignored = []
   for (const child of children) {
     if (!child.isFile() || !child.name.toLowerCase().endsWith('.zip')) continue
     const full = join(dir, child.name)
@@ -1320,10 +1467,27 @@ function listImportCandidates(rawDir) {
     } catch {
       // A vanished file simply disappears from the list.
     }
-    files.push({ path: full, name: child.name, size, modifiedAt })
+    const meta = peekPackageMeta(full)
+    if (!meta.valid) {
+      ignored.push({ name: child.name, reason: meta.reason || '无法识别' })
+      continue
+    }
+    files.push({
+      path: full,
+      name: child.name,
+      size,
+      modifiedAt,
+      sessionCount: meta.sessionCount || 0,
+      workspaceCount: meta.workspaceCount || 0,
+      exportedAt: meta.exportedAt || null,
+    })
   }
   files.sort((left, right) => right.modifiedAt - left.modifiedAt)
-  return { dir, files: files.slice(0, 200) }
+  return {
+    dir,
+    files: files.slice(0, 200),
+    ignored: ignored.slice(0, 50),
+  }
 }
 
 /**
