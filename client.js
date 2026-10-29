@@ -706,6 +706,9 @@ window.__ModuleLoader__.load({
         const selectedLogs = visibleLogs.filter((entry) => entry && logsSelected[entry.id] === true)
         const selectedLogsCount = selectedLogs.length
         const allLogsSelected = visibleLogs.length > 0 && selectedLogsCount === visibleLogs.length
+        // Row ids come from the Host half; a Host that predates the log-delete
+        // route sends none, and rows without an id cannot be addressed safely.
+        const logsSelectable = logs.some((entry) => entry && typeof entry.id === 'string')
 
         const visibleCount = groups.reduce((sum, group) => sum + group.sessions.length, 0)
         // Count only what is on screen, so a filter change cannot show a
@@ -1852,6 +1855,13 @@ window.__ModuleLoader__.load({
             'div',
             null,
             logsError !== null ? h('div', { style: warnStyle }, logsError) : null,
+            logsSelectable
+              ? null
+              : h(
+                  'div',
+                  { style: warnStyle },
+                  '当前运行的 Host 端（宿主端）还是旧版本，日志暂时不能勾选：完全退出并重新打开 DSH 后，这里会出现勾选框和「删除所选」。',
+                ),
             visibleLogs.map((entry, index) => {
               const at = Date.parse(entry && entry.at)
               const rowId = entry && typeof entry.id === 'string' ? entry.id : ''
@@ -2877,7 +2887,8 @@ window.__ModuleLoader__.load({
             'button',
             {
               className: 'sl-btn',
-              style: actionButtonStyle,
+              style: logsSelectable ? actionButtonStyle : { ...actionButtonStyle, opacity: 0.45, cursor: 'not-allowed' },
+              disabled: !logsSelectable,
               onClick: toggleLogsSelectAll,
             },
             allLogsSelected ? '取消全选' : '全选',
