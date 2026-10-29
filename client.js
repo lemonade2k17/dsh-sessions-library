@@ -3122,8 +3122,14 @@ window.__ModuleLoader__.load({
     const fabButtonStyle = {
       position: 'relative',
       zIndex: 1,
+      display: 'inline-flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      // Fixed width: the label gains a count while selecting, and a growing
+      // button reads as jitter next to the dock's other action.
+      width: 148,
       height: 38,
-      padding: '0 18px',
+      padding: 0,
       borderRadius: 999,
       border: '1px solid color-mix(in srgb, currentColor 24%, transparent)',
       background: 'color-mix(in srgb, currentColor 12%, Canvas)',
@@ -3134,6 +3140,7 @@ window.__ModuleLoader__.load({
       boxShadow: '0 6px 20px rgba(0, 0, 0, 0.28)',
       cursor: 'pointer',
       pointerEvents: 'auto',
+      transition: 'opacity 0.15s ease, box-shadow 0.15s ease',
     }
     const fabDisabledStyle = {
       ...fabButtonStyle,
