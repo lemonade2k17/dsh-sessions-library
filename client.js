@@ -23,6 +23,7 @@ window.__ModuleLoader__.load({
     const DELETE_PROGRESS_PATH = 'api/sessions-library/delete-progress'
     const EXPORT_PATH = 'api/sessions-library/export'
     const ATTACHMENT_PREFLIGHT_PATH = 'api/sessions-library/attachment-preflight'
+    const WORKSPACE_PREFLIGHT_PATH = 'api/sessions-library/workspace-preflight'
     const IMPORT_LIST_PATH = 'api/sessions-library/import-list'
     const IMPORT_PREFLIGHT_PATH = 'api/sessions-library/import-preflight'
     const IMPORT_RUN_PATH = 'api/sessions-library/import-run'
@@ -1342,38 +1343,50 @@ window.__ModuleLoader__.load({
             workspaceCount: 0,
             bytes: 0,
             error: null,
-            // Filled by the preflight below; the option only makes sense when the
-            // attachment store actually holds something for these sessions.
+            // Filled by the preflights below; an option only makes sense when the
+            // selection actually has something to include.
             attachments: null,
+            workspaceInfo: null,
             includeAttachments: true,
+            includeWorkspaceFiles: true,
           })
-          loadAttachmentPreflight(ids)
+          loadExportPreflights(ids)
         }
 
         /**
-         * Count the attachment objects the selected sessions reference.
+         * Read what the selected sessions would drag along: their referenced
+         * attachments and the files under their workspace directories.
          *
          * @param {string[]} ids selected session ids.
-         * @returns {Promise<void>} resolution after the preview settled.
+         * @returns {Promise<void>} resolution after both previews settled.
          */
-        async function loadAttachmentPreflight(ids) {
-          try {
-            const payload = await postJson(ATTACHMENT_PREFLIGHT_PATH, { sessionIds: ids })
-            const count = Number(payload.count) || 0
-            const attachments = {
-              count,
-              bytes: Number(payload.bytes) || 0,
-              missing: Number(payload.missing) || 0,
-            }
-            setExportDialog((current) => (current && current.phase === 'choose'
-              ? { ...current, attachments, includeAttachments: count > 0 }
-              : current))
-          } catch {
-            // A failed preview only hides the option; it never blocks exporting.
-            setExportDialog((current) => (current && current.phase === 'choose'
-              ? { ...current, attachments: { count: 0, bytes: 0, missing: 0 } }
-              : current))
+        async function loadExportPreflights(ids) {
+          const [attachmentResult, workspaceResult] = await Promise.all([
+            postJson(ATTACHMENT_PREFLIGHT_PATH, { sessionIds: ids }).catch(() => null),
+            postJson(WORKSPACE_PREFLIGHT_PATH, { sessionIds: ids }).catch(() => null),
+          ])
+          const attachments = {
+            count: attachmentResult ? Number(attachmentResult.count) || 0 : 0,
+            bytes: attachmentResult ? Number(attachmentResult.bytes) || 0 : 0,
+            missing: attachmentResult ? Number(attachmentResult.missing) || 0 : 0,
           }
+          const workspaceInfo = {
+            count: workspaceResult ? Number(workspaceResult.totalFiles) || 0 : 0,
+            bytes: workspaceResult ? Number(workspaceResult.totalBytes) || 0 : 0,
+            truncated: workspaceResult ? workspaceResult.truncated === true : false,
+            workspaces: workspaceResult && Array.isArray(workspaceResult.workspaces)
+              ? workspaceResult.workspaces
+              : [],
+          }
+          setExportDialog((current) => (current && current.phase === 'choose'
+            ? {
+                ...current,
+                attachments,
+                workspaceInfo,
+                includeAttachments: attachments.count > 0,
+                includeWorkspaceFiles: workspaceInfo.count > 0,
+              }
+            : current))
         }
 
         /**
@@ -1430,6 +1443,9 @@ window.__ModuleLoader__.load({
               ...(exportDialog !== null && exportDialog.includeAttachments === true
                 ? { includeAttachments: true }
                 : {}),
+              ...(exportDialog !== null && exportDialog.includeWorkspaceFiles === true
+                ? { includeWorkspaceFiles: true }
+                : {}),
             })
             saveExportDir(targetDir)
             setExportDialog({
@@ -1441,6 +1457,9 @@ window.__ModuleLoader__.load({
               attachmentCount: Number(payload.attachmentCount) || 0,
               attachmentBytes: Number(payload.attachmentBytes) || 0,
               attachmentsSkipped: Number(payload.attachmentsSkipped) || 0,
+              workspaceFileCount: Number(payload.workspaceFileCount) || 0,
+              workspaceFileBytes: Number(payload.workspaceFileBytes) || 0,
+              workspaceFilesSkipped: Number(payload.workspaceFilesSkipped) || 0,
               bytes: Number(payload.bytes) || 0,
               error: null,
             })
@@ -2595,6 +2614,9 @@ window.__ModuleLoader__.load({
                         + `，冲突 ${report.counts.conflicts} 个）`
                         + `${Number(report.counts.attachments) > 0
                           ? ` · 附件 ${report.counts.attachments} 个（${((Number(report.counts.attachmentBytes) || 0) / 1048576).toFixed(2)} MB）`
+                          : ''}`
+                        + `${Number(report.counts.workspaceFiles) > 0
+                          ? ` · 工作区文件 ${report.counts.workspaceFiles} 个（${((Number(report.counts.workspaceFileBytes) || 0) / 1048576).toFixed(2)} MB）`
                           : ''}`,
                     ),
                     ...(report.warnings || []).map((warning, index) => h(
@@ -2692,6 +2714,17 @@ window.__ModuleLoader__.load({
                             + '会话历史中的附件引用会直接命中这些对象。',
                         )
                       : null,
+                    outcome.workspaceFiles
+                      && Number(outcome.workspaceFiles.restored) + Number(outcome.workspaceFiles.skipped) > 0
+                      ? h(
+                          'p',
+                          { style: dialogHintStyle },
+                          `工作区文件已恢复 ${Number(outcome.workspaceFiles.restored) || 0} 个`
+                            + `（已存在 ${Number(outcome.workspaceFiles.skipped) || 0} 个则跳过，不覆盖）`
+                            + `${Number(outcome.workspaceFiles.failed) > 0 ? `，失败 ${outcome.workspaceFiles.failed} 个` : ''}；`
+                            + '未选择目标工作区的文件不会被写入。',
+                        )
+                      : null,
                     outcome.results.some((result) => result.rewritten === true)
                       ? h(
                           'p',
@@ -2747,6 +2780,16 @@ window.__ModuleLoader__.load({
               ? '所选会话没有引用的附件'
               : `包含会话附件：${attachmentCount} 个 · ${((Number(attachmentInfo.bytes) || 0) / 1048576).toFixed(2)} MB`
                 + `${Number(attachmentInfo.missing) > 0 ? `（${attachmentInfo.missing} 个引用在本地已缺失）` : ''}`
+          const workspaceInfo = exportDialog.workspaceInfo || null
+          const workspaceFileCount = workspaceInfo ? Number(workspaceInfo.count) || 0 : 0
+          const includeWorkspaceFiles = exportDialog.includeWorkspaceFiles === true && workspaceFileCount > 0
+          const workspaceLabel = workspaceInfo === null
+            ? '正在统计工作区文件…'
+            : workspaceFileCount === 0
+              ? '所选会话的工作区没有可备份的文件'
+              : `包含工作区文件：${workspaceFileCount} 个 · ${((Number(workspaceInfo.bytes) || 0) / 1048576).toFixed(2)} MB`
+                + `${workspaceInfo.truncated ? '（已达上限，部分文件未包含）' : ''}`
+                + '（自动排除 node_modules、.git、dist、build 等目录）'
           const actions = []
           if (choosing) {
             actions.push(h(
@@ -2832,6 +2875,21 @@ window.__ModuleLoader__.load({
                       ),
                       h('span', { style: exportAttachmentLabelStyle }, attachmentLabel),
                     ),
+                    h(
+                      'div',
+                      { style: exportAttachmentRowStyle },
+                      renderCheckbox(
+                        includeWorkspaceFiles ? 'all' : 'none',
+                        () => {
+                          if (workspaceFileCount === 0) return
+                          setExportDialog((current) => (current
+                            ? { ...current, includeWorkspaceFiles: current.includeWorkspaceFiles !== true }
+                            : current))
+                        },
+                        '包含工作区文件',
+                      ),
+                      h('span', { style: exportAttachmentLabelStyle }, workspaceLabel),
+                    ),
                   )
                 : null,
               busy
@@ -2851,13 +2909,17 @@ window.__ModuleLoader__.load({
                         + `包内包含 ${exportDialog.workspaceCount} 个工作区的信息（ID、路径、标题）。`
                         + (Number(exportDialog.attachmentCount) > 0
                           ? `另外附带 ${exportDialog.attachmentCount} 个会话附件（${((Number(exportDialog.attachmentBytes) || 0) / 1048576).toFixed(2)} MB）。`
+                          : '')
+                        + (Number(exportDialog.workspaceFileCount) > 0
+                          ? `工作区文件 ${exportDialog.workspaceFileCount} 个（${((Number(exportDialog.workspaceFileBytes) || 0) / 1048576).toFixed(2)} MB）也已打包。`
                           : ''),
                     ),
-                    Number(exportDialog.attachmentsSkipped) > 0
+                    Number(exportDialog.attachmentsSkipped) > 0 || Number(exportDialog.workspaceFilesSkipped) > 0
                       ? h(
                           'p',
                           { style: dialogHintStyle },
-                          `有 ${exportDialog.attachmentsSkipped} 个附件未能打包（本地缺失或超出体积上限），导入后对应内容可能不可用。`,
+                          `有 ${Number(exportDialog.attachmentsSkipped) || 0} 个附件、`
+                            + `${Number(exportDialog.workspaceFilesSkipped) || 0} 处工作区文件未能打包（本地缺失或超出体积上限）。`,
                         )
                       : null,
                     h('div', { style: exportPathStyle }, exportDialog.path),

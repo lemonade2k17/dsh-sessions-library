@@ -70,6 +70,7 @@ const LOGS_DELETE_PATH = '/api/sessions-library/logs-delete'
 const DELETE_PROGRESS_PATH = '/api/sessions-library/delete-progress'
 const EXPORT_PATH = '/api/sessions-library/export'
 const ATTACHMENT_PREFLIGHT_PATH = '/api/sessions-library/attachment-preflight'
+const WORKSPACE_PREFLIGHT_PATH = '/api/sessions-library/workspace-preflight'
 const IMPORT_LIST_PATH = '/api/sessions-library/import-list'
 const IMPORT_PREFLIGHT_PATH = '/api/sessions-library/import-preflight'
 const IMPORT_RUN_PATH = '/api/sessions-library/import-run'
@@ -80,6 +81,27 @@ const PENDING_TRASH_FILE = join(DSH_HOME, 'sessions-library', 'pending-trash.jso
 // Exported session packages land here for the user to move between machines.
 const EXPORT_DIR = join(DSH_HOME, 'sessions-library', 'exports')
 const EXPORT_MAX_BYTES = 512 * 1024 * 1024
+// Workspace backup ("附件") limits: the directory copy is optional and must never
+// turn one export into an unbounded read.
+const WORKSPACE_BACKUP_MAX_BYTES = 200 * 1024 * 1024
+const WORKSPACE_BACKUP_MAX_FILES = 5000
+const WORKSPACE_BACKUP_EXCLUDED_DIRS = new Set([
+  'node_modules',
+  '.git',
+  '.svn',
+  '.hg',
+  'dist',
+  'build',
+  'out',
+  'target',
+  'coverage',
+  '.next',
+  '.nuxt',
+  '.cache',
+  '.venv',
+  'venv',
+  '__pycache__',
+])
 const IMPORT_ZIP_BYTES_LIMIT = 768 * 1024 * 1024
 const IMPORT_UNPACKED_BYTES_LIMIT = 1536 * 1024 * 1024
 const IMPORT_ENTRY_LIMIT = 20000
@@ -1251,6 +1273,186 @@ function collectAttachmentsForSessions(sessionIds) {
   }
 }
 
+// --- Workspace backup support -----------------------------------------------
+
+/**
+ * Walk one workspace directory, skipping development artefacts.
+ *
+ * @param {string} rootPath workspace directory.
+ * @returns {{ files: Array<{ relative: string, bytes: number, path: string }>, totalBytes: number, excludedDirs: number, truncated: boolean }} collected files.
+ */
+function walkWorkspaceDirectory(rootPath) {
+  const files = []
+  let totalBytes = 0
+  let excludedDirs = 0
+  let truncated = false
+  const stack = [{ dir: rootPath, rel: '' }]
+  while (stack.length > 0) {
+    const current = stack.pop()
+    let children = []
+    try {
+      children = readdirSync(current.dir, { withFileTypes: true })
+    } catch {
+      continue
+    }
+    for (const child of children) {
+      if (files.length >= WORKSPACE_BACKUP_MAX_FILES || totalBytes >= WORKSPACE_BACKUP_MAX_BYTES) {
+        truncated = true
+        break
+      }
+      const absolute = join(current.dir, child.name)
+      const relative = current.rel === '' ? child.name : `${current.rel}/${child.name}`
+      if (child.isDirectory()) {
+        if (WORKSPACE_BACKUP_EXCLUDED_DIRS.has(child.name)) {
+          excludedDirs += 1
+          continue
+        }
+        stack.push({ dir: absolute, rel: relative })
+        continue
+      }
+      if (!child.isFile()) continue
+      let bytes = 0
+      try {
+        bytes = statSync(absolute).size
+      } catch {
+        continue
+      }
+      if (totalBytes + bytes > WORKSPACE_BACKUP_MAX_BYTES) {
+        truncated = true
+        break
+      }
+      totalBytes += bytes
+      files.push({ relative, bytes, path: absolute })
+    }
+    if (truncated) break
+  }
+  files.sort((left, right) => left.relative.localeCompare(right.relative))
+  return { files, totalBytes, excludedDirs, truncated }
+}
+
+/**
+ * Resolve the workspace directories the selected sessions belong to.
+ *
+ * @param {object} ctx Cordis context.
+ * @param {string[]} sessionIds selected session ids.
+ * @returns {Promise<{ workspaces: Array<object>, unmatched: number }>} per-workspace file listings.
+ */
+async function collectWorkspaceBackup(ctx, sessionIds) {
+  const wanted = new Set(sessionIds.map(String))
+  const baseline = await readWorkspaceBaseline(ctx, 'workspace-backup')
+  const matchedSessions = new Set()
+  const targets = new Map()
+  for (const item of baseline.baseline.items) {
+    const members = (item.sessionIds ?? []).map(String)
+    const hits = members.filter((id) => wanted.has(id))
+    if (hits.length === 0) continue
+    for (const id of hits) matchedSessions.add(id)
+    const workspaceId = String(item.workspaceId)
+    if (targets.has(workspaceId)) continue
+    targets.set(workspaceId, {
+      workspaceId,
+      path: typeof item.path === 'string' ? item.path : '',
+      title: typeof item.title === 'string' ? item.title : '',
+    })
+  }
+  const workspaces = []
+  for (const target of targets.values()) {
+    if (target.path === '') {
+      workspaces.push({ ...target, files: [], totalBytes: 0, excludedDirs: 0, truncated: false, unavailable: true })
+      continue
+    }
+    let exists = false
+    try {
+      exists = statSync(target.path).isDirectory()
+    } catch {
+      exists = false
+    }
+    if (!exists) {
+      workspaces.push({ ...target, files: [], totalBytes: 0, excludedDirs: 0, truncated: false, unavailable: true })
+      continue
+    }
+    workspaces.push({ ...target, ...walkWorkspaceDirectory(target.path), unavailable: false })
+  }
+  return { workspaces, unmatched: Math.max(0, wanted.size - matchedSessions.size) }
+}
+
+/**
+ * Restore one package's workspace files into the mapped local workspaces.
+ *
+ * Existing files are never overwritten: a backup is additive, and a silent
+ * overwrite could destroy newer work. Unmapped workspaces are reported instead.
+ *
+ * @param {Map<string, Array<{ segments: string[], data: Buffer }>>} byWorkspace members per source workspace id.
+ * @param {object} mapping source workspace id to local workspace id.
+ * @param {object | undefined} registry workspace registry service.
+ * @returns {{ restored: number, skipped: number, failed: number, bytes: number, workspaces: Array<object> }} counters and per-workspace results.
+ */
+function restoreWorkspaceFiles(byWorkspace, mapping, registry) {
+  const counters = { restored: 0, skipped: 0, failed: 0, bytes: 0, workspaces: [] }
+  if (!(byWorkspace instanceof Map) || byWorkspace.size === 0) return counters
+  for (const [sourceWorkspaceId, members] of byWorkspace) {
+    const targetWorkspaceId = mapping[String(sourceWorkspaceId)]
+    const workspace = typeof targetWorkspaceId === 'string' && registry && typeof registry.get === 'function'
+      ? registry.get(targetWorkspaceId)
+      : undefined
+    const targetRoot = workspace && typeof workspace.path === 'string' ? workspace.path : ''
+    if (targetRoot === '') {
+      counters.workspaces.push({
+        workspaceId: String(sourceWorkspaceId),
+        status: 'unmapped',
+        restored: 0,
+        skipped: 0,
+        failed: 0,
+      })
+      counters.skipped += members.length
+      continue
+    }
+    const root = resolve(targetRoot)
+    let restored = 0
+    let skipped = 0
+    let failed = 0
+    let bytes = 0
+    for (const member of members) {
+      const target = resolve(join(root, ...member.segments))
+      if (!target.startsWith(root + sep)) {
+        failed += 1
+        continue
+      }
+      try {
+        let exists = false
+        try {
+          exists = statSync(target).isFile()
+        } catch {
+          exists = false
+        }
+        if (exists) {
+          skipped += 1
+          continue
+        }
+        mkdirSync(dirname(target), { recursive: true })
+        writeFileSync(target, member.data)
+        restored += 1
+        bytes += member.data.length
+      } catch {
+        failed += 1
+      }
+    }
+    counters.restored += restored
+    counters.skipped += skipped
+    counters.failed += failed
+    counters.bytes += bytes
+    counters.workspaces.push({
+      workspaceId: String(sourceWorkspaceId),
+      targetWorkspaceId,
+      status: 'restored',
+      restored,
+      skipped,
+      failed,
+    })
+  }
+  return counters
+}
+
 // --- Import archive support --------------------------------------------------
 
 /**
@@ -1388,6 +1590,7 @@ function loadImportPackage(rawPath) {
 function indexPackageEntries(entries) {
   const bySession = new Map()
   const attachments = []
+  const byWorkspace = new Map()
   const unknown = []
   for (const entry of entries) {
     const segments = safeZipSegments(entry.name)
@@ -1400,6 +1603,12 @@ function indexPackageEntries(entries) {
       attachments.push({ segments: segments.slice(1), data: entry.data })
       continue
     }
+    if (segments[0] === 'workspaces' && segments.length >= 3) {
+      const workspaceId = segments[1]
+      if (!byWorkspace.has(workspaceId)) byWorkspace.set(workspaceId, [])
+      byWorkspace.get(workspaceId).push({ segments: segments.slice(2), data: entry.data })
+      continue
+    }
     if (segments[0] !== 'sessions' || segments.length < 3) {
       unknown.push(entry.name)
       continue
@@ -1408,7 +1617,7 @@ function indexPackageEntries(entries) {
     if (!bySession.has(sessionId)) bySession.set(sessionId, [])
     bySession.get(sessionId).push({ segments: segments.slice(2), data: entry.data })
   }
-  return { bySession, attachments, unknown }
+  return { bySession, attachments, byWorkspace, unknown }
 }
 
 /**
@@ -1773,7 +1982,7 @@ function listImportCandidates(rawDir) {
 async function inspectImport(ctx, rawPath) {
   const pkg = loadImportPackage(rawPath)
   const { manifest, entries } = pkg
-  const { bySession, attachments, unknown } = indexPackageEntries(entries)
+  const { bySession, attachments, byWorkspace, unknown } = indexPackageEntries(entries)
 
   const registry = ctx.get('workspaceRegistry')
   const localWorkspaces = registry && typeof registry.list === 'function'
@@ -1871,6 +2080,9 @@ async function inspectImport(ctx, rawPath) {
       workspaces: workspaces.length,
       attachments: attachments.length,
       attachmentBytes: attachments.reduce((sum, entry) => sum + entry.data.length, 0),
+      workspaceFiles: [...byWorkspace.values()].reduce((sum, members) => sum + members.length, 0),
+      workspaceFileBytes: [...byWorkspace.values()]
+        .reduce((sum, members) => sum + members.reduce((inner, member) => inner + member.data.length, 0), 0),
     },
   }
 }
@@ -2001,7 +2213,7 @@ async function adoptLocalSession(options) {
 async function importPackage(ctx, rawPath, rawMapping) {
   const pkg = loadImportPackage(rawPath)
   const { manifest, entries } = pkg
-  const { bySession, attachments } = indexPackageEntries(entries)
+  const { bySession, attachments, byWorkspace } = indexPackageEntries(entries)
   const mapping = rawMapping && typeof rawMapping === 'object' && !Array.isArray(rawMapping)
     ? rawMapping
     : {}
@@ -2176,7 +2388,15 @@ async function importPackage(ctx, rawPath, rawMapping) {
   // are restored even when every session was skipped: the local copy may already
   // be missing its attachments.
   const restoredAttachments = restorePackageAttachments(attachments)
-  trace('import', 'end', `imported=${imported} adopted=${adopted} skipped=${skipped} failed=${failed} attachments=${restoredAttachments.restored}`)
+  // Workspace files go into the mapped local workspace directory. Existing files
+  // are never overwritten: the backup only fills in what is missing.
+  const restoredWorkspaceFiles = restoreWorkspaceFiles(byWorkspace, mapping, registry)
+  trace(
+    'import',
+    'end',
+    `imported=${imported} adopted=${adopted} skipped=${skipped} failed=${failed} `
+      + `attachments=${restoredAttachments.restored} workspaceFiles=${restoredWorkspaceFiles.restored}`,
+  )
   return {
     results,
     imported,
@@ -2184,6 +2404,7 @@ async function importPackage(ctx, rawPath, rawMapping) {
     skipped,
     failed,
     attachments: restoredAttachments,
+    workspaceFiles: restoredWorkspaceFiles,
     fileName: pkg.fileName,
   }
 }
@@ -3147,6 +3368,57 @@ async function exportSessions(ctx, rawIds, signal, options = {}) {
     )
   }
 
+  // Optional workspace backup (the user's "附件"): the files under each selected
+  // session's workspace directory. Development artefacts are skipped, and the
+  // caps keep one export from reading an unbounded tree.
+  const workspaceFiles = []
+  let workspaceFilesSkipped = 0
+  if (options.includeWorkspaceFiles === true) {
+    const backup = await collectWorkspaceBackup(ctx, selected)
+    workspaceFilesSkipped += backup.unmatched
+    for (const workspace of backup.workspaces) {
+      if (workspace.unavailable === true || workspace.files.length === 0) {
+        workspaceFilesSkipped += 1
+        continue
+      }
+      const included = []
+      for (const file of workspace.files) {
+        if (totalBytes + file.bytes > EXPORT_MAX_BYTES) {
+          workspaceFilesSkipped += 1
+          continue
+        }
+        let data = null
+        try {
+          data = readFileSync(file.path)
+        } catch {
+          workspaceFilesSkipped += 1
+          continue
+        }
+        totalBytes += data.length
+        entries.push({ name: `workspaces/${workspace.workspaceId}/${file.relative}`, data })
+        included.push({ name: file.relative, bytes: data.length })
+      }
+      if (included.length === 0) continue
+      workspaceFiles.push({
+        workspaceId: workspace.workspaceId,
+        path: workspace.path,
+        title: workspace.title,
+        fileCount: included.length,
+        bytes: included.reduce((sum, item) => sum + item.bytes, 0),
+        truncated: workspace.truncated === true,
+        excludedDirs: workspace.excludedDirs,
+        files: included,
+      })
+    }
+    trace(
+      'export',
+      'workspace-files',
+      `workspaces=${workspaceFiles.length} `
+        + `files=${workspaceFiles.reduce((sum, item) => sum + item.fileCount, 0)}`
+        + ` skipped=${workspaceFilesSkipped}`,
+    )
+  }
+
   const manifest = {
     format: 'dsh-sessions-library-export',
     version: 1,
@@ -3159,6 +3431,9 @@ async function exportSessions(ctx, rawIds, signal, options = {}) {
     // Present only when the exporter asked for attachments; each entry mirrors a
     // member under `attachments/` and carries the content hash the log refers to.
     ...(attachments.length > 0 ? { attachments } : {}),
+    // Present only when the exporter asked for the workspace file backup; the
+    // listing lets the importer report conflicts before writing anything.
+    ...(workspaceFiles.length > 0 ? { workspaceFiles } : {}),
   }
   entries.unshift({
     name: 'manifest.json',
@@ -3197,6 +3472,9 @@ async function exportSessions(ctx, rawIds, signal, options = {}) {
     attachmentCount: attachments.length,
     attachmentBytes: attachments.reduce((sum, item) => sum + item.bytes, 0),
     attachmentsSkipped,
+    workspaceFileCount: workspaceFiles.reduce((sum, item) => sum + item.fileCount, 0),
+    workspaceFileBytes: workspaceFiles.reduce((sum, item) => sum + item.bytes, 0),
+    workspaceFilesSkipped,
     bytes: archive.length,
     missing: ids.filter((id) => !byId.has(id)).length,
   }
@@ -3515,6 +3793,33 @@ export function apply(ctx) {
         },
       },
       {
+        path: WORKSPACE_PREFLIGHT_PATH,
+        label: 'workspace-preflight',
+        handler: async (request) => {
+          const body = await readJsonBody(request)
+          const ids = normalizeIds(body.sessionIds)
+          const backup = await collectWorkspaceBackup(ctx, ids)
+          const workspaces = backup.workspaces.map((workspace) => ({
+            workspaceId: workspace.workspaceId,
+            title: workspace.title,
+            path: workspace.path,
+            fileCount: workspace.files.length,
+            bytes: workspace.totalBytes,
+            truncated: workspace.truncated === true,
+            excludedDirs: workspace.excludedDirs,
+            unavailable: workspace.unavailable === true,
+          }))
+          return jsonResponse({
+            ok: true,
+            totalFiles: workspaces.reduce((sum, item) => sum + item.fileCount, 0),
+            totalBytes: workspaces.reduce((sum, item) => sum + item.bytes, 0),
+            truncated: workspaces.some((item) => item.truncated === true),
+            unmatched: backup.unmatched,
+            workspaces,
+          })
+        },
+      },
+      {
         path: EXPORT_PATH,
         label: 'export',
         handler: async (request) => {
@@ -3523,6 +3828,7 @@ export function apply(ctx) {
             targetDir: typeof body.targetDir === 'string' ? body.targetDir : undefined,
             createDir: body.createDir === true,
             includeAttachments: body.includeAttachments === true,
+            includeWorkspaceFiles: body.includeWorkspaceFiles === true,
           })
           return jsonResponse({ ok: true, ...result })
         },
