@@ -2361,7 +2361,7 @@ window.__ModuleLoader__.load({
               h(
                 'p',
                 { style: dialogHintStyle },
-                `将删除所选的 ${count} 条操作日志（共 ${logs.length} 条）。已经执行的删除、恢复操作本身不受影响。`,
+                `将删除所选的 ${count} 条操作日志。已经执行的删除、恢复操作本身不受影响。`,
               ),
               logsDeleteDialog.error
                 ? h('div', { style: dialogBlockerStyle }, `失败：${logsDeleteDialog.error}`)
