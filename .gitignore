@@ -1,5 +1,7 @@
 node_modules/
 *.log
 *.tgz
+# 基线制品需要入库：release/<version>/*.tgz 例外
+!release/**/*.tgz
 .DS_Store
 Thumbs.db
