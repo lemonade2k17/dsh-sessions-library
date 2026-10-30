@@ -27,6 +27,55 @@ window.__ModuleLoader__.load({
     const IMPORT_PREFLIGHT_PATH = 'api/sessions-library/import-preflight'
     const IMPORT_RUN_PATH = 'api/sessions-library/import-run'
     const EXPORT_DIR_STORAGE_KEY = 'dsh-sessions-library:export-dir'
+    const EXCLUDE_DIRS_STORAGE_KEY = 'dsh-sessions-library:exclude-dirs'
+    // Mirrors the Host default so a fresh install shows the same list it applies.
+    const DEFAULT_EXCLUDE_DIRS = 'node_modules, .git, dist, build, out, target, coverage, .next, .nuxt, .cache, .venv, venv, __pycache__'
+
+    /**
+     * Split an edited exclusion list into directory names.
+     *
+     * @param {string} text raw input.
+     * @returns {string[]} trimmed names.
+     */
+    function parseExcludeDirs(text) {
+      if (typeof text !== 'string') return []
+      return text
+        .split(/[,;，；\s]+/)
+        .map((part) => part.trim())
+        .filter((part) => part !== '')
+    }
+
+    /**
+     * Read the saved exclusion list, falling back to the defaults.
+     *
+     * @returns {string} comma separated directory names.
+     */
+    function loadExcludeDirs() {
+      try {
+        const stored = window.localStorage.getItem(EXCLUDE_DIRS_STORAGE_KEY)
+        return typeof stored === 'string' ? stored : DEFAULT_EXCLUDE_DIRS
+      } catch {
+        return DEFAULT_EXCLUDE_DIRS
+      }
+    }
+
+    /**
+     * Remember an edited exclusion list.
+     *
+     * @param {string} text comma separated directory names.
+     */
+    function saveExcludeDirs(text) {
+      try {
+        const trimmed = typeof text === 'string' ? text.trim() : ''
+        if (trimmed === '' || trimmed === DEFAULT_EXCLUDE_DIRS) {
+          window.localStorage.removeItem(EXCLUDE_DIRS_STORAGE_KEY)
+        } else {
+          window.localStorage.setItem(EXCLUDE_DIRS_STORAGE_KEY, trimmed)
+        }
+      } catch {
+        // Remembering the list is cosmetic.
+      }
+    }
 
     /**
      * Read the last chosen export directory.
@@ -520,6 +569,10 @@ window.__ModuleLoader__.load({
         const [logsDeleteDialog, setLogsDeleteDialog] = React.useState(null)
         const [exportDialog, setExportDialog] = React.useState(null)
         const [exportTarget, setExportTarget] = React.useState(loadExportDir)
+        // Editable directory exclusion list for the workspace backup; persisted so
+        // the user does not retype it for every export.
+        const [excludeDirs, setExcludeDirs] = React.useState(loadExcludeDirs)
+        const excludeTimerRef = React.useRef(null)
         // Non-null while asking whether a missing export folder should be created.
         const [createDirPrompt, setCreateDirPrompt] = React.useState(null)
         // Import wizard state: source → preview (with mapping) → done.
@@ -1346,24 +1399,33 @@ window.__ModuleLoader__.load({
             // actually found files to include.
             workspaceInfo: null,
             includeWorkspaceFiles: true,
+            excludeText: excludeDirs,
           })
-          loadExportPreflight(ids)
+          loadExportPreflight(ids, excludeDirs)
         }
 
         /**
          * Read how many workspace files the selected sessions would carry.
          *
          * @param {string[]} ids selected session ids.
+         * @param {string} excludeText raw exclusion list typed by the user.
          * @returns {Promise<void>} resolution after the preview settled.
          */
-        async function loadExportPreflight(ids) {
-          const workspaceResult = await postJson(WORKSPACE_PREFLIGHT_PATH, { sessionIds: ids }).catch(() => null)
+        async function loadExportPreflight(ids, excludeText) {
+          const workspaceResult = await postJson(WORKSPACE_PREFLIGHT_PATH, {
+            sessionIds: ids,
+            exclude: parseExcludeDirs(excludeText),
+          }).catch(() => null)
           const workspaceInfo = {
             count: workspaceResult ? Number(workspaceResult.totalFiles) || 0 : 0,
             bytes: workspaceResult ? Number(workspaceResult.totalBytes) || 0 : 0,
             truncated: workspaceResult ? workspaceResult.truncated === true : false,
             workspaces: workspaceResult && Array.isArray(workspaceResult.workspaces)
               ? workspaceResult.workspaces
+              : [],
+            // Names the Host actually matched on disk, so a typo is visible.
+            excludedNames: workspaceResult && Array.isArray(workspaceResult.excludedNames)
+              ? workspaceResult.excludedNames
               : [],
           }
           setExportDialog((current) => (current && current.phase === 'choose'
@@ -1373,6 +1435,24 @@ window.__ModuleLoader__.load({
                 includeWorkspaceFiles: workspaceInfo.count > 0,
               }
             : current))
+        }
+
+        /**
+         * Update the exclusion list and refresh the preview shortly after typing.
+         *
+         * @param {string} text raw input.
+         * @returns {void}
+         */
+        function changeExcludeDirs(text) {
+          setExcludeDirs(text)
+          saveExcludeDirs(text)
+          if (excludeTimerRef.current !== null) clearTimeout(excludeTimerRef.current)
+          excludeTimerRef.current = setTimeout(() => {
+            excludeTimerRef.current = null
+            const ids = selectedVisibleIds()
+            if (ids.length === 0) return
+            loadExportPreflight(ids, text)
+          }, 450)
         }
 
         /**
@@ -1429,6 +1509,7 @@ window.__ModuleLoader__.load({
               ...(exportDialog !== null && exportDialog.includeWorkspaceFiles === true
                 ? { includeWorkspaceFiles: true }
                 : {}),
+              ...(exportDialog !== null ? { exclude: parseExcludeDirs(exportDialog.excludeText) } : {}),
             })
             saveExportDir(targetDir)
             setExportDialog({
@@ -2747,7 +2828,6 @@ window.__ModuleLoader__.load({
               ? '所选会话的工作区没有可备份的文件'
               : `包含工作区附件（工作区目录下的文件）：${workspaceFileCount} 个 · ${((Number(workspaceInfo.bytes) || 0) / 1048576).toFixed(2)} MB`
                 + `${workspaceInfo.truncated ? '（已达上限，部分文件未包含）' : ''}`
-                + '（自动排除 node_modules、.git、dist、build 等目录）'
           const actions = []
           if (choosing) {
             actions.push(h(
@@ -2832,6 +2912,31 @@ window.__ModuleLoader__.load({
                         '包含工作区附件',
                       ),
                       h('span', { style: exportOptionLabelStyle }, workspaceLabel),
+                    ),
+                    h(
+                      'div',
+                      { style: exportExcludeBlockStyle },
+                      h(
+                        'div',
+                        { style: dialogHintStyle },
+                        '排除目录（逗号或空格分隔，留空则打包全部文件）',
+                      ),
+                      h('input', {
+                        className: 'sl-input',
+                        style: exportInputStyle,
+                        value: typeof exportDialog.excludeText === 'string' ? exportDialog.excludeText : excludeDirs,
+                        placeholder: '例如 node_modules, .git, dist',
+                        onChange: (event) => changeExcludeDirs(event.target.value),
+                      }),
+                      h(
+                        'div',
+                        { style: exportExcludeHintStyle },
+                        workspaceInfo === null
+                          ? '正在统计…'
+                          : (workspaceInfo.excludedNames && workspaceInfo.excludedNames.length > 0)
+                            ? `本次实际排除：${workspaceInfo.excludedNames.join('、')}`
+                            : '本次扫描没有匹配到被排除的目录',
+                      ),
                     ),
                   )
                 : null,
@@ -3615,6 +3720,8 @@ window.__ModuleLoader__.load({
     // the count and size so the option is judged before exporting.
     const exportOptionRowStyle = { display: 'flex', alignItems: 'center', gap: 8, marginTop: 12 }
     const exportOptionLabelStyle = { fontSize: 12, opacity: 0.75, lineHeight: 1.5 }
+    const exportExcludeBlockStyle = { marginTop: 12 }
+    const exportExcludeHintStyle = { marginTop: 4, fontSize: 11, opacity: 0.5, lineHeight: 1.4 }
     const importListStyle = {
       display: 'flex',
       flexDirection: 'column',

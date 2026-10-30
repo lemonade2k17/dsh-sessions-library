@@ -1110,13 +1110,45 @@ function collectDirectoryEntries(root, prefix, entries, budget) {
 // --- Workspace backup support -----------------------------------------------
 
 /**
- * Walk one workspace directory, skipping development artefacts.
+ * Normalize a user-supplied exclusion list into plain directory names.
+ *
+ * Accepts an array or a comma / semicolon / whitespace separated string, keeps
+ * only single-segment names so a crafted value can never point outside the
+ * workspace, and caps the list length.
+ *
+ * @param {any} raw raw value from the Client.
+ * @param {Set<string>} fallback set used when the value is absent.
+ * @returns {string[]} safe directory names.
+ */
+function normalizeExcludeList(raw, fallback) {
+  const source = Array.isArray(raw)
+    ? raw
+    : typeof raw === 'string'
+      ? raw.split(/[,;，；\s]+/)
+      : null
+  if (source === null) return [...fallback]
+  const cleaned = []
+  for (const item of source) {
+    if (typeof item !== 'string') continue
+    const name = item.trim()
+    if (name === '' || name.includes('/') || name.includes('\\') || name.includes('..')) continue
+    if (name.length > 64) continue
+    if (!cleaned.includes(name)) cleaned.push(name)
+    if (cleaned.length >= 100) break
+  }
+  return cleaned
+}
+
+/**
+ * Walk one workspace directory, skipping the excluded directories.
  *
  * @param {string} rootPath workspace directory.
- * @returns {{ files: Array<{ relative: string, bytes: number, path: string }>, totalBytes: number, excludedDirs: number, truncated: boolean }} collected files.
+ * @param {Set<string>} excluded directory names to skip.
+ * @returns {{ files: Array<{ relative: string, bytes: number, path: string }>, totalBytes: number, excludedDirs: number, excludedNames: string[], truncated: boolean }} collected files.
  */
-function walkWorkspaceDirectory(rootPath) {
+function walkWorkspaceDirectory(rootPath, excluded = WORKSPACE_BACKUP_EXCLUDED_DIRS) {
   const files = []
+  const excludedNames = new Set()
   let totalBytes = 0
   let excludedDirs = 0
   let truncated = false
@@ -1137,8 +1169,9 @@ function walkWorkspaceDirectory(rootPath) {
       const absolute = join(current.dir, child.name)
       const relative = current.rel === '' ? child.name : `${current.rel}/${child.name}`
       if (child.isDirectory()) {
-        if (WORKSPACE_BACKUP_EXCLUDED_DIRS.has(child.name)) {
+        if (excluded.has(child.name)) {
           excludedDirs += 1
+          excludedNames.add(child.name)
           continue
         }
         stack.push({ dir: absolute, rel: relative })
@@ -1161,7 +1194,7 @@ function walkWorkspaceDirectory(rootPath) {
     if (truncated) break
   }
   files.sort((left, right) => left.relative.localeCompare(right.relative))
-  return { files, totalBytes, excludedDirs, truncated }
+  return { files, totalBytes, excludedDirs, excludedNames: [...excludedNames].sort(), truncated }
 }
 
 /**
@@ -1169,9 +1202,12 @@ function walkWorkspaceDirectory(rootPath) {
  *
  * @param {object} ctx Cordis context.
  * @param {string[]} sessionIds selected session ids.
- * @returns {Promise<{ workspaces: Array<object>, unmatched: number }>} per-workspace file listings.
+ * @param {any} [rawExclude] user-supplied exclusion list; absent keeps the defaults.
+ * @returns {Promise<{ workspaces: Array<object>, unmatched: number, exclude: string[], excludedNames: string[] }>} per-workspace file listings.
  */
-async function collectWorkspaceBackup(ctx, sessionIds) {
+async function collectWorkspaceBackup(ctx, sessionIds, rawExclude) {
+  const exclude = normalizeExcludeList(rawExclude, WORKSPACE_BACKUP_EXCLUDED_DIRS)
+  const excluded = new Set(exclude)
   const wanted = new Set(sessionIds.map(String))
   const baseline = await readWorkspaceBaseline(ctx, 'workspace-backup')
   const matchedSessions = new Set()
@@ -1205,9 +1241,15 @@ async function collectWorkspaceBackup(ctx, sessionIds) {
       workspaces.push({ ...target, files: [], totalBytes: 0, excludedDirs: 0, truncated: false, unavailable: true })
       continue
     }
-    workspaces.push({ ...target, ...walkWorkspaceDirectory(target.path), unavailable: false })
+    workspaces.push({ ...target, ...walkWorkspaceDirectory(target.path, excluded), unavailable: false })
   }
-  return { workspaces, unmatched: Math.max(0, wanted.size - matchedSessions.size) }
+  const excludedNames = [...new Set(workspaces.flatMap((workspace) => workspace.excludedNames ?? []))].sort()
+  return {
+    workspaces,
+    unmatched: Math.max(0, wanted.size - matchedSessions.size),
+    exclude,
+    excludedNames,
+  }
 }
 
 /**
@@ -3167,8 +3209,10 @@ async function exportSessions(ctx, rawIds, signal, options = {}) {
   // caps keep one export from reading an unbounded tree.
   const workspaceFiles = []
   let workspaceFilesSkipped = 0
+  let workspaceExclude = []
   if (options.includeWorkspaceFiles === true) {
-    const backup = await collectWorkspaceBackup(ctx, selected)
+    const backup = await collectWorkspaceBackup(ctx, selected, options.exclude)
+    workspaceExclude = backup.exclude
     workspaceFilesSkipped += backup.unmatched
     for (const workspace of backup.workspaces) {
       if (workspace.unavailable === true || workspace.files.length === 0) {
@@ -3201,6 +3245,7 @@ async function exportSessions(ctx, rawIds, signal, options = {}) {
         bytes: included.reduce((sum, item) => sum + item.bytes, 0),
         truncated: workspace.truncated === true,
         excludedDirs: workspace.excludedDirs,
+        excludedNames: workspace.excludedNames ?? [],
         files: included,
       })
     }
@@ -3225,6 +3270,9 @@ async function exportSessions(ctx, rawIds, signal, options = {}) {
     // Present only when the exporter asked for the workspace file backup; the
     // listing lets the importer report conflicts before writing anything.
     ...(workspaceFiles.length > 0 ? { workspaceFiles } : {}),
+    // Records which directory names were skipped, so the receiver can tell why a
+    // file is missing without re-running the exporter's settings.
+    ...(workspaceFiles.length > 0 ? { workspaceExclude } : {}),
   }
   entries.unshift({
     name: 'manifest.json',
@@ -3565,7 +3613,7 @@ export function apply(ctx) {
         handler: async (request) => {
           const body = await readJsonBody(request)
           const ids = normalizeIds(body.sessionIds)
-          const backup = await collectWorkspaceBackup(ctx, ids)
+          const backup = await collectWorkspaceBackup(ctx, ids, body.exclude)
           const workspaces = backup.workspaces.map((workspace) => ({
             workspaceId: workspace.workspaceId,
             title: workspace.title,
@@ -3574,6 +3622,7 @@ export function apply(ctx) {
             bytes: workspace.totalBytes,
             truncated: workspace.truncated === true,
             excludedDirs: workspace.excludedDirs,
+            excludedNames: workspace.excludedNames ?? [],
             unavailable: workspace.unavailable === true,
           }))
           return jsonResponse({
@@ -3582,6 +3631,10 @@ export function apply(ctx) {
             totalBytes: workspaces.reduce((sum, item) => sum + item.bytes, 0),
             truncated: workspaces.some((item) => item.truncated === true),
             unmatched: backup.unmatched,
+            // Echo the effective list so the Client can show what was applied and
+            // which names actually matched a directory on disk.
+            exclude: backup.exclude,
+            excludedNames: backup.excludedNames,
             workspaces,
           })
         },
@@ -3595,6 +3648,7 @@ export function apply(ctx) {
             targetDir: typeof body.targetDir === 'string' ? body.targetDir : undefined,
             createDir: body.createDir === true,
             includeWorkspaceFiles: body.includeWorkspaceFiles === true,
+            exclude: body.exclude,
           })
           return jsonResponse({ ok: true, ...result })
         },
