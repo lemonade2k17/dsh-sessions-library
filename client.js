@@ -252,19 +252,44 @@ window.__ModuleLoader__.load({
       '.sl-root { position: relative; height: 100%; min-height: 0; display: flex; flex-direction: column; color: inherit; }',
       '.sl-root * { box-sizing: border-box; }',
       '.sl-scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 4px 24px 106px; }',
-      '.sl-scroll::-webkit-scrollbar { width: 10px; }',
-      '.sl-scroll::-webkit-scrollbar-thumb { background: color-mix(in srgb, currentColor 18%, transparent); border-radius: 8px; border: 3px solid transparent; background-clip: content-box; }',
+      // One scrollbar treatment for the page and for every dialog scroll area.
+      '.sl-root ::-webkit-scrollbar { width: 10px; height: 10px; }',
+      '.sl-root ::-webkit-scrollbar-thumb { background: color-mix(in srgb, currentColor 18%, transparent); border-radius: 8px; border: 3px solid transparent; background-clip: content-box; }',
+      '.sl-root ::-webkit-scrollbar-thumb:hover { background: color-mix(in srgb, currentColor 30%, transparent); }',
+      '.sl-root ::-webkit-scrollbar-track, .sl-root ::-webkit-scrollbar-corner { background: transparent; }',
+      // Hover/press feedback is background-color only (paint, never layout), and
+      // short enough that a fast pointer reads as a state, not an animation.
+      '.sl-group-head, .sl-row, .sl-logrow, .sl-check { transition: background-color 120ms ease, border-color 120ms ease; }',
       '.sl-group-head:hover { background: color-mix(in srgb, currentColor 6%, transparent); }',
+      '.sl-group-head:active { background: color-mix(in srgb, currentColor 9%, transparent); }',
       '.sl-row:hover { background: color-mix(in srgb, currentColor 8%, transparent); }',
+      '.sl-row:active { background: color-mix(in srgb, currentColor 12%, transparent); }',
+      '.sl-logrow:hover { background: color-mix(in srgb, currentColor 5%, transparent); }',
       '.sl-btn:hover { background: color-mix(in srgb, currentColor 8%, transparent); }',
+      '.sl-btn:active { background: color-mix(in srgb, currentColor 13%, transparent); }',
       '.sl-btn:disabled { cursor: not-allowed; opacity: 0.5; }',
-      '.sl-fab:hover:not(:disabled) { background: color-mix(in srgb, currentColor 18%, Canvas); }',
+      // Dock surfaces live in the stylesheet (not inline) so hover and press can
+      // actually reach them; the layout stays inline with the render code.
+      '.sl-fab { border: 1px solid color-mix(in srgb, currentColor 24%, transparent); background: color-mix(in srgb, currentColor 12%, Canvas); box-shadow: 0 6px 20px rgba(0, 0, 0, 0.28); transition: background-color 120ms ease, border-color 120ms ease, box-shadow 120ms ease, opacity 120ms ease; }',
+      '.sl-fab:disabled { opacity: 0.45; box-shadow: none; }',
+      '.sl-fab:hover:not(:disabled) { background: color-mix(in srgb, currentColor 18%, Canvas); border-color: color-mix(in srgb, currentColor 34%, transparent); }',
+      '.sl-fab:active:not(:disabled) { background: color-mix(in srgb, currentColor 23%, Canvas); }',
+      '.sl-dock-secondary { border: 1px solid color-mix(in srgb, currentColor 22%, transparent); background: color-mix(in srgb, currentColor 8%, Canvas); transition: background-color 120ms ease, border-color 120ms ease; }',
+      '.sl-dock-secondary:hover:not(:disabled) { background: color-mix(in srgb, currentColor 14%, Canvas); border-color: color-mix(in srgb, currentColor 30%, transparent); }',
+      '.sl-dock-secondary:active:not(:disabled) { background: color-mix(in srgb, currentColor 17%, Canvas); }',
+      '.sl-check { border: 1px solid color-mix(in srgb, currentColor 38%, transparent); background: transparent; }',
+      '.sl-check[aria-checked="true"], .sl-check[aria-checked="mixed"] { border-color: color-mix(in srgb, currentColor 60%, transparent); background: color-mix(in srgb, currentColor 26%, transparent); }',
+      '.sl-check:hover { border-color: color-mix(in srgb, currentColor 62%, transparent); }',
+      // Keyboard focus only: a click never draws these rings.
+      '.sl-row:focus-visible, .sl-group-head:focus-visible, .sl-check:focus-visible, .sl-btn:focus-visible, .sl-fab:focus-visible, .sl-logrow:focus-visible { outline: 2px solid color-mix(in srgb, currentColor 38%, transparent); outline-offset: 1px; }',
       // Export dock backdrop: dark edges over a light theme, light edges over a
       // dark theme, so the strip stays visible in both palettes.
       '.sl-dock { background: linear-gradient(180deg, rgba(28, 32, 38, 0.04) 0%, rgba(110, 116, 126, 0.025) 26%, rgba(235, 238, 243, 0.015) 50%, rgba(110, 116, 126, 0.025) 74%, rgba(28, 32, 38, 0.04) 100%); }',
       'body[data-ds-dark-theme] .sl-dock { background: linear-gradient(180deg, rgba(243, 246, 249, 0.04) 0%, rgba(196, 202, 210, 0.025) 26%, rgba(118, 124, 134, 0.02) 50%, rgba(196, 202, 210, 0.025) 74%, rgba(243, 246, 249, 0.04) 100%); }',
       '.sl-input::placeholder { color: color-mix(in srgb, currentColor 45%, transparent); }',
       '.sl-input:focus { outline: 2px solid color-mix(in srgb, currentColor 28%, transparent); outline-offset: -1px; }',
+      // Respect the OS setting: state changes stay instant, nothing animates.
+      '@media (prefers-reduced-motion: reduce) { .sl-group-head, .sl-row, .sl-logrow, .sl-check { transition: none; } }',
     ].join('\n')
 
     /** Sidebar entry icon; the panellist passes the host size. */
@@ -1656,6 +1681,16 @@ window.__ModuleLoader__.load({
           if (session.archived) badges.push(h('span', { key: 'archived', style: badgeStyle }, '已归档'))
           if (session.running) badges.push(h('span', { key: 'running', style: badgeStyle }, '运行中'))
           const checked = selected[session.id] === true
+          const baseRowStyle = session.archived ? { ...rowStyle, opacity: 0.72 } : rowStyle
+          // A checked row keeps a tint plus a left accent bar, so the selection is
+          // readable when the list is scrolled away from the checkboxes.
+          const rowStyleForSession = checked
+            ? {
+                ...baseRowStyle,
+                background: 'color-mix(in srgb, currentColor 9%, transparent)',
+                boxShadow: 'inset 2px 0 0 color-mix(in srgb, currentColor 48%, transparent)',
+              }
+            : baseRowStyle
           return h(
             'div',
             {
@@ -1663,7 +1698,7 @@ window.__ModuleLoader__.load({
               className: 'sl-row',
               role: 'button',
               tabIndex: 0,
-              style: session.archived ? { ...rowStyle, opacity: 0.72 } : rowStyle,
+              style: rowStyleForSession,
               title: session.cwd || session.id,
               onClick: () => openSession(session.id),
               onKeyDown: (event) => {
@@ -1759,7 +1794,7 @@ window.__ModuleLoader__.load({
 
         function renderTrash() {
           if (trashPhase === 'loading' || trashPhase === 'idle') {
-            return h('div', { style: placeholderStyle }, '正在读取回收站…')
+            return renderPlaceholder('正在读取回收站…', null)
           }
           if (trashPhase === 'error') {
             return h(
@@ -1770,10 +1805,10 @@ window.__ModuleLoader__.load({
             )
           }
           if (trash.length === 0) {
-            return h('div', { style: placeholderStyle }, '回收站是空的')
+            return renderPlaceholder('回收站是空的', '删除的会话会先放在这里，可恢复或永久删除')
           }
           if (trashFamilies.length === 0) {
-            return h('div', { style: placeholderStyle }, '没有匹配的回收站条目')
+            return renderPlaceholder('没有匹配的回收站条目', '换个搜索词，或清空筛选后再看')
           }
 
           const families = trashFamilies
@@ -1863,7 +1898,7 @@ window.__ModuleLoader__.load({
 
         function renderLogs() {
           if (logsPhase === 'loading' || logsPhase === 'idle') {
-            return h('div', { style: placeholderStyle }, '正在读取操作日志…')
+            return renderPlaceholder('正在读取操作日志…', null)
           }
           if (logsPhase === 'error') {
             return h(
@@ -1878,10 +1913,10 @@ window.__ModuleLoader__.load({
             )
           }
           if (logs.length === 0) {
-            return h('div', { style: placeholderStyle }, '暂无操作日志')
+            return renderPlaceholder('暂无操作日志', '导出、导入、删除、恢复等操作都会记录在这里')
           }
           if (visibleLogs.length === 0) {
-            return h('div', { style: placeholderStyle }, '没有匹配的日志')
+            return renderPlaceholder('没有匹配的日志', '换个搜索词试试')
           }
           return h(
             'div',
@@ -1895,10 +1930,20 @@ window.__ModuleLoader__.load({
                 'div',
                 {
                   key: rowId !== '' ? rowId : `${entry && entry.at ? entry.at : ''}-${index}`,
+                  className: rowId !== '' ? 'sl-logrow' : undefined,
+                  role: rowId !== '' ? 'button' : undefined,
+                  tabIndex: rowId !== '' ? 0 : undefined,
                   style: rowId !== ''
                     ? { ...logsRowStyle, cursor: 'pointer' }
                     : logsRowStyle,
                   onClick: rowId !== '' ? () => toggleLogSelection(rowId) : undefined,
+                  onKeyDown: rowId !== ''
+                    ? (event) => {
+                        if (event.key !== 'Enter' && event.key !== ' ') return
+                        event.preventDefault()
+                        toggleLogSelection(rowId)
+                      }
+                    : undefined,
                 },
                 rowId !== ''
                   ? renderCheckbox(checked ? 'all' : 'none', () => toggleLogSelection(rowId), '勾选这条日志')
@@ -2726,6 +2771,25 @@ window.__ModuleLoader__.load({
           )
         }
 
+        /**
+         * Render a centred empty/loading placeholder.
+         *
+         * Two nodes at most, and only while the list is empty, so it costs
+         * nothing once rows exist.
+         *
+         * @param {string} title main line.
+         * @param {string | null} [hint] dim second line.
+         * @returns {object} React element.
+         */
+        function renderPlaceholder(title, hint) {
+          return h(
+            'div',
+            { style: placeholderStyle },
+            h('div', null, title),
+            hint ? h('div', { style: placeholderHintStyle }, hint) : null,
+          )
+        }
+
         const filterButton = (value, label, count) => h(
           'button',
           {
@@ -2910,7 +2974,7 @@ window.__ModuleLoader__.load({
         } else if (view === 'logs') {
           body = renderLogs()
         } else if (phase === 'loading') {
-          body = h('div', { style: placeholderStyle }, '正在读取会话…')
+          body = renderPlaceholder('正在读取会话…', null)
         } else if (phase === 'error') {
           body = h(
             'div',
@@ -2927,7 +2991,12 @@ window.__ModuleLoader__.load({
             ),
           )
         } else if (groups.length === 0) {
-          body = h('div', { style: placeholderStyle }, query.trim() !== '' ? '没有匹配的会话' : '还没有会话')
+          body = renderPlaceholder(
+            query.trim() !== '' ? '没有匹配的会话' : '还没有会话',
+            query.trim() !== ''
+              ? '换个搜索词，或切换筛选后再看'
+              : '在任意工作区里开始一个会话后，这里会按工作区分组列出',
+          )
         } else {
           body = groups.map(renderGroup)
         }
@@ -2987,7 +3056,7 @@ window.__ModuleLoader__.load({
                     'button',
                     {
                       type: 'button',
-                      className: 'sl-btn',
+                      className: 'sl-btn sl-dock-secondary',
                       style: dockSecondaryButtonStyle,
                       onClick: openImportDialog,
                     },
@@ -3051,7 +3120,7 @@ window.__ModuleLoader__.load({
                     'button',
                     {
                       type: 'button',
-                      className: 'sl-btn',
+                      className: 'sl-btn sl-dock-secondary',
                       style: dockSecondaryButtonStyle,
                       onClick: () => setClearLogsDialog(true),
                     },
@@ -3093,7 +3162,6 @@ window.__ModuleLoader__.load({
       padding: '8px 10px',
       border: 'none',
       borderRadius: 6,
-      background: 'transparent',
       color: 'inherit',
       font: 'inherit',
       fontSize: 13,
@@ -3119,7 +3187,13 @@ window.__ModuleLoader__.load({
       textOverflow: 'ellipsis',
       whiteSpace: 'nowrap',
     }
-    const groupCountStyle = { flex: '0 0 auto', fontSize: 12, fontWeight: 400, opacity: 0.6 }
+    const groupCountStyle = {
+      flex: '0 0 auto',
+      fontSize: 12,
+      fontWeight: 400,
+      opacity: 0.6,
+      fontVariantNumeric: 'tabular-nums',
+    }
     const groupTimeStyle = {
       flex: '0 0 auto',
       fontSize: 12,
@@ -3127,7 +3201,10 @@ window.__ModuleLoader__.load({
       opacity: 0.45,
       width: 72,
       textAlign: 'right',
+      fontVariantNumeric: 'tabular-nums',
     }
+    // Rows and group heads keep their background unset: the stylesheet owns the
+    // hover/press tint, and an inline "transparent" would outrank it.
     const rowStyle = {
       display: 'flex',
       alignItems: 'center',
@@ -3137,7 +3214,6 @@ window.__ModuleLoader__.load({
       padding: '7px 10px 7px 32px',
       border: 'none',
       borderRadius: 6,
-      background: 'transparent',
       color: 'inherit',
       font: 'inherit',
       fontSize: 13,
@@ -3150,7 +3226,15 @@ window.__ModuleLoader__.load({
       textOverflow: 'ellipsis',
       whiteSpace: 'nowrap',
     }
-    const sessionTimeStyle = { flex: '0 0 auto', fontSize: 12, opacity: 0.45, width: 72, textAlign: 'right' }
+    const sessionTimeStyle = {
+      flex: '0 0 auto',
+      fontSize: 12,
+      opacity: 0.45,
+      width: 72,
+      textAlign: 'right',
+      // Equal-width digits keep the time column from jittering between rows.
+      fontVariantNumeric: 'tabular-nums',
+    }
     // Inline row action (currently only "取消归档"): small, quiet and clearly
     // separate from the row's own click target.
     const rowActionStyle = {
@@ -3159,7 +3243,6 @@ window.__ModuleLoader__.load({
       padding: '0 9px',
       borderRadius: 999,
       border: '1px solid color-mix(in srgb, currentColor 30%, transparent)',
-      background: 'transparent',
       color: 'inherit',
       font: 'inherit',
       fontSize: 11,
@@ -3175,16 +3258,16 @@ window.__ModuleLoader__.load({
       border: '1px solid color-mix(in srgb, currentColor 24%, transparent)',
       opacity: 0.75,
     }
-    const checkboxStyle = (state) => ({
+    // Layout only: the border and fill live in the stylesheet, keyed off
+    // `aria-checked`, so the hover state is not blocked by an inline value.
+    const checkboxStyle = () => ({
       flex: '0 0 auto',
       width: 14,
       height: 14,
       display: 'inline-flex',
       alignItems: 'center',
       justifyContent: 'center',
-      borderRadius: 3,
-      border: '1px solid color-mix(in srgb, currentColor 38%, transparent)',
-      background: state === 'none' ? 'transparent' : 'color-mix(in srgb, currentColor 20%, transparent)',
+      borderRadius: 4,
       fontSize: 10,
       lineHeight: 1,
       cursor: 'pointer',
@@ -3196,7 +3279,6 @@ window.__ModuleLoader__.load({
       padding: '5px 10px',
       border: 'none',
       borderRadius: 6,
-      background: 'transparent',
       color: 'inherit',
       font: 'inherit',
       fontSize: 12,
@@ -3248,7 +3330,9 @@ window.__ModuleLoader__.load({
       padding: '4px 10px',
       border: 'none',
       borderRadius: 5,
-      background: active ? 'color-mix(in srgb, currentColor 14%, transparent)' : 'transparent',
+      // The active chip keeps its own fill; the inactive one leaves the
+      // background to the stylesheet so hover feedback can show through.
+      background: active ? 'color-mix(in srgb, currentColor 14%, transparent)' : undefined,
       color: 'inherit',
       font: 'inherit',
       fontSize: 12,
@@ -3261,7 +3345,6 @@ window.__ModuleLoader__.load({
       padding: '0 12px',
       borderRadius: 6,
       border: '1px solid color-mix(in srgb, currentColor 18%, transparent)',
-      background: 'transparent',
       color: 'inherit',
       font: 'inherit',
       fontSize: 12,
@@ -3316,6 +3399,7 @@ window.__ModuleLoader__.load({
       opacity: 0.5,
       width: 88,
       textAlign: 'right',
+      fontVariantNumeric: 'tabular-nums',
     }
     // Deletion timestamps are long enough to wrap inside the fixed meta column,
     // so they get their own single-line slot.
@@ -3388,7 +3472,6 @@ window.__ModuleLoader__.load({
       padding: '0 10px',
       borderRadius: 6,
       border: '1px solid color-mix(in srgb, currentColor 16%, transparent)',
-      background: 'transparent',
       color: 'inherit',
       font: 'inherit',
       fontSize: 12,
@@ -3454,6 +3537,9 @@ window.__ModuleLoader__.load({
       alignItems: 'center',
       justifyContent: 'flex-end',
       padding: '0 20px',
+      // A hairline edge keeps the strip readable when it floats over a row of
+      // similar brightness; the backdrop blur stays the only expensive effect.
+      border: '1px solid color-mix(in srgb, currentColor 7%, transparent)',
       backdropFilter: 'blur(8px)',
       WebkitBackdropFilter: 'blur(8px)',
       pointerEvents: 'none',
@@ -3470,13 +3556,13 @@ window.__ModuleLoader__.load({
       display: 'inline-flex',
       alignItems: 'center',
       justifyContent: 'center',
-      // Same fixed box as the export action so the dock reads as one row.
+      // Same fixed box as the export action so the dock reads as one row. The
+      // surface (background/border) comes from the `.sl-dock-secondary` class so
+      // hover and pressed states are not blocked by an inline value.
       width: 132,
       height: 38,
       padding: 0,
       borderRadius: 999,
-      border: '1px solid color-mix(in srgb, currentColor 22%, transparent)',
-      background: 'color-mix(in srgb, currentColor 8%, Canvas)',
       color: 'inherit',
       font: 'inherit',
       fontSize: 13,
@@ -3496,23 +3582,16 @@ window.__ModuleLoader__.load({
       height: 38,
       padding: 0,
       borderRadius: 999,
-      border: '1px solid color-mix(in srgb, currentColor 24%, transparent)',
-      background: 'color-mix(in srgb, currentColor 12%, Canvas)',
       color: 'inherit',
       font: 'inherit',
       fontSize: 13,
       fontWeight: 600,
-      boxShadow: '0 6px 20px rgba(0, 0, 0, 0.28)',
       cursor: 'pointer',
       pointerEvents: 'auto',
-      transition: 'opacity 0.15s ease, box-shadow 0.15s ease',
     }
-    const fabDisabledStyle = {
-      ...fabButtonStyle,
-      opacity: 0.45,
-      cursor: 'not-allowed',
-      boxShadow: 'none',
-    }
+    // The disabled look (dim, no shadow) comes from `.sl-fab:disabled`; the style
+    // object only has to stay layout-compatible.
+    const fabDisabledStyle = { ...fabButtonStyle }
     const overlayStyle = {
       position: 'fixed',
       inset: 0,
@@ -3592,7 +3671,14 @@ window.__ModuleLoader__.load({
       font: 'inherit',
       fontSize: 13,
     }
-    const placeholderStyle = { padding: '40px 10px', fontSize: 13, opacity: 0.55, textAlign: 'center' }
+    const placeholderStyle = {
+      padding: '56px 16px',
+      fontSize: 13,
+      opacity: 0.55,
+      textAlign: 'center',
+      lineHeight: 1.6,
+    }
+    const placeholderHintStyle = { marginTop: 6, fontSize: 12, opacity: 0.6 }
     const infoStyle = {
       fontSize: 12,
       lineHeight: 1.6,
