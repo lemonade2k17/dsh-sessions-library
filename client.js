@@ -3624,7 +3624,7 @@ window.__ModuleLoader__.load({
       // Same fixed box as the export action so the dock reads as one row. The
       // surface (background/border) comes from the `.sl-dock-secondary` class so
       // hover and pressed states are not blocked by an inline value.
-      width: 132,
+      width: 116,
       height: 38,
       padding: 0,
       borderRadius: 999,
@@ -3643,7 +3643,7 @@ window.__ModuleLoader__.load({
       justifyContent: 'center',
       // Fixed width: the label gains a count while selecting, and a growing
       // button reads as jitter next to the dock's other action.
-      width: 132,
+      width: 116,
       height: 38,
       padding: 0,
       borderRadius: 999,
