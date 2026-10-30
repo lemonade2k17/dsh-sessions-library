@@ -22,6 +22,7 @@ window.__ModuleLoader__.load({
     const LOGS_LIMIT = 500
     const DELETE_PROGRESS_PATH = 'api/sessions-library/delete-progress'
     const EXPORT_PATH = 'api/sessions-library/export'
+    const ATTACHMENT_PREFLIGHT_PATH = 'api/sessions-library/attachment-preflight'
     const IMPORT_LIST_PATH = 'api/sessions-library/import-list'
     const IMPORT_PREFLIGHT_PATH = 'api/sessions-library/import-preflight'
     const IMPORT_RUN_PATH = 'api/sessions-library/import-run'
@@ -1331,7 +1332,8 @@ window.__ModuleLoader__.load({
          * @returns {void}
          */
         function openExportDialog() {
-          if (selectedVisibleIds().length === 0) return
+          const ids = selectedVisibleIds()
+          if (ids.length === 0) return
           setExportDialog({
             phase: 'choose',
             path: '',
@@ -1340,7 +1342,38 @@ window.__ModuleLoader__.load({
             workspaceCount: 0,
             bytes: 0,
             error: null,
+            // Filled by the preflight below; the option only makes sense when the
+            // attachment store actually holds something for these sessions.
+            attachments: null,
+            includeAttachments: true,
           })
+          loadAttachmentPreflight(ids)
+        }
+
+        /**
+         * Count the attachment objects the selected sessions reference.
+         *
+         * @param {string[]} ids selected session ids.
+         * @returns {Promise<void>} resolution after the preview settled.
+         */
+        async function loadAttachmentPreflight(ids) {
+          try {
+            const payload = await postJson(ATTACHMENT_PREFLIGHT_PATH, { sessionIds: ids })
+            const count = Number(payload.count) || 0
+            const attachments = {
+              count,
+              bytes: Number(payload.bytes) || 0,
+              missing: Number(payload.missing) || 0,
+            }
+            setExportDialog((current) => (current && current.phase === 'choose'
+              ? { ...current, attachments, includeAttachments: count > 0 }
+              : current))
+          } catch {
+            // A failed preview only hides the option; it never blocks exporting.
+            setExportDialog((current) => (current && current.phase === 'choose'
+              ? { ...current, attachments: { count: 0, bytes: 0, missing: 0 } }
+              : current))
+          }
         }
 
         /**
@@ -1394,6 +1427,9 @@ window.__ModuleLoader__.load({
               sessionIds: ids,
               ...(targetDir !== '' ? { targetDir } : {}),
               ...(createDir === true ? { createDir: true } : {}),
+              ...(exportDialog !== null && exportDialog.includeAttachments === true
+                ? { includeAttachments: true }
+                : {}),
             })
             saveExportDir(targetDir)
             setExportDialog({
@@ -1402,6 +1438,9 @@ window.__ModuleLoader__.load({
               path: typeof payload.path === 'string' ? payload.path : '',
               sessionCount: Number(payload.sessionCount) || 0,
               workspaceCount: Number(payload.workspaceCount) || 0,
+              attachmentCount: Number(payload.attachmentCount) || 0,
+              attachmentBytes: Number(payload.attachmentBytes) || 0,
+              attachmentsSkipped: Number(payload.attachmentsSkipped) || 0,
               bytes: Number(payload.bytes) || 0,
               error: null,
             })
@@ -2553,7 +2592,10 @@ window.__ModuleLoader__.load({
                         + `${report.exportedAt ? ` · 导出时间 ${formatAbsolute(Date.parse(report.exportedAt))}` : ''}`
                         + ` · 会话 ${report.counts.sessions} 个（可导入 ${report.counts.importable} 个`
                         + `${report.counts.adoptable > 0 ? `，其中已归档 ${report.counts.adoptable} 个` : ''}`
-                        + `，冲突 ${report.counts.conflicts} 个）`,
+                        + `，冲突 ${report.counts.conflicts} 个）`
+                        + `${Number(report.counts.attachments) > 0
+                          ? ` · 附件 ${report.counts.attachments} 个（${((Number(report.counts.attachmentBytes) || 0) / 1048576).toFixed(2)} MB）`
+                          : ''}`,
                     ),
                     ...(report.warnings || []).map((warning, index) => h(
                       'div',
@@ -2640,6 +2682,16 @@ window.__ModuleLoader__.load({
                         + `，跳过 ${outcome.skipped} 个，失败 ${outcome.failed} 个。`
                         + `${outcome.imported > 0 || outcome.adopted > 0 ? '会话库已刷新，可在列表中查看。' : ''}`,
                     ),
+                    outcome.attachments && Number(outcome.attachments.restored) + Number(outcome.attachments.skipped) > 0
+                      ? h(
+                          'p',
+                          { style: dialogHintStyle },
+                          `附件已恢复 ${Number(outcome.attachments.restored) || 0} 个`
+                            + `（本地已存在 ${Number(outcome.attachments.skipped) || 0} 个）`
+                            + `${Number(outcome.attachments.failed) > 0 ? `，失败 ${outcome.attachments.failed} 个` : ''}，`
+                            + '会话历史中的附件引用会直接命中这些对象。',
+                        )
+                      : null,
                     outcome.results.some((result) => result.rewritten === true)
                       ? h(
                           'p',
@@ -2686,6 +2738,15 @@ window.__ModuleLoader__.load({
           const failed = phase === 'error'
           const bytes = Number(exportDialog.bytes) || 0
           const title = done ? '已导出会话' : failed ? '导出失败' : '导出会话'
+          const attachmentInfo = exportDialog.attachments || null
+          const attachmentCount = attachmentInfo ? Number(attachmentInfo.count) || 0 : 0
+          const includeAttachments = exportDialog.includeAttachments === true && attachmentCount > 0
+          const attachmentLabel = attachmentInfo === null
+            ? '正在统计所选会话的附件…'
+            : attachmentCount === 0
+              ? '所选会话没有引用的附件'
+              : `包含会话附件：${attachmentCount} 个 · ${((Number(attachmentInfo.bytes) || 0) / 1048576).toFixed(2)} MB`
+                + `${Number(attachmentInfo.missing) > 0 ? `（${attachmentInfo.missing} 个引用在本地已缺失）` : ''}`
           const actions = []
           if (choosing) {
             actions.push(h(
@@ -2756,6 +2817,21 @@ window.__ModuleLoader__.load({
                           )
                         : null,
                     ),
+                    h(
+                      'div',
+                      { style: exportAttachmentRowStyle },
+                      renderCheckbox(
+                        includeAttachments ? 'all' : 'none',
+                        () => {
+                          if (attachmentCount === 0) return
+                          setExportDialog((current) => (current
+                            ? { ...current, includeAttachments: current.includeAttachments !== true }
+                            : current))
+                        },
+                        '包含会话附件',
+                      ),
+                      h('span', { style: exportAttachmentLabelStyle }, attachmentLabel),
+                    ),
                   )
                 : null,
               busy
@@ -2772,10 +2848,20 @@ window.__ModuleLoader__.load({
                       'p',
                       { style: dialogHintStyle },
                       `已导出 ${exportDialog.sessionCount} 个会话（${(bytes / 1048576).toFixed(2)} MB），`
-                        + `包内包含 ${exportDialog.workspaceCount} 个工作区的信息（ID、路径、标题）。`,
+                        + `包内包含 ${exportDialog.workspaceCount} 个工作区的信息（ID、路径、标题）。`
+                        + (Number(exportDialog.attachmentCount) > 0
+                          ? `另外附带 ${exportDialog.attachmentCount} 个会话附件（${((Number(exportDialog.attachmentBytes) || 0) / 1048576).toFixed(2)} MB）。`
+                          : ''),
                     ),
+                    Number(exportDialog.attachmentsSkipped) > 0
+                      ? h(
+                          'p',
+                          { style: dialogHintStyle },
+                          `有 ${exportDialog.attachmentsSkipped} 个附件未能打包（本地缺失或超出体积上限），导入后对应内容可能不可用。`,
+                        )
+                      : null,
                     h('div', { style: exportPathStyle }, exportDialog.path),
-                    h('p', { style: dialogHintStyle }, '会话日志按原存储格式逐字节复制；导入功能尚未实现，这个包用于先备份或跨机器携带。'),
+                    h('p', { style: dialogHintStyle }, '会话日志按原存储格式逐字节复制；对方可用本插件的「导入会话」还原（附件会一并恢复）。'),
                   )
                 : null,
               actions.length > 0
@@ -3524,6 +3610,10 @@ window.__ModuleLoader__.load({
     }
     const exportChooserStyle = { margin: '4px 0 10px' }
     const exportChooserActionsStyle = { display: 'flex', gap: 8, marginTop: 8 }
+    // Attachment opt-in row: the checkbox keeps its 14px box, the label carries
+    // the count and size so the option is judged before exporting.
+    const exportAttachmentRowStyle = { display: 'flex', alignItems: 'center', gap: 8, marginTop: 12 }
+    const exportAttachmentLabelStyle = { fontSize: 12, opacity: 0.75, lineHeight: 1.5 }
     const importListStyle = {
       display: 'flex',
       flexDirection: 'column',
