@@ -2883,7 +2883,7 @@ window.__ModuleLoader__.load({
               style: actionButtonStyle,
               onClick: closeTrash,
             },
-            '← 返回会话库',
+            '返回会话库',
           ),
           h('input', {
             className: 'sl-input',
@@ -2928,7 +2928,7 @@ window.__ModuleLoader__.load({
               style: actionButtonStyle,
               onClick: closeLogs,
             },
-            '← 返回会话库',
+            '返回会话库',
           ),
           h('input', {
             className: 'sl-input',
