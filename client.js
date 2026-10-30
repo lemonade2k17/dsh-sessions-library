@@ -250,6 +250,12 @@ window.__ModuleLoader__.load({
 
     const CSS = [
       '.sl-root { position: relative; height: 100%; min-height: 0; display: flex; flex-direction: column; color: inherit; }',
+      // Status colours are the only non-neutral hues in this UI. They are declared
+      // once here so the light theme can use darker, readable variants: the
+      // original hexes clear 4.5:1 on the dark canvas but only reach 1.8–3.0:1 on
+      // white. Dark keeps the values it was tuned against.
+      '.sl-root { --sl-danger: #f06a6a; --sl-danger-text: #f08a8a; --sl-warn: #f0b37e; --sl-info: #6aa9f0; }',
+      'body:not([data-ds-dark-theme]) .sl-root { --sl-danger: #b3261e; --sl-danger-text: #b3261e; --sl-warn: #8a5300; --sl-info: #1a5fb4; }',
       '.sl-root * { box-sizing: border-box; }',
       '.sl-scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 4px 24px 106px; }',
       // One scrollbar treatment for the page and for every dialog scroll area.
@@ -280,8 +286,9 @@ window.__ModuleLoader__.load({
       '.sl-check { border: 1px solid color-mix(in srgb, currentColor 38%, transparent); background: transparent; }',
       '.sl-check[aria-checked="true"], .sl-check[aria-checked="mixed"] { border-color: color-mix(in srgb, currentColor 60%, transparent); background: color-mix(in srgb, currentColor 26%, transparent); }',
       '.sl-check:hover { border-color: color-mix(in srgb, currentColor 62%, transparent); }',
-      // Keyboard focus only: a click never draws these rings.
-      '.sl-row:focus-visible, .sl-group-head:focus-visible, .sl-check:focus-visible, .sl-btn:focus-visible, .sl-fab:focus-visible, .sl-logrow:focus-visible { outline: 2px solid color-mix(in srgb, currentColor 38%, transparent); outline-offset: 1px; }',
+      // Keyboard focus only: a click never draws these rings. 50% of the label
+      // colour keeps the ring above the 3:1 non-text contrast bar on white too.
+      '.sl-row:focus-visible, .sl-group-head:focus-visible, .sl-check:focus-visible, .sl-btn:focus-visible, .sl-fab:focus-visible, .sl-logrow:focus-visible { outline: 2px solid color-mix(in srgb, currentColor 50%, transparent); outline-offset: 1px; }',
       // Export dock backdrop: dark edges over a light theme, light edges over a
       // dark theme, so the strip stays visible in both palettes.
       '.sl-dock { background: linear-gradient(180deg, rgba(28, 32, 38, 0.04) 0%, rgba(110, 116, 126, 0.025) 26%, rgba(235, 238, 243, 0.015) 50%, rgba(110, 116, 126, 0.025) 74%, rgba(28, 32, 38, 0.04) 100%); }',
@@ -3356,8 +3363,8 @@ window.__ModuleLoader__.load({
       lineHeight: '16px',
       padding: '0 6px',
       borderRadius: 999,
-      border: '1px solid color-mix(in srgb, #f06a6a 55%, transparent)',
-      color: '#f08a8a',
+      border: '1px solid color-mix(in srgb, var(--sl-danger, #f06a6a) 55%, transparent)',
+      color: 'var(--sl-danger-text, #f08a8a)',
       opacity: 0.9,
     }
     // Neutral sibling of the blocked badge: the row is importable, it just needs
@@ -3378,8 +3385,8 @@ window.__ModuleLoader__.load({
       height: 30,
       padding: '0 12px',
       borderRadius: 6,
-      border: '1px solid color-mix(in srgb, #f06a6a 55%, transparent)',
-      background: 'color-mix(in srgb, #f06a6a 14%, transparent)',
+      border: '1px solid color-mix(in srgb, var(--sl-danger, #f06a6a) 55%, transparent)',
+      background: 'color-mix(in srgb, var(--sl-danger, #f06a6a) 14%, transparent)',
       color: 'inherit',
       font: 'inherit',
       fontSize: 12,
@@ -3656,16 +3663,16 @@ window.__ModuleLoader__.load({
       padding: '8px 10px',
       margin: '4px 0 10px',
       borderRadius: 6,
-      border: '1px solid color-mix(in srgb, #f0b37e 45%, transparent)',
-      color: '#f0b37e',
-      background: 'color-mix(in srgb, #f0b37e 10%, transparent)',
+      border: '1px solid color-mix(in srgb, var(--sl-warn, #f0b37e) 45%, transparent)',
+      color: 'var(--sl-warn, #f0b37e)',
+      background: 'color-mix(in srgb, var(--sl-warn, #f0b37e) 10%, transparent)',
     }
     const purgeInputStyle = {
       width: '100%',
       height: 32,
       padding: '0 10px',
       borderRadius: 6,
-      border: '1px solid color-mix(in srgb, #f06a6a 45%, transparent)',
+      border: '1px solid color-mix(in srgb, var(--sl-danger, #f06a6a) 45%, transparent)',
       background: 'transparent',
       color: 'inherit',
       font: 'inherit',
@@ -3685,9 +3692,9 @@ window.__ModuleLoader__.load({
       padding: '8px 10px',
       margin: '4px 0 10px',
       borderRadius: 6,
-      border: '1px solid color-mix(in srgb, #6aa9f0 45%, transparent)',
-      color: '#6aa9f0',
-      background: 'color-mix(in srgb, #6aa9f0 10%, transparent)',
+      border: '1px solid color-mix(in srgb, var(--sl-info, #6aa9f0) 45%, transparent)',
+      color: 'var(--sl-info, #6aa9f0)',
+      background: 'color-mix(in srgb, var(--sl-info, #6aa9f0) 10%, transparent)',
     }
     const dialogBlockerStyle = {
       fontSize: 12,
@@ -3695,16 +3702,16 @@ window.__ModuleLoader__.load({
       padding: '6px 8px',
       margin: '6px 0 2px',
       borderRadius: 6,
-      color: '#f0b37e',
-      background: 'color-mix(in srgb, #f0b37e 12%, transparent)',
+      color: 'var(--sl-warn, #f0b37e)',
+      background: 'color-mix(in srgb, var(--sl-warn, #f0b37e) 12%, transparent)',
       textAlign: 'left',
     }
     const warnStyle = {
       flex: '0 0 auto',
       padding: '6px 24px',
       fontSize: 12,
-      color: '#f0b37e',
-      background: 'color-mix(in srgb, #f0b37e 12%, transparent)',
+      color: 'var(--sl-warn, #f0b37e)',
+      background: 'color-mix(in srgb, var(--sl-warn, #f0b37e) 12%, transparent)',
     }
     const footerStyle = { flex: '0 0 auto', padding: '6px 24px', fontSize: 11, opacity: 0.35 }
 
