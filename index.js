@@ -69,7 +69,6 @@ const LOGS_CLEAR_PATH = '/api/sessions-library/logs-clear'
 const LOGS_DELETE_PATH = '/api/sessions-library/logs-delete'
 const DELETE_PROGRESS_PATH = '/api/sessions-library/delete-progress'
 const EXPORT_PATH = '/api/sessions-library/export'
-const ATTACHMENT_PREFLIGHT_PATH = '/api/sessions-library/attachment-preflight'
 const WORKSPACE_PREFLIGHT_PATH = '/api/sessions-library/workspace-preflight'
 const IMPORT_LIST_PATH = '/api/sessions-library/import-list'
 const IMPORT_PREFLIGHT_PATH = '/api/sessions-library/import-preflight'
@@ -1106,171 +1105,6 @@ function collectDirectoryEntries(root, prefix, entries, budget) {
     }
   }
   return used
-}
-
-// --- Session attachment support ---------------------------------------------
-
-/**
- * Collect the attachment objects one stored session references.
- *
- * References are content addressed (`sha256:<hex>`), so restoring identical
- * bytes on another machine reproduces the same id and the session history keeps
- * resolving them — no log rewriting is needed.
- *
- * @param {string} sessionDir session directory.
- * @returns {Array<{ id: string, hex: string, name: string | null, bytes: number, mediaType: string | null }>} unique references.
- */
-function collectSessionAttachmentRefs(sessionDir) {
-  const logFile = findSessionLogFile(sessionDir)
-  if (logFile === undefined) return []
-  let buffer = null
-  try {
-    buffer = readFileSync(logFile)
-  } catch {
-    return []
-  }
-  const refs = new Map()
-  let offset = 0
-  while (offset + 4 <= buffer.length) {
-    const rest = buffer.subarray(offset)
-    if (rest.readUInt32LE(0) !== 0xfd2fb528) break
-    let length = 0
-    try {
-      length = firstZstdFrameLength(rest)
-    } catch {
-      break
-    }
-    if (length <= 0 || offset + length > buffer.length) break
-    let text = ''
-    try {
-      text = zstdDecompressSync(buffer.subarray(offset, offset + length)).toString('utf8')
-    } catch {
-      break
-    }
-    for (const match of text.matchAll(/"attachment":(\{[^}]{0,400}\})/g)) {
-      let value = null
-      try {
-        value = JSON.parse(match[1])
-      } catch {
-        value = null
-      }
-      if (!value || typeof value.attachmentId !== 'string') continue
-      const hashed = /^sha256:([0-9a-f]{64})$/i.exec(value.attachmentId)
-      if (!hashed) continue
-      const hex = hashed[1].toLowerCase()
-      if (refs.has(hex)) continue
-      refs.set(hex, {
-        id: value.attachmentId,
-        hex,
-        name: typeof value.name === 'string' && value.name !== '' ? value.name : null,
-        bytes: typeof value.bytes === 'number' ? value.bytes : 0,
-        mediaType: typeof value.mediaType === 'string' ? value.mediaType : null,
-      })
-    }
-    offset += length
-  }
-  return [...refs.values()]
-}
-
-/**
- * List the attachment store's version directories (`v1`, `v2`, ...).
- *
- * @returns {string[]} version directory names, empty when the store is absent.
- */
-function attachmentVersionDirs() {
-  try {
-    return readdirSync(ATTACHMENTS_ROOT, { withFileTypes: true })
-      .filter((entry) => entry.isDirectory() && /^v\d+$/.test(entry.name))
-      .map((entry) => entry.name)
-  } catch {
-    return []
-  }
-}
-
-/**
- * Locate one attachment object inside the harness attachment store.
- *
- * The store keeps three layouts under a version directory, and the same id can
- * appear in more than one: `objects/` (normalized images), `file-objects/`
- * (verbatim bytes) and `files/<bucket>/<hex>/<display name>` (verbatim bytes
- * with their name).
- *
- * @param {{ hex: string, name: string | null, mediaType: string | null }} ref attachment reference.
- * @returns {{ path: string, relative: string } | null} host path and its path under the attachments root.
- */
-function findAttachmentObject(ref) {
-  const bucket = ref.hex.slice(0, 2)
-  const discovered = attachmentVersionDirs()
-  const versions = discovered.length > 0 ? discovered : ['v1']
-  const candidates = []
-  for (const version of versions) {
-    if (ref.mediaType !== null) candidates.push([version, 'objects', bucket, ref.hex])
-    candidates.push([version, 'file-objects', bucket, ref.hex])
-    if (ref.name !== null) candidates.push([version, 'files', bucket, ref.hex, ref.name])
-  }
-  for (const segments of candidates) {
-    const absolute = join(ATTACHMENTS_ROOT, ...segments)
-    try {
-      if (!statSync(absolute).isFile()) continue
-    } catch {
-      continue
-    }
-    return { path: absolute, relative: segments.join('/') }
-  }
-  // The named mirror may be the only copy left when the display name changed.
-  for (const version of versions) {
-    const namedDir = join(ATTACHMENTS_ROOT, version, 'files', bucket, ref.hex)
-    try {
-      const children = readdirSync(namedDir, { withFileTypes: true }).filter((entry) => entry.isFile())
-      if (children.length > 0) {
-        return {
-          path: join(namedDir, children[0].name),
-          relative: `${version}/files/${bucket}/${ref.hex}/${children[0].name}`,
-        }
-      }
-    } catch {
-      // No named mirror for this version: try the next one.
-    }
-  }
-  return null
-}
-
-/**
- * Resolve every attachment object the given sessions reference.
- *
- * @param {string[]} sessionIds session ids.
- * @returns {{ files: Array<object>, missing: Array<object>, totalBytes: number }} located objects and unresolved references.
- */
-function collectAttachmentsForSessions(sessionIds) {
-  const refs = new Map()
-  for (const id of sessionIds) {
-    const dir = findSessionDir(id)
-    if (dir === undefined) continue
-    for (const ref of collectSessionAttachmentRefs(dir)) {
-      if (!refs.has(ref.hex)) refs.set(ref.hex, ref)
-    }
-  }
-  const files = []
-  const missing = []
-  for (const ref of refs.values()) {
-    const located = findAttachmentObject(ref)
-    if (located === null) {
-      missing.push(ref)
-      continue
-    }
-    let bytes = ref.bytes
-    try {
-      bytes = statSync(located.path).size
-    } catch {
-      // Keep the size recorded in the session log.
-    }
-    files.push({ ...ref, bytes, path: located.path, relative: located.relative })
-  }
-  return {
-    files,
-    missing,
-    totalBytes: files.reduce((sum, file) => sum + file.bytes, 0),
-  }
 }
 
 // --- Workspace backup support -----------------------------------------------
@@ -3328,46 +3162,6 @@ async function exportSessions(ctx, rawIds, signal, options = {}) {
     if (item) workspaces.push({ workspaceId, path: item.path, title: item.title })
   }
 
-  // Optional attachments: the objects the exported sessions reference. The store
-  // is content addressed, so a restored copy resolves the same ids on the target
-  // machine. Anything above the remaining size budget is counted as skipped
-  // instead of silently producing a package with dangling references.
-  const attachments = []
-  let attachmentsSkipped = 0
-  if (options.includeAttachments === true) {
-    const collected = collectAttachmentsForSessions(selected)
-    attachmentsSkipped += collected.missing.length
-    for (const file of collected.files) {
-      if (totalBytes + file.bytes > EXPORT_MAX_BYTES) {
-        attachmentsSkipped += 1
-        continue
-      }
-      let data = null
-      try {
-        data = readFileSync(file.path)
-      } catch {
-        attachmentsSkipped += 1
-        continue
-      }
-      totalBytes += data.length
-      const zipPath = `attachments/${file.relative}`
-      entries.push({ name: zipPath, data })
-      attachments.push({
-        id: file.id,
-        name: file.name,
-        bytes: data.length,
-        mediaType: file.mediaType,
-        path: zipPath,
-      })
-    }
-    trace(
-      'export',
-      'attachments',
-      `included=${attachments.length} skipped=${attachmentsSkipped} ` +
-        `bytes=${attachments.reduce((sum, item) => sum + item.bytes, 0)}`,
-    )
-  }
-
   // Optional workspace backup (the user's "附件"): the files under each selected
   // session's workspace directory. Development artefacts are skipped, and the
   // caps keep one export from reading an unbounded tree.
@@ -3428,9 +3222,6 @@ async function exportSessions(ctx, rawIds, signal, options = {}) {
     // the target sessions root and reads workspace membership from here.
     workspaces,
     sessions,
-    // Present only when the exporter asked for attachments; each entry mirrors a
-    // member under `attachments/` and carries the content hash the log refers to.
-    ...(attachments.length > 0 ? { attachments } : {}),
     // Present only when the exporter asked for the workspace file backup; the
     // listing lets the importer report conflicts before writing anything.
     ...(workspaceFiles.length > 0 ? { workspaceFiles } : {}),
@@ -3469,9 +3260,6 @@ async function exportSessions(ctx, rawIds, signal, options = {}) {
     path: target,
     sessionCount: sessions.length,
     workspaceCount: workspaces.length,
-    attachmentCount: attachments.length,
-    attachmentBytes: attachments.reduce((sum, item) => sum + item.bytes, 0),
-    attachmentsSkipped,
     workspaceFileCount: workspaceFiles.reduce((sum, item) => sum + item.fileCount, 0),
     workspaceFileBytes: workspaceFiles.reduce((sum, item) => sum + item.bytes, 0),
     workspaceFilesSkipped,
@@ -3772,27 +3560,6 @@ export function apply(ctx) {
         },
       },
       {
-        path: ATTACHMENT_PREFLIGHT_PATH,
-        label: 'attachment-preflight',
-        handler: async (request) => {
-          const body = await readJsonBody(request)
-          const ids = normalizeIds(body.sessionIds)
-          const collected = collectAttachmentsForSessions(ids)
-          return jsonResponse({
-            ok: true,
-            count: collected.files.length,
-            bytes: collected.totalBytes,
-            missing: collected.missing.length,
-            items: collected.files.slice(0, 200).map((file) => ({
-              id: file.id,
-              name: file.name,
-              bytes: file.bytes,
-              mediaType: file.mediaType,
-            })),
-          })
-        },
-      },
-      {
         path: WORKSPACE_PREFLIGHT_PATH,
         label: 'workspace-preflight',
         handler: async (request) => {
@@ -3827,7 +3594,6 @@ export function apply(ctx) {
           const result = await exportSessions(ctx, body.sessionIds, request.signal, {
             targetDir: typeof body.targetDir === 'string' ? body.targetDir : undefined,
             createDir: body.createDir === true,
-            includeAttachments: body.includeAttachments === true,
             includeWorkspaceFiles: body.includeWorkspaceFiles === true,
           })
           return jsonResponse({ ok: true, ...result })

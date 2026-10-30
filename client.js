@@ -22,7 +22,6 @@ window.__ModuleLoader__.load({
     const LOGS_LIMIT = 500
     const DELETE_PROGRESS_PATH = 'api/sessions-library/delete-progress'
     const EXPORT_PATH = 'api/sessions-library/export'
-    const ATTACHMENT_PREFLIGHT_PATH = 'api/sessions-library/attachment-preflight'
     const WORKSPACE_PREFLIGHT_PATH = 'api/sessions-library/workspace-preflight'
     const IMPORT_LIST_PATH = 'api/sessions-library/import-list'
     const IMPORT_PREFLIGHT_PATH = 'api/sessions-library/import-preflight'
@@ -1343,33 +1342,22 @@ window.__ModuleLoader__.load({
             workspaceCount: 0,
             bytes: 0,
             error: null,
-            // Filled by the preflights below; an option only makes sense when the
-            // selection actually has something to include.
-            attachments: null,
+            // Filled by the preflight below; the option only shows once the walk
+            // actually found files to include.
             workspaceInfo: null,
-            includeAttachments: true,
             includeWorkspaceFiles: true,
           })
-          loadExportPreflights(ids)
+          loadExportPreflight(ids)
         }
 
         /**
-         * Read what the selected sessions would drag along: their referenced
-         * attachments and the files under their workspace directories.
+         * Read how many workspace files the selected sessions would carry.
          *
          * @param {string[]} ids selected session ids.
-         * @returns {Promise<void>} resolution after both previews settled.
+         * @returns {Promise<void>} resolution after the preview settled.
          */
-        async function loadExportPreflights(ids) {
-          const [attachmentResult, workspaceResult] = await Promise.all([
-            postJson(ATTACHMENT_PREFLIGHT_PATH, { sessionIds: ids }).catch(() => null),
-            postJson(WORKSPACE_PREFLIGHT_PATH, { sessionIds: ids }).catch(() => null),
-          ])
-          const attachments = {
-            count: attachmentResult ? Number(attachmentResult.count) || 0 : 0,
-            bytes: attachmentResult ? Number(attachmentResult.bytes) || 0 : 0,
-            missing: attachmentResult ? Number(attachmentResult.missing) || 0 : 0,
-          }
+        async function loadExportPreflight(ids) {
+          const workspaceResult = await postJson(WORKSPACE_PREFLIGHT_PATH, { sessionIds: ids }).catch(() => null)
           const workspaceInfo = {
             count: workspaceResult ? Number(workspaceResult.totalFiles) || 0 : 0,
             bytes: workspaceResult ? Number(workspaceResult.totalBytes) || 0 : 0,
@@ -1381,9 +1369,7 @@ window.__ModuleLoader__.load({
           setExportDialog((current) => (current && current.phase === 'choose'
             ? {
                 ...current,
-                attachments,
                 workspaceInfo,
-                includeAttachments: attachments.count > 0,
                 includeWorkspaceFiles: workspaceInfo.count > 0,
               }
             : current))
@@ -1440,9 +1426,6 @@ window.__ModuleLoader__.load({
               sessionIds: ids,
               ...(targetDir !== '' ? { targetDir } : {}),
               ...(createDir === true ? { createDir: true } : {}),
-              ...(exportDialog !== null && exportDialog.includeAttachments === true
-                ? { includeAttachments: true }
-                : {}),
               ...(exportDialog !== null && exportDialog.includeWorkspaceFiles === true
                 ? { includeWorkspaceFiles: true }
                 : {}),
@@ -1454,9 +1437,6 @@ window.__ModuleLoader__.load({
               path: typeof payload.path === 'string' ? payload.path : '',
               sessionCount: Number(payload.sessionCount) || 0,
               workspaceCount: Number(payload.workspaceCount) || 0,
-              attachmentCount: Number(payload.attachmentCount) || 0,
-              attachmentBytes: Number(payload.attachmentBytes) || 0,
-              attachmentsSkipped: Number(payload.attachmentsSkipped) || 0,
               workspaceFileCount: Number(payload.workspaceFileCount) || 0,
               workspaceFileBytes: Number(payload.workspaceFileBytes) || 0,
               workspaceFilesSkipped: Number(payload.workspaceFilesSkipped) || 0,
@@ -2612,11 +2592,8 @@ window.__ModuleLoader__.load({
                         + ` · 会话 ${report.counts.sessions} 个（可导入 ${report.counts.importable} 个`
                         + `${report.counts.adoptable > 0 ? `，其中已归档 ${report.counts.adoptable} 个` : ''}`
                         + `，冲突 ${report.counts.conflicts} 个）`
-                        + `${Number(report.counts.attachments) > 0
-                          ? ` · 附件 ${report.counts.attachments} 个（${((Number(report.counts.attachmentBytes) || 0) / 1048576).toFixed(2)} MB）`
-                          : ''}`
                         + `${Number(report.counts.workspaceFiles) > 0
-                          ? ` · 工作区文件 ${report.counts.workspaceFiles} 个（${((Number(report.counts.workspaceFileBytes) || 0) / 1048576).toFixed(2)} MB）`
+                          ? ` · 工作区附件 ${report.counts.workspaceFiles} 个（${((Number(report.counts.workspaceFileBytes) || 0) / 1048576).toFixed(2)} MB）`
                           : ''}`,
                     ),
                     ...(report.warnings || []).map((warning, index) => h(
@@ -2704,22 +2681,12 @@ window.__ModuleLoader__.load({
                         + `，跳过 ${outcome.skipped} 个，失败 ${outcome.failed} 个。`
                         + `${outcome.imported > 0 || outcome.adopted > 0 ? '会话库已刷新，可在列表中查看。' : ''}`,
                     ),
-                    outcome.attachments && Number(outcome.attachments.restored) + Number(outcome.attachments.skipped) > 0
-                      ? h(
-                          'p',
-                          { style: dialogHintStyle },
-                          `附件已恢复 ${Number(outcome.attachments.restored) || 0} 个`
-                            + `（本地已存在 ${Number(outcome.attachments.skipped) || 0} 个）`
-                            + `${Number(outcome.attachments.failed) > 0 ? `，失败 ${outcome.attachments.failed} 个` : ''}，`
-                            + '会话历史中的附件引用会直接命中这些对象。',
-                        )
-                      : null,
                     outcome.workspaceFiles
                       && Number(outcome.workspaceFiles.restored) + Number(outcome.workspaceFiles.skipped) > 0
                       ? h(
                           'p',
                           { style: dialogHintStyle },
-                          `工作区文件已恢复 ${Number(outcome.workspaceFiles.restored) || 0} 个`
+                          `工作区附件已恢复 ${Number(outcome.workspaceFiles.restored) || 0} 个`
                             + `（已存在 ${Number(outcome.workspaceFiles.skipped) || 0} 个则跳过，不覆盖）`
                             + `${Number(outcome.workspaceFiles.failed) > 0 ? `，失败 ${outcome.workspaceFiles.failed} 个` : ''}；`
                             + '未选择目标工作区的文件不会被写入。',
@@ -2771,15 +2738,6 @@ window.__ModuleLoader__.load({
           const failed = phase === 'error'
           const bytes = Number(exportDialog.bytes) || 0
           const title = done ? '已导出会话' : failed ? '导出失败' : '导出会话'
-          const attachmentInfo = exportDialog.attachments || null
-          const attachmentCount = attachmentInfo ? Number(attachmentInfo.count) || 0 : 0
-          const includeAttachments = exportDialog.includeAttachments === true && attachmentCount > 0
-          const attachmentLabel = attachmentInfo === null
-            ? '正在统计所选会话的附件…'
-            : attachmentCount === 0
-              ? '所选会话没有引用的附件'
-              : `包含会话附件：${attachmentCount} 个 · ${((Number(attachmentInfo.bytes) || 0) / 1048576).toFixed(2)} MB`
-                + `${Number(attachmentInfo.missing) > 0 ? `（${attachmentInfo.missing} 个引用在本地已缺失）` : ''}`
           const workspaceInfo = exportDialog.workspaceInfo || null
           const workspaceFileCount = workspaceInfo ? Number(workspaceInfo.count) || 0 : 0
           const includeWorkspaceFiles = exportDialog.includeWorkspaceFiles === true && workspaceFileCount > 0
@@ -2787,7 +2745,7 @@ window.__ModuleLoader__.load({
             ? '正在统计工作区文件…'
             : workspaceFileCount === 0
               ? '所选会话的工作区没有可备份的文件'
-              : `包含工作区文件：${workspaceFileCount} 个 · ${((Number(workspaceInfo.bytes) || 0) / 1048576).toFixed(2)} MB`
+              : `包含工作区附件（工作区目录下的文件）：${workspaceFileCount} 个 · ${((Number(workspaceInfo.bytes) || 0) / 1048576).toFixed(2)} MB`
                 + `${workspaceInfo.truncated ? '（已达上限，部分文件未包含）' : ''}`
                 + '（自动排除 node_modules、.git、dist、build 等目录）'
           const actions = []
@@ -2862,22 +2820,7 @@ window.__ModuleLoader__.load({
                     ),
                     h(
                       'div',
-                      { style: exportAttachmentRowStyle },
-                      renderCheckbox(
-                        includeAttachments ? 'all' : 'none',
-                        () => {
-                          if (attachmentCount === 0) return
-                          setExportDialog((current) => (current
-                            ? { ...current, includeAttachments: current.includeAttachments !== true }
-                            : current))
-                        },
-                        '包含会话附件',
-                      ),
-                      h('span', { style: exportAttachmentLabelStyle }, attachmentLabel),
-                    ),
-                    h(
-                      'div',
-                      { style: exportAttachmentRowStyle },
+                      { style: exportOptionRowStyle },
                       renderCheckbox(
                         includeWorkspaceFiles ? 'all' : 'none',
                         () => {
@@ -2886,9 +2829,9 @@ window.__ModuleLoader__.load({
                             ? { ...current, includeWorkspaceFiles: current.includeWorkspaceFiles !== true }
                             : current))
                         },
-                        '包含工作区文件',
+                        '包含工作区附件',
                       ),
-                      h('span', { style: exportAttachmentLabelStyle }, workspaceLabel),
+                      h('span', { style: exportOptionLabelStyle }, workspaceLabel),
                     ),
                   )
                 : null,
@@ -2907,23 +2850,19 @@ window.__ModuleLoader__.load({
                       { style: dialogHintStyle },
                       `已导出 ${exportDialog.sessionCount} 个会话（${(bytes / 1048576).toFixed(2)} MB），`
                         + `包内包含 ${exportDialog.workspaceCount} 个工作区的信息（ID、路径、标题）。`
-                        + (Number(exportDialog.attachmentCount) > 0
-                          ? `另外附带 ${exportDialog.attachmentCount} 个会话附件（${((Number(exportDialog.attachmentBytes) || 0) / 1048576).toFixed(2)} MB）。`
-                          : '')
                         + (Number(exportDialog.workspaceFileCount) > 0
-                          ? `工作区文件 ${exportDialog.workspaceFileCount} 个（${((Number(exportDialog.workspaceFileBytes) || 0) / 1048576).toFixed(2)} MB）也已打包。`
+                          ? `工作区附件 ${exportDialog.workspaceFileCount} 个（${((Number(exportDialog.workspaceFileBytes) || 0) / 1048576).toFixed(2)} MB）也已打包。`
                           : ''),
                     ),
-                    Number(exportDialog.attachmentsSkipped) > 0 || Number(exportDialog.workspaceFilesSkipped) > 0
+                    Number(exportDialog.workspaceFilesSkipped) > 0
                       ? h(
                           'p',
                           { style: dialogHintStyle },
-                          `有 ${Number(exportDialog.attachmentsSkipped) || 0} 个附件、`
-                            + `${Number(exportDialog.workspaceFilesSkipped) || 0} 处工作区文件未能打包（本地缺失或超出体积上限）。`,
+                          `有 ${Number(exportDialog.workspaceFilesSkipped) || 0} 处工作区文件未能打包（工作区不可用或超出体积上限）。`,
                         )
                       : null,
                     h('div', { style: exportPathStyle }, exportDialog.path),
-                    h('p', { style: dialogHintStyle }, '会话日志按原存储格式逐字节复制；对方可用本插件的「导入会话」还原（附件会一并恢复）。'),
+                    h('p', { style: dialogHintStyle }, '会话日志按原存储格式逐字节复制；对方可用本插件的「导入会话」还原，工作区附件会写回所选工作区目录。'),
                   )
                 : null,
               actions.length > 0
@@ -3674,8 +3613,8 @@ window.__ModuleLoader__.load({
     const exportChooserActionsStyle = { display: 'flex', gap: 8, marginTop: 8 }
     // Attachment opt-in row: the checkbox keeps its 14px box, the label carries
     // the count and size so the option is judged before exporting.
-    const exportAttachmentRowStyle = { display: 'flex', alignItems: 'center', gap: 8, marginTop: 12 }
-    const exportAttachmentLabelStyle = { fontSize: 12, opacity: 0.75, lineHeight: 1.5 }
+    const exportOptionRowStyle = { display: 'flex', alignItems: 'center', gap: 8, marginTop: 12 }
+    const exportOptionLabelStyle = { fontSize: 12, opacity: 0.75, lineHeight: 1.5 }
     const importListStyle = {
       display: 'flex',
       flexDirection: 'column',
