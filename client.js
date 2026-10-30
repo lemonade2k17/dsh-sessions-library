@@ -539,6 +539,13 @@ window.__ModuleLoader__.load({
         // The poll reads the current view without restarting its interval.
         const viewRef = React.useRef(view)
         viewRef.current = view
+        // Timestamp of the last successful read for the visible view; the
+        // activity-triggered sync uses it to avoid re-reading data that is
+        // already fresh.
+        const lastSyncRef = React.useRef(0)
+        // Root element, used to tell clicks inside this page from clicks in the
+        // native sidebar or another panel.
+        const rootRef = React.useRef(null)
 
         React.useEffect(() => {
           let cancelled = false
@@ -554,6 +561,7 @@ window.__ModuleLoader__.load({
                 : collectSessionIds(data).filter((id) => !previousIds.has(id)).length
               applyBootBoundary(data)
               cachedSnapshot = data
+              lastSyncRef.current = Date.now()
               setSnapshot(data)
               setAddedCount(added)
               setError(null)
@@ -575,12 +583,16 @@ window.__ModuleLoader__.load({
           }
         }, [reloadToken])
 
-        // Visible-page polling: archiving happens in the native sidebar, files
-        // move on other views, and the startup flush turns deferred deletions
-        // into real bin entries. The view that is on screen re-reads its data
-        // every 15s; hidden tabs pause and refresh once when they come back.
+        // Visible-page polling, plus an activity-triggered sync. The native
+        // sidebar archives and unarchives sessions outside this page and DSH
+        // emits no client event for it, so a click anywhere *outside* this page
+        // schedules one silent re-read (debounced so the sidebar action has
+        // landed, and rate-limited so a burst of input cannot hammer the Host).
+        // The slow interval stays as the safety net for changes made while the
+        // user does not touch the window at all.
         React.useEffect(() => {
           let timer = null
+          let activityTimer = null
           const isVisible = () => document.visibilityState !== 'hidden'
           const stop = () => {
             if (timer !== null) {
@@ -588,7 +600,7 @@ window.__ModuleLoader__.load({
               timer = null
             }
           }
-          const tick = () => {
+          const syncActiveView = () => {
             if (!isVisible()) return
             if (viewRef.current === 'trash') {
               // Silent: a poll must not flash the loading or error placeholder.
@@ -598,6 +610,38 @@ window.__ModuleLoader__.load({
             } else {
               setReloadToken((token) => token + 1)
             }
+          }
+          const tick = () => {
+            if (!isVisible()) return
+            syncActiveView()
+          }
+          const isInsidePage = (target) => {
+            const root = rootRef.current
+            if (!root || !target) return false
+            try {
+              return root.contains(target)
+            } catch {
+              return false
+            }
+          }
+          const scheduleSync = () => {
+            if (!isVisible()) return
+            if (activityTimer !== null) clearTimeout(activityTimer)
+            activityTimer = setTimeout(() => {
+              activityTimer = null
+              // Fresh data needs no re-read; this also absorbs double clicks.
+              if (Date.now() - lastSyncRef.current < 900) return
+              syncActiveView()
+            }, 450)
+          }
+          const onPointer = (event) => {
+            // Clicks inside this page already refresh what they change.
+            if (isInsidePage(event && event.target)) return
+            scheduleSync()
+          }
+          const onKey = (event) => {
+            if (isInsidePage(event && event.target)) return
+            scheduleSync()
           }
           const start = () => {
             if (timer !== null || !isVisible()) return
@@ -611,11 +655,19 @@ window.__ModuleLoader__.load({
               stop()
             }
           }
+          const onFocus = () => scheduleSync()
           start()
           document.addEventListener('visibilitychange', onVisibility)
+          document.addEventListener('pointerdown', onPointer, true)
+          document.addEventListener('keydown', onKey, true)
+          window.addEventListener('focus', onFocus)
           return () => {
             stop()
+            if (activityTimer !== null) clearTimeout(activityTimer)
             document.removeEventListener('visibilitychange', onVisibility)
+            document.removeEventListener('pointerdown', onPointer, true)
+            document.removeEventListener('keydown', onKey, true)
+            window.removeEventListener('focus', onFocus)
           }
         }, [])
 
@@ -984,6 +1036,7 @@ window.__ModuleLoader__.load({
               return next
             })
             setTrashPhase('ready')
+            lastSyncRef.current = Date.now()
           } catch (failure) {
             // A silent failure keeps the last good list instead of replacing it
             // with an error screen the user did not ask for.
@@ -1048,6 +1101,7 @@ window.__ModuleLoader__.load({
               return changed ? next : current
             })
             setLogsPhase('ready')
+            lastSyncRef.current = Date.now()
           } catch (failure) {
             if (silent) return
             setLogsPhase('error')
@@ -3017,7 +3071,7 @@ window.__ModuleLoader__.load({
 
         return h(
           'div',
-          { className: 'sl-root' },
+          { className: 'sl-root', ref: rootRef },
           h('style', null, CSS),
           h(
             'header',
