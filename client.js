@@ -283,7 +283,10 @@ window.__ModuleLoader__.load({
       '.sl-dock-secondary { border: 1px solid color-mix(in srgb, currentColor 22%, transparent); background: color-mix(in srgb, currentColor 8%, Canvas); transition: background-color 120ms ease, border-color 120ms ease; }',
       '.sl-dock-secondary:hover:not(:disabled) { background: color-mix(in srgb, currentColor 14%, Canvas); border-color: color-mix(in srgb, currentColor 30%, transparent); }',
       '.sl-dock-secondary:active:not(:disabled) { background: color-mix(in srgb, currentColor 17%, Canvas); }',
-      '.sl-check { border: 1px solid color-mix(in srgb, currentColor 38%, transparent); background: transparent; }',
+      '.sl-check { position: relative; border: 1px solid color-mix(in srgb, currentColor 38%, transparent); background: transparent; }',
+      // 5px transparent halo: the pointer target grows to 24x24 while the drawn
+      // box stays 14x14, so the row layout does not shift.
+      '.sl-check::before { content: ""; position: absolute; inset: -5px; border-radius: 6px; }',
       '.sl-check[aria-checked="true"], .sl-check[aria-checked="mixed"] { border-color: color-mix(in srgb, currentColor 60%, transparent); background: color-mix(in srgb, currentColor 26%, transparent); }',
       '.sl-check:hover { border-color: color-mix(in srgb, currentColor 62%, transparent); }',
       // Keyboard focus only: a click never draws these rings. 50% of the label
@@ -3271,6 +3274,7 @@ window.__ModuleLoader__.load({
       flex: '0 0 auto',
       width: 14,
       height: 14,
+      position: 'relative',
       display: 'inline-flex',
       alignItems: 'center',
       justifyContent: 'center',
