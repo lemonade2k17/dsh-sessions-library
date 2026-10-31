@@ -1253,6 +1253,85 @@ async function collectWorkspaceBackup(ctx, sessionIds, rawExclude) {
 }
 
 /**
+ * Wait until the session store lists a freshly written session.
+ *
+ * `workspace.attachSession` validates the session through the persistence
+ * listing before it records membership. That listing can lag a few hundred
+ * milliseconds behind the files an import just wrote, and attaching too early
+ * throws — which used to leave the imported session ungrouped forever.
+ *
+ * @param {object} ctx Cordis context.
+ * @param {string} sessionId session id.
+ * @param {number} [timeoutMs] how long to keep polling.
+ * @returns {Promise<boolean>} whether the store reported the session.
+ */
+async function waitForSessionVisibility(ctx, sessionId, timeoutMs = 3000) {
+  const persistence = ctx.get('sessionPersistence')
+  if (!persistence || typeof persistence.list !== 'function') return false
+  const deadline = Date.now() + timeoutMs
+  for (;;) {
+    try {
+      const snapshots = await persistence.list({})
+      if (Array.isArray(snapshots)
+        && snapshots.some((snapshot) => String(snapshot && snapshot.header && snapshot.header.id) === sessionId)) {
+        return true
+      }
+    } catch {
+      // A failed listing only means "not yet"; keep polling until the deadline.
+    }
+    if (Date.now() >= deadline) return false
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 150))
+  }
+}
+
+/**
+ * Attach one freshly written session to its target workspaces.
+ *
+ * Each workspace is tried twice: the first attempt often lands before the store
+ * can see the new session, and the retry runs after another visibility wait.
+ *
+ * @param {object} ctx Cordis context.
+ * @param {object | undefined} registry workspace registry service.
+ * @param {string} sessionId session id.
+ * @param {string[]} workspaceIds target workspace ids.
+ * @returns {Promise<{ attached: string[], errors: string[] }>} results.
+ */
+async function attachFreshSession(ctx, registry, sessionId, workspaceIds) {
+  const attached = []
+  const errors = []
+  if (!registry || typeof registry.get !== 'function' || workspaceIds.length === 0) {
+    return { attached, errors }
+  }
+  await waitForSessionVisibility(ctx, sessionId)
+  for (const workspaceId of workspaceIds) {
+    const workspace = registry.get(workspaceId)
+    if (!workspace || typeof workspace.attachSession !== 'function') {
+      errors.push(`工作区 ${workspaceId} 不可用`)
+      continue
+    }
+    let done = false
+    for (let attempt = 0; attempt < 2 && !done; attempt += 1) {
+      try {
+        await workspace.attachSession(sessionId)
+        attached.push(workspaceId)
+        done = true
+      } catch (error) {
+        if (attempt === 0) {
+          // Give the session listing another moment, then retry once.
+          await waitForSessionVisibility(ctx, sessionId, 1500)
+          continue
+        }
+        errors.push(describeError(error))
+      }
+    }
+  }
+  if (errors.length > 0) {
+    trace('import', 'attach-fail', `id=${sessionId} ${errors.join(' | ')}`)
+  }
+  return { attached, errors }
+}
+
+/**
  * Restore one package's workspace files into the mapped local workspaces.
  *
  * Existing files are never overwritten: a backup is additive, and a silent
@@ -2051,8 +2130,10 @@ async function adoptLocalSession(options) {
               await workspace.attachSession(id)
               attached.push(workspaceId)
             }
-          } catch {
-            // Membership is best effort; the session is already visible.
+          } catch (error) {
+            // Membership is best effort here, but never silent: the result
+            // warning reaches the import dialog.
+            warnings.push(`未能归入工作区 ${workspaceId}：${describeError(error)}`)
           }
         }
       }
@@ -2210,18 +2291,8 @@ async function importPackage(ctx, rawPath, rawMapping) {
         rewriteSessionHeaderCwd(logFile, targetCwd)
       }
 
-      const attached = []
-      for (const workspaceId of targetWorkspaceIds) {
-        try {
-          const workspace = registry && typeof registry.get === 'function' ? registry.get(workspaceId) : undefined
-          if (workspace && typeof workspace.attachSession === 'function') {
-            await workspace.attachSession(id)
-            attached.push(workspaceId)
-          }
-        } catch {
-          // Membership is best effort; the session still imports.
-        }
-      }
+      const attachOutcome = await attachFreshSession(ctx, registry, id, targetWorkspaceIds)
+      const attached = attachOutcome.attached
       // An imported session must never stay archived: an archived session is
       // hidden from the Native sidebar and from the library's default view, so
       // the user would see a successful import with nothing to show for it.
@@ -2244,6 +2315,10 @@ async function importPackage(ctx, rawPath, rawMapping) {
         unarchivedFromPackage: session.archived === true,
         rewritten: rewrite,
         cwd: targetCwd,
+        // Surfaced to the Client so a membership failure is never silent.
+        warning: attachOutcome.errors.length > 0
+          ? `未能归入目标工作区：${attachOutcome.errors.join('；')}`
+          : undefined,
       })
     } catch (error) {
       failed += 1
