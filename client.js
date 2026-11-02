@@ -1061,6 +1061,9 @@ window.__ModuleLoader__.load({
         function openTrash() {
           setView('trash')
           setTrashNotice(null)
+          // Leaving the library drops its selection: a selection made before a
+          // detour into the bin must not stay armed for a batch action on return.
+          setSelected({})
           // A fresh visit starts with nothing selected: a selection carried over
           // from an earlier visit would keep "永久删除" armed with stale intent.
           setTrashSelected({})
@@ -1124,6 +1127,8 @@ window.__ModuleLoader__.load({
         function openLogs() {
           setView('logs')
           setLogsError(null)
+          // Same rule as the bin: a library selection does not survive the trip.
+          setSelected({})
           setLogsQuery('')
           setLogsSort('newest')
           setLogsSelected({})
