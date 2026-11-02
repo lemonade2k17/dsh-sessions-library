@@ -1427,9 +1427,10 @@ window.__ModuleLoader__.load({
         /**
          * Open the exclusion browser at one workspace root.
          *
-         * The root is the workspace the selected sessions belong to, and the
-         * browser never climbs above it: exclusions only make sense inside a
-         * workspace, so "up" stops at the root.
+         * The first level is fetched *before* the dialog is mounted: opening with
+         * an empty list and filling it one frame later is what read as a flash.
+         * A slow disk still gets a loading frame after a short delay, so the click
+         * never looks ignored.
          *
          * @param {string} startPath initial directory (a workspace root).
          * @param {string[]} roots every workspace root of the current selection.
@@ -1438,17 +1439,40 @@ window.__ModuleLoader__.load({
         async function openExcludePicker(startPath, roots = []) {
           if (typeof startPath !== 'string' || startPath === '') return
           const availableRoots = Array.isArray(roots) && roots.length > 0 ? roots : [startPath]
-          setExcludePicker({
+          const base = {
             root: startPath,
             roots: availableRoots,
             path: startPath,
             parent: null,
             entries: [],
             truncated: false,
-            loading: true,
+            loading: false,
             error: null,
-          })
-          await browseExcludeDirectory(startPath)
+          }
+          let settled = false
+          const slowTimer = setTimeout(() => {
+            if (!settled) setExcludePicker({ ...base, loading: true })
+          }, 160)
+          try {
+            const payload = await postJson(WORKSPACE_BROWSE_PATH, { path: startPath, root: startPath })
+            settled = true
+            clearTimeout(slowTimer)
+            setExcludePicker({
+              ...base,
+              path: typeof payload.path === 'string' ? payload.path : startPath,
+              root: typeof payload.root === 'string' ? payload.root : startPath,
+              parent: typeof payload.parent === 'string' ? payload.parent : null,
+              entries: Array.isArray(payload.entries) ? payload.entries : [],
+              truncated: payload.truncated === true,
+            })
+          } catch (failure) {
+            settled = true
+            clearTimeout(slowTimer)
+            setExcludePicker({
+              ...base,
+              error: failure && failure.message ? failure.message : String(failure),
+            })
+          }
         }
 
         /**
@@ -4061,8 +4085,10 @@ window.__ModuleLoader__.load({
     }
     const exportPickerBarStyle = { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }
     const exportPickerCountStyle = { fontSize: 12, opacity: 0.55 }
+    // Fixed height: the dialog keeps its size while navigating between a folder
+    // with three entries and one with three hundred.
     const exportPickerListStyle = {
-      maxHeight: 260,
+      height: 260,
       overflow: 'auto',
       border: '1px solid color-mix(in srgb, currentColor 12%, transparent)',
       borderRadius: 6,
