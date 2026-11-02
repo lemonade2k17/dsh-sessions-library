@@ -3148,6 +3148,10 @@ window.__ModuleLoader__.load({
                 ? h('div', { style: dialogActionsStyle }, actions)
                 : null,
             ),
+            // The exclusion browser lives inside this overlay so the page keeps a
+            // single dim layer: a second full-screen scrim made the background
+            // darken again whenever the picker opened.
+            excludePicker !== null ? renderExcludePicker({ transparent: true }) : null,
           )
         }
 
@@ -3207,11 +3211,18 @@ window.__ModuleLoader__.load({
          * Picking a path only edits the export dialog's selection; the dialog is
          * re-previewed once the browser closes.
          *
+         * @param {{ transparent?: boolean }} [options] transparent overlay when the
+         *   browser is nested inside another dialog's scrim.
          * @returns {object | null} React element, or null when closed.
          */
-        function renderExcludePicker() {
+        function renderExcludePicker(options = {}) {
           const picker = excludePicker
           if (picker === null) return null
+          // Nested mode adds no scrim: the export overlay underneath already dims
+          // the page, and a second layer made it visibly darker.
+          const layerStyle = options.transparent === true
+            ? { ...overlayStyle, background: 'transparent' }
+            : overlayStyle
           const selection = exportDialog && Array.isArray(exportDialog.excludePaths)
             ? exportDialog.excludePaths
             : []
@@ -3246,7 +3257,7 @@ window.__ModuleLoader__.load({
           }
           return h(
             'div',
-            { style: overlayStyle },
+            { style: layerStyle },
             h(
               'div',
               { style: dialogStyle, onClick: (event) => event.stopPropagation() },
@@ -3731,7 +3742,9 @@ window.__ModuleLoader__.load({
           clearLogsDialog ? renderClearLogsDialog() : null,
           logsDeleteDialog !== null ? renderLogsDeleteDialog() : null,
           exportDialog !== null ? renderExportDialog() : null,
-          excludePicker !== null ? renderExcludePicker() : null,
+          // Normally nested inside the export overlay (single scrim); this fallback
+          // only matters if the picker were ever open without its parent dialog.
+          exportDialog === null && excludePicker !== null ? renderExcludePicker() : null,
           importDialog !== null ? renderImportDialog() : null,
           createDirPrompt !== null ? renderCreateDirPrompt() : null,
         )
