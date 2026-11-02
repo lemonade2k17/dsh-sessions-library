@@ -3211,6 +3211,15 @@ window.__ModuleLoader__.load({
           const relativeLabel = picker.root && picker.path && picker.path.length > picker.root.length
             ? `.${picker.path.slice(picker.root.length)}`
             : '（工作区根目录）'
+          // Select-all works on the current level: every row listed right now.
+          const listedPaths = picker.entries.map((entry) => entry.path)
+          const allListed = listedPaths.length > 0 && listedPaths.every((path) => selection.includes(path))
+          const toggleAllListed = () => {
+            const nextSelection = allListed
+              ? selection.filter((path) => !listedPaths.includes(path))
+              : [...selection, ...listedPaths.filter((path) => !selection.includes(path))]
+            setExportDialog((current) => (current ? { ...current, excludePaths: nextSelection } : current))
+          }
           return h(
             'div',
             { style: overlayStyle },
@@ -3254,6 +3263,18 @@ window.__ModuleLoader__.load({
                     onClick: () => { if (canGoUp) browseExcludeDirectory(picker.parent) },
                   },
                   '上一级',
+                ),
+                h(
+                  'button',
+                  {
+                    className: 'sl-btn',
+                    style: listedPaths.length === 0
+                      ? { ...actionButtonStyle, opacity: 0.45, cursor: 'not-allowed' }
+                      : actionButtonStyle,
+                    disabled: listedPaths.length === 0,
+                    onClick: toggleAllListed,
+                  },
+                  allListed ? '取消全选' : '全选',
                 ),
                 h(
                   'span',
@@ -3306,7 +3327,7 @@ window.__ModuleLoader__.load({
                 h(
                   'button',
                   { className: 'sl-btn', style: actionButtonStyle, onClick: closePicker },
-                  '完成',
+                  '确定',
                 ),
               ),
             ),
@@ -4009,11 +4030,10 @@ window.__ModuleLoader__.load({
     const exportOptionLabelStyle = { fontSize: 12, opacity: 0.75, lineHeight: 1.5 }
     const exportExcludeBlockStyle = { marginTop: 12 }
     const exportExcludeActionsStyle = { display: 'flex', gap: 8, marginTop: 6, marginBottom: 6 }
-    // Fixed-height scroll box for the chosen paths: it never grows with the
-    // selection, and its scrollbar uses the page-wide treatment.
+    // Fixed-height scroll box for the chosen paths: one item or ten, the box keeps
+    // the same footprint so the dialog does not jump while paths are picked.
     const exportExcludeListStyle = {
-      maxHeight: 104,
-      minHeight: 44,
+      height: 104,
       overflowY: 'auto',
       padding: '4px 2px',
       borderRadius: 6,
