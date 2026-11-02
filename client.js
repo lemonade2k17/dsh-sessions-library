@@ -1388,13 +1388,6 @@ window.__ModuleLoader__.load({
             workspaces: workspaceResult && Array.isArray(workspaceResult.workspaces)
               ? workspaceResult.workspaces
               : [],
-            // Names the Host actually matched on disk (built-in artefact dirs).
-            excludedNames: workspaceResult && Array.isArray(workspaceResult.excludedNames)
-              ? workspaceResult.excludedNames
-              : [],
-            builtinExclude: workspaceResult && Array.isArray(workspaceResult.builtinExclude)
-              ? workspaceResult.builtinExclude
-              : [],
           }
           setExportDialog((current) => (current && current.phase === 'choose'
             ? {
@@ -3058,16 +3051,8 @@ window.__ModuleLoader__.load({
                         style: exportExcludeTextStyle,
                         readOnly: true,
                         value: exportExcludePaths.join('\n'),
-                        placeholder: '尚未选择；内置排除（node_modules、.git、dist 等）始终生效',
+                        placeholder: '尚未选择；不选则打包工作区目录下的全部文件',
                       }),
-                      h(
-                        'div',
-                        { style: exportExcludeHintStyle },
-                        workspaceInfo === null
-                          ? '正在统计…'
-                          : `本次实际排除：${(workspaceInfo.excludedNames || []).join('、') || '（无）'}`
-                            + `${exportExcludePaths.length > 0 ? `；另外手动排除 ${exportExcludePaths.length} 项` : ''}`,
-                      ),
                     ),
                   )
                 : null,
@@ -3989,7 +3974,6 @@ window.__ModuleLoader__.load({
     const exportOptionRowStyle = { display: 'flex', alignItems: 'center', gap: 8, marginTop: 12 }
     const exportOptionLabelStyle = { fontSize: 12, opacity: 0.75, lineHeight: 1.5 }
     const exportExcludeBlockStyle = { marginTop: 12 }
-    const exportExcludeHintStyle = { marginTop: 4, fontSize: 11, opacity: 0.5, lineHeight: 1.4 }
     const exportExcludeActionsStyle = { display: 'flex', gap: 8, marginTop: 6, marginBottom: 6 }
     // Read-only overflow box listing the picked paths; a real textarea keeps the
     // scrollbar consistent with the other panels.
