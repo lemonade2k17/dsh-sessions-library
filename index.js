@@ -1179,8 +1179,11 @@ function walkWorkspaceDirectory(rootPath, excluded = WORKSPACE_BACKUP_EXCLUDED_D
       }
       if (!child.isFile()) continue
       let bytes = 0
+      let mtime = 0
       try {
-        bytes = statSync(absolute).size
+        const stats = statSync(absolute)
+        bytes = stats.size
+        mtime = Math.round(stats.mtimeMs)
       } catch {
         continue
       }
@@ -1189,7 +1192,9 @@ function walkWorkspaceDirectory(rootPath, excluded = WORKSPACE_BACKUP_EXCLUDED_D
         break
       }
       totalBytes += bytes
-      files.push({ relative, bytes, path: absolute })
+      // The modification time travels in the manifest so an import can decide
+      // "keep the newer file" without trusting the zip entry timestamp.
+      files.push({ relative, bytes, mtime, path: absolute })
     }
     if (truncated) break
   }
@@ -1334,17 +1339,25 @@ async function attachFreshSession(ctx, registry, sessionId, workspaceIds) {
 /**
  * Restore one package's workspace files into the mapped local workspaces.
  *
- * Existing files are never overwritten: a backup is additive, and a silent
- * overwrite could destroy newer work. Unmapped workspaces are reported instead.
+ * The conflict policy is chosen in the import dialog:
+ *   - `skip` (default) leaves every existing file untouched;
+ *   - `overwrite` replaces files whose path already exists;
+ *   - `newer` only replaces a file when the packaged copy is strictly newer,
+ *     using the modification times the exporter recorded in the manifest.
+ *
+ * Unmapped workspaces are reported instead of guessing a destination.
  *
  * @param {Map<string, Array<{ segments: string[], data: Buffer }>>} byWorkspace members per source workspace id.
  * @param {object} mapping source workspace id to local workspace id.
  * @param {object | undefined} registry workspace registry service.
- * @returns {{ restored: number, skipped: number, failed: number, bytes: number, workspaces: Array<object> }} counters and per-workspace results.
+ * @param {{ mode?: string, mtimes?: Map<string, Map<string, number>> }} [selection] conflict policy and packaged mtimes.
+ * @returns {{ restored: number, overwritten: number, skipped: number, failed: number, bytes: number, workspaces: Array<object> }} counters and per-workspace results.
  */
-function restoreWorkspaceFiles(byWorkspace, mapping, registry) {
-  const counters = { restored: 0, skipped: 0, failed: 0, bytes: 0, workspaces: [] }
+function restoreWorkspaceFiles(byWorkspace, mapping, registry, selection = {}) {
+  const counters = { restored: 0, overwritten: 0, skipped: 0, failed: 0, bytes: 0, workspaces: [] }
   if (!(byWorkspace instanceof Map) || byWorkspace.size === 0) return counters
+  const mode = selection.mode === 'overwrite' || selection.mode === 'newer' ? selection.mode : 'skip'
+  const mtimes = selection.mtimes instanceof Map ? selection.mtimes : new Map()
   for (const [sourceWorkspaceId, members] of byWorkspace) {
     const targetWorkspaceId = mapping[String(sourceWorkspaceId)]
     const workspace = typeof targetWorkspaceId === 'string' && registry && typeof registry.get === 'function'
@@ -1356,6 +1369,7 @@ function restoreWorkspaceFiles(byWorkspace, mapping, registry) {
         workspaceId: String(sourceWorkspaceId),
         status: 'unmapped',
         restored: 0,
+        overwritten: 0,
         skipped: 0,
         failed: 0,
       })
@@ -1363,7 +1377,9 @@ function restoreWorkspaceFiles(byWorkspace, mapping, registry) {
       continue
     }
     const root = resolve(targetRoot)
+    const packagedMtimes = mtimes.get(String(sourceWorkspaceId))
     let restored = 0
+    let overwritten = 0
     let skipped = 0
     let failed = 0
     let bytes = 0
@@ -1374,25 +1390,43 @@ function restoreWorkspaceFiles(byWorkspace, mapping, registry) {
         continue
       }
       try {
-        let exists = false
+        let existing = null
         try {
-          exists = statSync(target).isFile()
+          existing = statSync(target)
         } catch {
-          exists = false
+          existing = null
         }
-        if (exists) {
-          skipped += 1
+        // A directory in the way cannot be replaced by a file.
+        if (existing !== null && !existing.isFile()) {
+          failed += 1
           continue
+        }
+        if (existing !== null) {
+          const relative = member.segments.join('/')
+          const incoming = packagedMtimes instanceof Map ? packagedMtimes.get(relative) : undefined
+          if (mode === 'skip') {
+            skipped += 1
+            continue
+          }
+          if (mode === 'newer') {
+            // Without a packaged timestamp there is nothing to compare against.
+            if (typeof incoming !== 'number' || incoming <= 0 || existing.mtimeMs >= incoming) {
+              skipped += 1
+              continue
+            }
+          }
         }
         mkdirSync(dirname(target), { recursive: true })
         writeFileSync(target, member.data)
-        restored += 1
+        if (existing !== null) overwritten += 1
+        else restored += 1
         bytes += member.data.length
       } catch {
         failed += 1
       }
     }
     counters.restored += restored
+    counters.overwritten += overwritten
     counters.skipped += skipped
     counters.failed += failed
     counters.bytes += bytes
@@ -1401,6 +1435,7 @@ function restoreWorkspaceFiles(byWorkspace, mapping, registry) {
       targetWorkspaceId,
       status: 'restored',
       restored,
+      overwritten,
       skipped,
       failed,
     })
@@ -2165,9 +2200,10 @@ async function adoptLocalSession(options) {
  * @param {object} ctx Cordis context.
  * @param {any} rawPath package path.
  * @param {any} rawMapping source workspace id to local workspace id (or null).
+ * @param {{ workspaceConflict?: string }} [options] workspace-file conflict policy.
  * @returns {Promise<object>} per-session results and counters.
  */
-async function importPackage(ctx, rawPath, rawMapping) {
+async function importPackage(ctx, rawPath, rawMapping, options = {}) {
   const pkg = loadImportPackage(rawPath)
   const { manifest, entries } = pkg
   const { bySession, attachments, byWorkspace } = indexPackageEntries(entries)
@@ -2339,14 +2375,34 @@ async function importPackage(ctx, rawPath, rawMapping) {
   // are restored even when every session was skipped: the local copy may already
   // be missing its attachments.
   const restoredAttachments = restorePackageAttachments(attachments)
-  // Workspace files go into the mapped local workspace directory. Existing files
-  // are never overwritten: the backup only fills in what is missing.
-  const restoredWorkspaceFiles = restoreWorkspaceFiles(byWorkspace, mapping, registry)
+  // Workspace files go into the mapped local workspace directory. The conflict
+  // policy comes from the import dialog; `newer` compares against the packaged
+  // modification times recorded in the manifest.
+  const packagedMtimes = new Map()
+  for (const workspace of Array.isArray(manifest.workspaceFiles) ? manifest.workspaceFiles : []) {
+    const workspaceId = typeof workspace.workspaceId === 'string' ? workspace.workspaceId : ''
+    if (workspaceId === '') continue
+    const byPath = new Map()
+    for (const file of Array.isArray(workspace.files) ? workspace.files : []) {
+      if (!file || typeof file.name !== 'string') continue
+      if (typeof file.mtime !== 'number' || file.mtime <= 0) continue
+      byPath.set(file.name, file.mtime)
+    }
+    packagedMtimes.set(workspaceId, byPath)
+  }
+  const conflictMode = options.workspaceConflict === 'overwrite' || options.workspaceConflict === 'newer'
+    ? options.workspaceConflict
+    : 'skip'
+  const restoredWorkspaceFiles = restoreWorkspaceFiles(byWorkspace, mapping, registry, {
+    mode: conflictMode,
+    mtimes: packagedMtimes,
+  })
   trace(
     'import',
     'end',
     `imported=${imported} adopted=${adopted} skipped=${skipped} failed=${failed} `
-      + `attachments=${restoredAttachments.restored} workspaceFiles=${restoredWorkspaceFiles.restored}`,
+      + `attachments=${restoredAttachments.restored} workspaceFiles=${restoredWorkspaceFiles.restored} `
+      + `overwritten=${restoredWorkspaceFiles.overwritten} conflictMode=${conflictMode}`,
   )
   return {
     results,
@@ -3309,7 +3365,7 @@ async function exportSessions(ctx, rawIds, signal, options = {}) {
         }
         totalBytes += data.length
         entries.push({ name: `workspaces/${workspace.workspaceId}/${file.relative}`, data })
-        included.push({ name: file.relative, bytes: data.length })
+        included.push({ name: file.relative, bytes: data.length, mtime: file.mtime || 0 })
       }
       if (included.length === 0) continue
       workspaceFiles.push({
@@ -3751,7 +3807,9 @@ export function apply(ctx) {
         label: 'import-run',
         handler: async (request) => {
           const body = await readJsonBody(request)
-          const outcome = await importPackage(ctx, body.path, body.mapping)
+          const outcome = await importPackage(ctx, body.path, body.mapping, {
+            workspaceConflict: body.workspaceConflict,
+          })
           return jsonResponse({ ok: true, ...outcome })
         },
       },

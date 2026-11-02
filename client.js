@@ -1243,6 +1243,8 @@ window.__ModuleLoader__.load({
             ignored: [],
             report: null,
             mapping: {},
+            // Workspace-file conflict policy: skip | overwrite | newer.
+            workspaceConflict: 'skip',
             outcome: null,
             error: null,
           })
@@ -1353,18 +1355,27 @@ window.__ModuleLoader__.load({
           if (!importDialog || importDialog.phase !== 'preview') return
           const zipPath = importDialog.path
           const mapping = importDialog.mapping || {}
+          const workspaceConflict = importDialog.workspaceConflict === 'overwrite'
+            || importDialog.workspaceConflict === 'newer'
+            ? importDialog.workspaceConflict
+            : 'skip'
           setImportDialog((current) => (current ? { ...current, phase: 'importing', error: null } : current))
           try {
-            const payload = await postJson(IMPORT_RUN_PATH, { path: zipPath, mapping })
+            const payload = await postJson(IMPORT_RUN_PATH, { path: zipPath, mapping, workspaceConflict })
             setImportDialog((current) => (current
               ? {
                   ...current,
                   phase: 'done',
                   outcome: {
                     imported: Number(payload.imported) || 0,
+                    adopted: Number(payload.adopted) || 0,
                     skipped: Number(payload.skipped) || 0,
                     failed: Number(payload.failed) || 0,
                     results: Array.isArray(payload.results) ? payload.results : [],
+                    // Counters the result screen renders; dropping them used to
+                    // hide every workspace-file and attachment line.
+                    workspaceFiles: payload.workspaceFiles || null,
+                    attachments: payload.attachments || null,
                   },
                 }
               : current))
@@ -2747,6 +2758,42 @@ window.__ModuleLoader__.load({
                           )),
                         )
                       : null,
+                    report.workspaces.length > 0
+                      ? h(
+                          'div',
+                          { style: importConflictBlockStyle },
+                          h('div', { style: importSectionTitleStyle }, '工作区文件冲突处理'),
+                          h(
+                            'p',
+                            { style: dialogHintStyle },
+                            '目标工作区已有同名文件时怎么办（只影响工作区附件，不影响会话本身）：',
+                          ),
+                          h(
+                            'select',
+                            {
+                              className: 'sl-input',
+                              style: importConflictSelectStyle,
+                              value: importDialog.workspaceConflict || 'skip',
+                              onChange: (event) => setImportDialog((current) => (current
+                                ? { ...current, workspaceConflict: event.target.value }
+                                : current)),
+                            },
+                            h('option', { value: 'skip' }, '跳过：保留本地已有文件（默认）'),
+                            h('option', { value: 'overwrite' }, '覆盖：用包内文件替换本地文件'),
+                            h('option', { value: 'newer' }, '保留较新：仅当包内文件更新时覆盖'),
+                          ),
+                          importDialog.workspaceConflict === 'overwrite'
+                            ? h('div', { style: dialogBlockerStyle }, '覆盖不可撤销：本地已有的同名文件会被包内版本替换。')
+                            : null,
+                          importDialog.workspaceConflict === 'newer'
+                            ? h(
+                                'div',
+                                { style: dialogHintStyle },
+                                '按导出时记录的修改时间比较；旧包若没有记录时间，该文件会按“跳过”处理。',
+                              )
+                            : null,
+                        )
+                      : null,
                   )
                 : null,
 
@@ -2763,14 +2810,16 @@ window.__ModuleLoader__.load({
                         + `${outcome.imported > 0 || outcome.adopted > 0 ? '会话库已刷新，可在列表中查看。' : ''}`,
                     ),
                     outcome.workspaceFiles
-                      && Number(outcome.workspaceFiles.restored) + Number(outcome.workspaceFiles.skipped) > 0
+                      && Number(outcome.workspaceFiles.restored) + Number(outcome.workspaceFiles.overwritten)
+                        + Number(outcome.workspaceFiles.skipped) > 0
                       ? h(
                           'p',
                           { style: dialogHintStyle },
-                          `工作区附件已恢复 ${Number(outcome.workspaceFiles.restored) || 0} 个`
-                            + `（已存在 ${Number(outcome.workspaceFiles.skipped) || 0} 个则跳过，不覆盖）`
-                            + `${Number(outcome.workspaceFiles.failed) > 0 ? `，失败 ${outcome.workspaceFiles.failed} 个` : ''}；`
-                            + '未选择目标工作区的文件不会被写入。',
+                          `工作区附件：新增 ${Number(outcome.workspaceFiles.restored) || 0} 个`
+                            + `${Number(outcome.workspaceFiles.overwritten) > 0 ? `，覆盖 ${outcome.workspaceFiles.overwritten} 个` : ''}`
+                            + `${Number(outcome.workspaceFiles.skipped) > 0 ? `，跳过 ${outcome.workspaceFiles.skipped} 个` : ''}`
+                            + `${Number(outcome.workspaceFiles.failed) > 0 ? `，失败 ${outcome.workspaceFiles.failed} 个` : ''}`
+                            + '；未选择目标工作区的文件不会被写入。',
                         )
                       : null,
                     outcome.results.some((result) => result.rewritten === true)
@@ -3772,6 +3821,20 @@ window.__ModuleLoader__.load({
       overflow: 'hidden',
       textOverflow: 'ellipsis',
       whiteSpace: 'nowrap',
+    }
+    // Workspace-file conflict policy block: a full-width select plus its hint.
+    const importConflictBlockStyle = { marginTop: 14 }
+    const importConflictSelectStyle = {
+      width: '100%',
+      height: 30,
+      padding: '0 8px',
+      borderRadius: 6,
+      border: '1px solid color-mix(in srgb, currentColor 18%, transparent)',
+      background: 'Canvas',
+      color: 'inherit',
+      font: 'inherit',
+      fontSize: 12,
+      cursor: 'pointer',
     }
     const exportInputStyle = {
       width: '100%',
