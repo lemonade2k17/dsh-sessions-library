@@ -260,6 +260,13 @@ window.__ModuleLoader__.load({
       'body:not([data-ds-dark-theme]) .sl-root { --sl-danger: #b3261e; --sl-danger-text: #b3261e; --sl-warn: #8a5300; --sl-info: #1a5fb4; }',
       '.sl-root * { box-sizing: border-box; }',
       '.sl-scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 4px 24px 106px; }',
+      // Chosen exclusion paths: a fixed-height list with its own scrollbar, so a
+      // long selection stays readable instead of stretching the dialog.
+      '.sl-pathlist { scrollbar-gutter: stable; }',
+      '.sl-pathlist-row { display: flex; align-items: center; gap: 8px; padding: 2px 8px; font-size: 12px; line-height: 1.7; border-radius: 4px; }',
+      '.sl-pathlist-row:hover { background: color-mix(in srgb, currentColor 6%, transparent); }',
+      '.sl-pathlist-path { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }',
+      '.sl-pathlist-empty { padding: 8px; font-size: 12px; opacity: 0.5; }',
       // One scrollbar treatment for the page and for every dialog scroll area.
       '.sl-root ::-webkit-scrollbar { width: 10px; height: 10px; }',
       '.sl-root ::-webkit-scrollbar-thumb { background: color-mix(in srgb, currentColor 18%, transparent); border-radius: 8px; border: 3px solid transparent; background-clip: content-box; }',
@@ -2284,7 +2291,7 @@ window.__ModuleLoader__.load({
 
           return h(
             'div',
-            { style: overlayStyle, onClick: () => { if (dialog.phase !== 'busy') setDialog(null) } },
+            { style: overlayStyle },
             h(
               'div',
               { style: dialogStyle, onClick: (event) => event.stopPropagation() },
@@ -2412,7 +2419,7 @@ window.__ModuleLoader__.load({
 
           return h(
             'div',
-            { style: overlayStyle, onClick: () => { if (purgeDialog.phase !== 'busy') setPurgeDialog(null) } },
+            { style: overlayStyle },
             h(
               'div',
               { style: dialogStyle, onClick: (event) => event.stopPropagation() },
@@ -2484,7 +2491,7 @@ window.__ModuleLoader__.load({
         function renderClearLogsDialog() {
           return h(
             'div',
-            { style: overlayStyle, onClick: () => setClearLogsDialog(false) },
+            { style: overlayStyle },
             h(
               'div',
               { style: dialogStyle, onClick: (event) => event.stopPropagation() },
@@ -2522,7 +2529,7 @@ window.__ModuleLoader__.load({
           const count = Array.isArray(logsDeleteDialog.ids) ? logsDeleteDialog.ids.length : 0
           return h(
             'div',
-            { style: overlayStyle, onClick: () => { if (!busy) setLogsDeleteDialog(null) } },
+            { style: overlayStyle },
             h(
               'div',
               { style: dialogStyle, onClick: (event) => event.stopPropagation() },
@@ -2642,7 +2649,7 @@ window.__ModuleLoader__.load({
 
           return h(
             'div',
-            { style: overlayStyle, onClick: () => { if (!busy) setImportDialog(null) } },
+            { style: overlayStyle },
             h(
               'div',
               { style: dialogStyle, onClick: (event) => event.stopPropagation() },
@@ -2956,7 +2963,7 @@ window.__ModuleLoader__.load({
           }
           return h(
             'div',
-            { style: overlayStyle, onClick: () => { if (!busy) setExportDialog(null) } },
+            { style: overlayStyle },
             h(
               'div',
               { style: dialogStyle, onClick: (event) => event.stopPropagation() },
@@ -3046,13 +3053,40 @@ window.__ModuleLoader__.load({
                             )
                           : null,
                       ),
-                      h('textarea', {
-                        className: 'sl-input',
-                        style: exportExcludeTextStyle,
-                        readOnly: true,
-                        value: exportExcludePaths.join('\n'),
-                        placeholder: '尚未选择；不选则打包工作区目录下的全部文件',
-                      }),
+                      h(
+                        'div',
+                        {
+                          className: 'sl-pathlist',
+                          style: exportExcludeListStyle,
+                          role: 'list',
+                        },
+                        exportExcludePaths.length === 0
+                          ? h('div', { className: 'sl-pathlist-empty' }, '尚未选择；不选则打包工作区目录下的全部文件')
+                          : exportExcludePaths.map((excludedPath) => h(
+                              'div',
+                              { key: excludedPath, className: 'sl-pathlist-row', role: 'listitem' },
+                              h('span', { className: 'sl-pathlist-path', title: excludedPath }, excludedPath),
+                              h(
+                                'button',
+                                {
+                                  className: 'sl-btn',
+                                  style: exportPathRemoveStyle,
+                                  onClick: () => {
+                                    // Remove one entry: the state and the preview
+                                    // both have to follow, so compute the next
+                                    // list once and feed it to both.
+                                    const nextPaths = exportExcludePaths.filter((entry) => entry !== excludedPath)
+                                    setExportDialog((current) => (current
+                                      ? { ...current, excludePaths: nextPaths }
+                                      : current))
+                                    const ids = selectedVisibleIds()
+                                    if (ids.length > 0) loadExportPreflight(ids, nextPaths)
+                                  },
+                                },
+                                '移除',
+                              ),
+                            )),
+                      ),
                     ),
                   )
                 : null,
@@ -3104,7 +3138,7 @@ window.__ModuleLoader__.load({
             : ''
           return h(
             'div',
-            { style: overlayStyle, onClick: () => setCreateDirPrompt(null) },
+            { style: overlayStyle },
             h(
               'div',
               { style: dialogStyle, onClick: (event) => event.stopPropagation() },
@@ -3179,7 +3213,7 @@ window.__ModuleLoader__.load({
             : '（工作区根目录）'
           return h(
             'div',
-            { style: overlayStyle, onClick: closePicker },
+            { style: overlayStyle },
             h(
               'div',
               { style: dialogStyle, onClick: (event) => event.stopPropagation() },
@@ -3975,22 +4009,26 @@ window.__ModuleLoader__.load({
     const exportOptionLabelStyle = { fontSize: 12, opacity: 0.75, lineHeight: 1.5 }
     const exportExcludeBlockStyle = { marginTop: 12 }
     const exportExcludeActionsStyle = { display: 'flex', gap: 8, marginTop: 6, marginBottom: 6 }
-    // Read-only overflow box listing the picked paths; a real textarea keeps the
-    // scrollbar consistent with the other panels.
-    const exportExcludeTextStyle = {
-      width: '100%',
-      minHeight: 58,
-      maxHeight: 96,
-      padding: '6px 8px',
+    // Fixed-height scroll box for the chosen paths: it never grows with the
+    // selection, and its scrollbar uses the page-wide treatment.
+    const exportExcludeListStyle = {
+      maxHeight: 104,
+      minHeight: 44,
+      overflowY: 'auto',
+      padding: '4px 2px',
       borderRadius: 6,
-      border: '1px solid color-mix(in srgb, currentColor 18%, transparent)',
+      border: '1px solid color-mix(in srgb, currentColor 16%, transparent)',
       background: 'Canvas',
+    }
+    const exportPathRemoveStyle = {
+      flex: '0 0 auto',
+      padding: '1px 6px',
+      fontSize: 11,
+      borderRadius: 4,
+      border: '1px solid color-mix(in srgb, currentColor 18%, transparent)',
+      background: 'transparent',
       color: 'inherit',
-      font: 'inherit',
-      fontSize: 12,
-      lineHeight: 1.5,
-      resize: 'vertical',
-      overflow: 'auto',
+      cursor: 'pointer',
     }
     // Exclusion browser (directory list) styles.
     const exportPickerPathStyle = {
