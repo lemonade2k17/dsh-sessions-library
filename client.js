@@ -1427,29 +1427,57 @@ window.__ModuleLoader__.load({
         /**
          * Open the exclusion browser at one workspace root.
          *
-         * @param {string} startPath initial directory.
+         * The root is the workspace the selected sessions belong to, and the
+         * browser never climbs above it: exclusions only make sense inside a
+         * workspace, so "up" stops at the root.
+         *
+         * @param {string} startPath initial directory (a workspace root).
+         * @param {string[]} roots every workspace root of the current selection.
          * @returns {Promise<void>} resolution after the first listing arrived.
          */
-        async function openExcludePicker(startPath) {
+        async function openExcludePicker(startPath, roots = []) {
           if (typeof startPath !== 'string' || startPath === '') return
-          setExcludePicker({ path: startPath, parent: null, entries: [], truncated: false, loading: true, error: null })
+          const availableRoots = Array.isArray(roots) && roots.length > 0 ? roots : [startPath]
+          setExcludePicker({
+            root: startPath,
+            roots: availableRoots,
+            path: startPath,
+            parent: null,
+            entries: [],
+            truncated: false,
+            loading: true,
+            error: null,
+          })
           await browseExcludeDirectory(startPath)
         }
 
         /**
          * Read one directory level for the exclusion browser.
          *
+         * The previous entries stay on screen while the next level loads, so
+         * navigating does not flash an empty list.
+         *
          * @param {string} target absolute directory path.
+         * @param {string} [rootOverride] workspace root to switch to.
          * @returns {Promise<void>} resolution after the listing arrived.
          */
-        async function browseExcludeDirectory(target) {
-          setExcludePicker((current) => (current ? { ...current, loading: true, error: null } : current))
+        async function browseExcludeDirectory(target, rootOverride) {
+          const root = typeof rootOverride === 'string' && rootOverride !== ''
+            ? rootOverride
+            : (excludePicker && typeof excludePicker.root === 'string' ? excludePicker.root : '')
+          setExcludePicker((current) => (current
+            ? { ...current, root: root || current.root, loading: true, error: null }
+            : current))
           try {
-            const payload = await postJson(WORKSPACE_BROWSE_PATH, { path: target })
+            const payload = await postJson(WORKSPACE_BROWSE_PATH, {
+              path: target,
+              ...(root !== '' ? { root } : {}),
+            })
             setExcludePicker((current) => (current
               ? {
                   ...current,
                   path: typeof payload.path === 'string' ? payload.path : target,
+                  root: typeof payload.root === 'string' ? payload.root : current.root,
                   parent: typeof payload.parent === 'string' ? payload.parent : null,
                   entries: Array.isArray(payload.entries) ? payload.entries : [],
                   truncated: payload.truncated === true,
@@ -3005,7 +3033,7 @@ window.__ModuleLoader__.load({
                             className: 'sl-btn',
                             style: actionButtonStyle,
                             disabled: exportExcludeRoots.length === 0,
-                            onClick: () => openExcludePicker(exportExcludeRoots[0]),
+                            onClick: () => openExcludePicker(exportExcludeRoots[0], exportExcludeRoots),
                           },
                           '选择要排除的目录或文件…',
                         ),
@@ -3144,7 +3172,12 @@ window.__ModuleLoader__.load({
           const selection = exportDialog && Array.isArray(exportDialog.excludePaths)
             ? exportDialog.excludePaths
             : []
+          const roots = Array.isArray(picker.roots) ? picker.roots : []
+          // The Host already reports no parent at the workspace root; keep the
+          // button disabled there so the browse cannot leave the workspace.
           const canGoUp = typeof picker.parent === 'string' && picker.parent !== ''
+          const atRoot = typeof picker.path === 'string' && typeof picker.root === 'string'
+            && picker.path.toLowerCase() === picker.root.toLowerCase()
           const closePicker = () => {
             setExcludePicker(null)
             refreshExcludePreview()
@@ -3155,6 +3188,10 @@ window.__ModuleLoader__.load({
             if (bytes >= 1024) return `${Math.round(bytes / 1024)} KB`
             return `${bytes} B`
           }
+          // Show the path relative to the workspace root, so it stays short.
+          const relativeLabel = picker.root && picker.path && picker.path.length > picker.root.length
+            ? `.${picker.path.slice(picker.root.length)}`
+            : '（工作区根目录）'
           return h(
             'div',
             { style: overlayStyle, onClick: closePicker },
@@ -3167,7 +3204,23 @@ window.__ModuleLoader__.load({
                 { style: dialogHintStyle },
                 '勾选目录会排除它下面的全部内容；勾选文件只排除该文件。选择只对本次导出有效。',
               ),
-              h('div', { style: exportPickerPathStyle }, picker.path),
+              roots.length > 1
+                ? h(
+                    'select',
+                    {
+                      className: 'sl-input',
+                      style: importConflictSelectStyle,
+                      value: picker.root,
+                      onChange: (event) => browseExcludeDirectory(event.target.value, event.target.value),
+                    },
+                    roots.map((root) => h('option', { key: root, value: root }, root)),
+                  )
+                : null,
+              h(
+                'div',
+                { style: exportPickerPathStyle, title: picker.path },
+                `${relativeLabel}　·　${picker.root}`,
+              ),
               h(
                 'div',
                 { style: exportPickerBarStyle },
@@ -3183,7 +3236,11 @@ window.__ModuleLoader__.load({
                   },
                   '上一级',
                 ),
-                h('span', { style: exportPickerCountStyle }, `已选 ${selection.length} 项`),
+                h(
+                  'span',
+                  { style: exportPickerCountStyle },
+                  atRoot ? `已到工作区根目录 · 已选 ${selection.length} 项` : `已选 ${selection.length} 项`,
+                ),
               ),
               picker.error !== null
                 ? h('div', { style: dialogBlockerStyle }, `读取目录失败：${picker.error}`)
@@ -3191,7 +3248,9 @@ window.__ModuleLoader__.load({
               h(
                 'div',
                 { style: exportPickerListStyle },
-                picker.loading
+                // Keep the previous rows visible while the next level loads: a
+                // blank list on every click reads as a flicker.
+                picker.entries.length === 0 && picker.loading
                   ? h('div', { style: dialogHintStyle }, '正在读取目录…')
                   : picker.entries.length === 0
                     ? h('div', { style: dialogHintStyle }, '这个目录是空的')

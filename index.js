@@ -1157,11 +1157,24 @@ function pathKey(value) {
 /**
  * List one directory level for the exclusion picker.
  *
+ * The listing never escapes the workspace root the picker was opened for: the
+ * exclusion only makes sense inside a workspace, so `root` is enforced here as
+ * well as in the Client.
+ *
  * @param {string} rawPath absolute directory path.
- * @returns {{ path: string, parent: string | null, truncated: boolean, entries: Array<{ name: string, path: string, isDirectory: boolean, bytes: number, hidden: boolean }> }} listing.
+ * @param {string} [rawRoot] absolute workspace root the browsing is limited to.
+ * @returns {{ path: string, root: string, parent: string | null, truncated: boolean, entries: Array<{ name: string, path: string, isDirectory: boolean, bytes: number, hidden: boolean }> }} listing.
  */
-function listDirectoryLevel(rawPath) {
+function listDirectoryLevel(rawPath, rawRoot) {
   const target = resolve(rawPath)
+  const root = typeof rawRoot === 'string' && rawRoot.trim() !== '' ? resolve(rawRoot) : ''
+  if (root !== '') {
+    const targetKey = pathKey(target)
+    const rootKey = pathKey(root)
+    if (targetKey !== rootKey && !targetKey.startsWith(`${rootKey}${sep}`)) {
+      throw new Error('不能超出工作区目录浏览')
+    }
+  }
   let stats = null
   try {
     stats = statSync(target)
@@ -1210,9 +1223,13 @@ function listDirectoryLevel(rawPath) {
     return left.name.localeCompare(right.name)
   })
   const parent = dirname(target)
+  // `parent` is only reported while it stays inside the root, so the Client can
+  // disable "go up" instead of letting the browse leave the workspace.
+  const atRoot = root !== '' && pathKey(target) === pathKey(root)
   return {
     path: target,
-    parent: parent === target ? null : parent,
+    root: root !== '' ? root : target,
+    parent: atRoot || parent === target ? null : parent,
     truncated,
     entries,
   }
@@ -3867,7 +3884,8 @@ export function apply(ctx) {
             ? body.path.trim()
             : ''
           if (target === '') throw new Error('请提供一个目录路径')
-          return jsonResponse({ ok: true, ...listDirectoryLevel(target) })
+          const root = typeof body.root === 'string' ? body.root.trim() : ''
+          return jsonResponse({ ok: true, ...listDirectoryLevel(target, root) })
         },
       },
       {
