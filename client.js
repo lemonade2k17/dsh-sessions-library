@@ -27,55 +27,7 @@ window.__ModuleLoader__.load({
     const IMPORT_PREFLIGHT_PATH = 'api/sessions-library/import-preflight'
     const IMPORT_RUN_PATH = 'api/sessions-library/import-run'
     const EXPORT_DIR_STORAGE_KEY = 'dsh-sessions-library:export-dir'
-    const EXCLUDE_DIRS_STORAGE_KEY = 'dsh-sessions-library:exclude-dirs'
-    // Mirrors the Host default so a fresh install shows the same list it applies.
-    const DEFAULT_EXCLUDE_DIRS = 'node_modules, .git, dist, build, out, target, coverage, .next, .nuxt, .cache, .venv, venv, __pycache__'
-
-    /**
-     * Split an edited exclusion list into directory names.
-     *
-     * @param {string} text raw input.
-     * @returns {string[]} trimmed names.
-     */
-    function parseExcludeDirs(text) {
-      if (typeof text !== 'string') return []
-      return text
-        .split(/[,;，；\s]+/)
-        .map((part) => part.trim())
-        .filter((part) => part !== '')
-    }
-
-    /**
-     * Read the saved exclusion list, falling back to the defaults.
-     *
-     * @returns {string} comma separated directory names.
-     */
-    function loadExcludeDirs() {
-      try {
-        const stored = window.localStorage.getItem(EXCLUDE_DIRS_STORAGE_KEY)
-        return typeof stored === 'string' ? stored : DEFAULT_EXCLUDE_DIRS
-      } catch {
-        return DEFAULT_EXCLUDE_DIRS
-      }
-    }
-
-    /**
-     * Remember an edited exclusion list.
-     *
-     * @param {string} text comma separated directory names.
-     */
-    function saveExcludeDirs(text) {
-      try {
-        const trimmed = typeof text === 'string' ? text.trim() : ''
-        if (trimmed === '' || trimmed === DEFAULT_EXCLUDE_DIRS) {
-          window.localStorage.removeItem(EXCLUDE_DIRS_STORAGE_KEY)
-        } else {
-          window.localStorage.setItem(EXCLUDE_DIRS_STORAGE_KEY, trimmed)
-        }
-      } catch {
-        // Remembering the list is cosmetic.
-      }
-    }
+    const WORKSPACE_BROWSE_PATH = 'api/sessions-library/workspace-browse'
 
     /**
      * Read the last chosen export directory.
@@ -569,10 +521,9 @@ window.__ModuleLoader__.load({
         const [logsDeleteDialog, setLogsDeleteDialog] = React.useState(null)
         const [exportDialog, setExportDialog] = React.useState(null)
         const [exportTarget, setExportTarget] = React.useState(loadExportDir)
-        // Editable directory exclusion list for the workspace backup; persisted so
-        // the user does not retype it for every export.
-        const [excludeDirs, setExcludeDirs] = React.useState(loadExcludeDirs)
-        const excludeTimerRef = React.useRef(null)
+        // Directory browser used to pick paths excluded from the workspace backup.
+        // Its selection lives in the export dialog, so it resets every export.
+        const [excludePicker, setExcludePicker] = React.useState(null)
         // Non-null while asking whether a missing export folder should be created.
         const [createDirPrompt, setCreateDirPrompt] = React.useState(null)
         // Import wizard state: source → preview (with mapping) → done.
@@ -1398,6 +1349,7 @@ window.__ModuleLoader__.load({
         function openExportDialog() {
           const ids = selectedVisibleIds()
           if (ids.length === 0) return
+          setExcludePicker(null)
           setExportDialog({
             phase: 'choose',
             path: '',
@@ -1410,22 +1362,24 @@ window.__ModuleLoader__.load({
             // actually found files to include.
             workspaceInfo: null,
             includeWorkspaceFiles: true,
-            excludeText: excludeDirs,
+            // One-off selection: it lives only in this dialog instance, so every
+            // new export starts with nothing excluded by hand.
+            excludePaths: [],
           })
-          loadExportPreflight(ids, excludeDirs)
+          loadExportPreflight(ids, [])
         }
 
         /**
          * Read how many workspace files the selected sessions would carry.
          *
          * @param {string[]} ids selected session ids.
-         * @param {string} excludeText raw exclusion list typed by the user.
+         * @param {string[]} excludePaths paths picked in the directory browser.
          * @returns {Promise<void>} resolution after the preview settled.
          */
-        async function loadExportPreflight(ids, excludeText) {
+        async function loadExportPreflight(ids, excludePaths) {
           const workspaceResult = await postJson(WORKSPACE_PREFLIGHT_PATH, {
             sessionIds: ids,
-            exclude: parseExcludeDirs(excludeText),
+            excludePaths: Array.isArray(excludePaths) ? excludePaths : [],
           }).catch(() => null)
           const workspaceInfo = {
             count: workspaceResult ? Number(workspaceResult.totalFiles) || 0 : 0,
@@ -1434,9 +1388,12 @@ window.__ModuleLoader__.load({
             workspaces: workspaceResult && Array.isArray(workspaceResult.workspaces)
               ? workspaceResult.workspaces
               : [],
-            // Names the Host actually matched on disk, so a typo is visible.
+            // Names the Host actually matched on disk (built-in artefact dirs).
             excludedNames: workspaceResult && Array.isArray(workspaceResult.excludedNames)
               ? workspaceResult.excludedNames
+              : [],
+            builtinExclude: workspaceResult && Array.isArray(workspaceResult.builtinExclude)
+              ? workspaceResult.builtinExclude
               : [],
           }
           setExportDialog((current) => (current && current.phase === 'choose'
@@ -1449,21 +1406,80 @@ window.__ModuleLoader__.load({
         }
 
         /**
-         * Update the exclusion list and refresh the preview shortly after typing.
+         * Toggle one picked path in the export dialog's exclusion selection.
          *
-         * @param {string} text raw input.
+         * @param {string} path absolute path inside a workspace.
          * @returns {void}
          */
-        function changeExcludeDirs(text) {
-          setExcludeDirs(text)
-          saveExcludeDirs(text)
-          if (excludeTimerRef.current !== null) clearTimeout(excludeTimerRef.current)
-          excludeTimerRef.current = setTimeout(() => {
-            excludeTimerRef.current = null
-            const ids = selectedVisibleIds()
-            if (ids.length === 0) return
-            loadExportPreflight(ids, text)
-          }, 450)
+        function toggleExcludePath(path) {
+          if (typeof path !== 'string' || path === '') return
+          setExportDialog((current) => {
+            if (!current) return current
+            const currentPaths = Array.isArray(current.excludePaths) ? current.excludePaths : []
+            const exists = currentPaths.includes(path)
+            const nextPaths = exists
+              ? currentPaths.filter((entry) => entry !== path)
+              : [...currentPaths, path]
+            return { ...current, excludePaths: nextPaths }
+          })
+        }
+
+        /**
+         * Open the exclusion browser at one workspace root.
+         *
+         * @param {string} startPath initial directory.
+         * @returns {Promise<void>} resolution after the first listing arrived.
+         */
+        async function openExcludePicker(startPath) {
+          if (typeof startPath !== 'string' || startPath === '') return
+          setExcludePicker({ path: startPath, parent: null, entries: [], truncated: false, loading: true, error: null })
+          await browseExcludeDirectory(startPath)
+        }
+
+        /**
+         * Read one directory level for the exclusion browser.
+         *
+         * @param {string} target absolute directory path.
+         * @returns {Promise<void>} resolution after the listing arrived.
+         */
+        async function browseExcludeDirectory(target) {
+          setExcludePicker((current) => (current ? { ...current, loading: true, error: null } : current))
+          try {
+            const payload = await postJson(WORKSPACE_BROWSE_PATH, { path: target })
+            setExcludePicker((current) => (current
+              ? {
+                  ...current,
+                  path: typeof payload.path === 'string' ? payload.path : target,
+                  parent: typeof payload.parent === 'string' ? payload.parent : null,
+                  entries: Array.isArray(payload.entries) ? payload.entries : [],
+                  truncated: payload.truncated === true,
+                  loading: false,
+                  error: null,
+                }
+              : current))
+          } catch (failure) {
+            setExcludePicker((current) => (current
+              ? {
+                  ...current,
+                  loading: false,
+                  error: failure && failure.message ? failure.message : String(failure),
+                }
+              : current))
+          }
+        }
+
+        /**
+         * Re-run the preview after the exclusion selection changed.
+         *
+         * @returns {void}
+         */
+        function refreshExcludePreview() {
+          const ids = selectedVisibleIds()
+          if (ids.length === 0) return
+          const currentPaths = exportDialog && Array.isArray(exportDialog.excludePaths)
+            ? exportDialog.excludePaths
+            : []
+          loadExportPreflight(ids, currentPaths)
         }
 
         /**
@@ -1520,7 +1536,9 @@ window.__ModuleLoader__.load({
               ...(exportDialog !== null && exportDialog.includeWorkspaceFiles === true
                 ? { includeWorkspaceFiles: true }
                 : {}),
-              ...(exportDialog !== null ? { exclude: parseExcludeDirs(exportDialog.excludeText) } : {}),
+              ...(exportDialog !== null ? {
+                excludePaths: Array.isArray(exportDialog.excludePaths) ? exportDialog.excludePaths : [],
+              } : {}),
             })
             saveExportDir(targetDir)
             setExportDialog({
@@ -2877,6 +2895,14 @@ window.__ModuleLoader__.load({
               ? '所选会话的工作区没有可备份的文件'
               : `包含工作区附件（工作区目录下的文件）：${workspaceFileCount} 个 · ${((Number(workspaceInfo.bytes) || 0) / 1048576).toFixed(2)} MB`
                 + `${workspaceInfo.truncated ? '（已达上限，部分文件未包含）' : ''}`
+          // Paths picked in the exclusion browser, and the workspace roots the
+          // browser may start from.
+          const exportExcludePaths = Array.isArray(exportDialog.excludePaths) ? exportDialog.excludePaths : []
+          const exportExcludeRoots = workspaceInfo && Array.isArray(workspaceInfo.workspaces)
+            ? [...new Set(workspaceInfo.workspaces
+              .map((workspace) => (typeof workspace.path === 'string' ? workspace.path : ''))
+              .filter((path) => path !== ''))]
+            : []
           const actions = []
           if (choosing) {
             actions.push(h(
@@ -2968,23 +2994,51 @@ window.__ModuleLoader__.load({
                       h(
                         'div',
                         { style: dialogHintStyle },
-                        '排除目录（逗号或空格分隔，留空则打包全部文件）',
+                        '排除目录或文件（点击选择，仅本次导出有效）',
                       ),
-                      h('input', {
+                      h(
+                        'div',
+                        { style: exportExcludeActionsStyle },
+                        h(
+                          'button',
+                          {
+                            className: 'sl-btn',
+                            style: actionButtonStyle,
+                            disabled: exportExcludeRoots.length === 0,
+                            onClick: () => openExcludePicker(exportExcludeRoots[0]),
+                          },
+                          '选择要排除的目录或文件…',
+                        ),
+                        exportExcludePaths.length > 0
+                          ? h(
+                              'button',
+                              {
+                                className: 'sl-btn',
+                                style: actionButtonStyle,
+                                onClick: () => {
+                                  setExportDialog((current) => (current ? { ...current, excludePaths: [] } : current))
+                                  const ids = selectedVisibleIds()
+                                  if (ids.length > 0) loadExportPreflight(ids, [])
+                                },
+                              },
+                              `清空选择（${exportExcludePaths.length}）`,
+                            )
+                          : null,
+                      ),
+                      h('textarea', {
                         className: 'sl-input',
-                        style: exportInputStyle,
-                        value: typeof exportDialog.excludeText === 'string' ? exportDialog.excludeText : excludeDirs,
-                        placeholder: '例如 node_modules, .git, dist',
-                        onChange: (event) => changeExcludeDirs(event.target.value),
+                        style: exportExcludeTextStyle,
+                        readOnly: true,
+                        value: exportExcludePaths.join('\n'),
+                        placeholder: '尚未选择；内置排除（node_modules、.git、dist 等）始终生效',
                       }),
                       h(
                         'div',
                         { style: exportExcludeHintStyle },
                         workspaceInfo === null
                           ? '正在统计…'
-                          : (workspaceInfo.excludedNames && workspaceInfo.excludedNames.length > 0)
-                            ? `本次实际排除：${workspaceInfo.excludedNames.join('、')}`
-                            : '本次扫描没有匹配到被排除的目录',
+                          : `本次实际排除：${(workspaceInfo.excludedNames || []).join('、') || '（无）'}`
+                            + `${exportExcludePaths.length > 0 ? `；另外手动排除 ${exportExcludePaths.length} 项` : ''}`,
                       ),
                     ),
                   )
@@ -3070,6 +3124,111 @@ window.__ModuleLoader__.load({
                     },
                   },
                   '是，创建并导出',
+                ),
+              ),
+            ),
+          )
+        }
+
+        /**
+         * Render the exclusion browser: directory list plus checkboxes.
+         *
+         * Picking a path only edits the export dialog's selection; the dialog is
+         * re-previewed once the browser closes.
+         *
+         * @returns {object | null} React element, or null when closed.
+         */
+        function renderExcludePicker() {
+          const picker = excludePicker
+          if (picker === null) return null
+          const selection = exportDialog && Array.isArray(exportDialog.excludePaths)
+            ? exportDialog.excludePaths
+            : []
+          const canGoUp = typeof picker.parent === 'string' && picker.parent !== ''
+          const closePicker = () => {
+            setExcludePicker(null)
+            refreshExcludePreview()
+          }
+          const formatBytes = (value) => {
+            const bytes = Number(value) || 0
+            if (bytes >= 1048576) return `${(bytes / 1048576).toFixed(1)} MB`
+            if (bytes >= 1024) return `${Math.round(bytes / 1024)} KB`
+            return `${bytes} B`
+          }
+          return h(
+            'div',
+            { style: overlayStyle, onClick: closePicker },
+            h(
+              'div',
+              { style: dialogStyle, onClick: (event) => event.stopPropagation() },
+              h('h2', { style: dialogTitleStyle }, '选择要排除的目录或文件'),
+              h(
+                'p',
+                { style: dialogHintStyle },
+                '勾选目录会排除它下面的全部内容；勾选文件只排除该文件。选择只对本次导出有效。',
+              ),
+              h('div', { style: exportPickerPathStyle }, picker.path),
+              h(
+                'div',
+                { style: exportPickerBarStyle },
+                h(
+                  'button',
+                  {
+                    className: 'sl-btn',
+                    style: canGoUp
+                      ? actionButtonStyle
+                      : { ...actionButtonStyle, opacity: 0.45, cursor: 'not-allowed' },
+                    disabled: !canGoUp,
+                    onClick: () => { if (canGoUp) browseExcludeDirectory(picker.parent) },
+                  },
+                  '上一级',
+                ),
+                h('span', { style: exportPickerCountStyle }, `已选 ${selection.length} 项`),
+              ),
+              picker.error !== null
+                ? h('div', { style: dialogBlockerStyle }, `读取目录失败：${picker.error}`)
+                : null,
+              h(
+                'div',
+                { style: exportPickerListStyle },
+                picker.loading
+                  ? h('div', { style: dialogHintStyle }, '正在读取目录…')
+                  : picker.entries.length === 0
+                    ? h('div', { style: dialogHintStyle }, '这个目录是空的')
+                    : picker.entries.map((entry) => h(
+                        'div',
+                        { key: entry.path, style: exportPickerRowStyle },
+                        renderCheckbox(
+                          selection.includes(entry.path) ? 'all' : 'none',
+                          () => toggleExcludePath(entry.path),
+                          `排除 ${entry.name}`,
+                        ),
+                        h(
+                          'span',
+                          {
+                            style: entry.isDirectory ? exportPickerDirStyle : exportPickerFileStyle,
+                            title: entry.path,
+                            onClick: () => { if (entry.isDirectory === true) browseExcludeDirectory(entry.path) },
+                          },
+                          entry.isDirectory === true ? `▸ ${entry.name}/` : entry.name,
+                        ),
+                        h(
+                          'span',
+                          { style: exportPickerSizeStyle },
+                          entry.isDirectory === true ? '' : formatBytes(entry.bytes),
+                        ),
+                      )),
+              ),
+              picker.truncated
+                ? h('div', { style: dialogHintStyle }, '目录项过多，仅显示前 500 项')
+                : null,
+              h(
+                'div',
+                { style: dialogActionsStyle },
+                h(
+                  'button',
+                  { className: 'sl-btn', style: actionButtonStyle, onClick: closePicker },
+                  '完成',
                 ),
               ),
             ),
@@ -3449,6 +3608,7 @@ window.__ModuleLoader__.load({
           clearLogsDialog ? renderClearLogsDialog() : null,
           logsDeleteDialog !== null ? renderLogsDeleteDialog() : null,
           exportDialog !== null ? renderExportDialog() : null,
+          excludePicker !== null ? renderExcludePicker() : null,
           importDialog !== null ? renderImportDialog() : null,
           createDirPrompt !== null ? renderCreateDirPrompt() : null,
         )
@@ -3771,6 +3931,52 @@ window.__ModuleLoader__.load({
     const exportOptionLabelStyle = { fontSize: 12, opacity: 0.75, lineHeight: 1.5 }
     const exportExcludeBlockStyle = { marginTop: 12 }
     const exportExcludeHintStyle = { marginTop: 4, fontSize: 11, opacity: 0.5, lineHeight: 1.4 }
+    const exportExcludeActionsStyle = { display: 'flex', gap: 8, marginTop: 6, marginBottom: 6 }
+    // Read-only overflow box listing the picked paths; a real textarea keeps the
+    // scrollbar consistent with the other panels.
+    const exportExcludeTextStyle = {
+      width: '100%',
+      minHeight: 58,
+      maxHeight: 96,
+      padding: '6px 8px',
+      borderRadius: 6,
+      border: '1px solid color-mix(in srgb, currentColor 18%, transparent)',
+      background: 'Canvas',
+      color: 'inherit',
+      font: 'inherit',
+      fontSize: 12,
+      lineHeight: 1.5,
+      resize: 'vertical',
+      overflow: 'auto',
+    }
+    // Exclusion browser (directory list) styles.
+    const exportPickerPathStyle = {
+      marginBottom: 6,
+      fontSize: 12,
+      opacity: 0.8,
+      overflow: 'hidden',
+      textOverflow: 'ellipsis',
+      whiteSpace: 'nowrap',
+    }
+    const exportPickerBarStyle = { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }
+    const exportPickerCountStyle = { fontSize: 12, opacity: 0.55 }
+    const exportPickerListStyle = {
+      maxHeight: 260,
+      overflow: 'auto',
+      border: '1px solid color-mix(in srgb, currentColor 12%, transparent)',
+      borderRadius: 6,
+      padding: '4px 2px',
+    }
+    const exportPickerRowStyle = {
+      display: 'flex',
+      alignItems: 'center',
+      gap: 8,
+      padding: '3px 6px',
+      borderRadius: 4,
+    }
+    const exportPickerDirStyle = { flex: '1 1 auto', cursor: 'pointer', fontSize: 13 }
+    const exportPickerFileStyle = { flex: '1 1 auto', cursor: 'default', fontSize: 13, opacity: 0.85 }
+    const exportPickerSizeStyle = { fontSize: 11, opacity: 0.45, minWidth: 56, textAlign: 'right' }
     const importListStyle = {
       display: 'flex',
       flexDirection: 'column',
