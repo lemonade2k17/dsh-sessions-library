@@ -250,65 +250,228 @@ window.__ModuleLoader__.load({
       }
     }
 
+    // One stylesheet for the whole page. Visual rules live here rather than in
+    // inline styles so hover, focus and press states stay reachable; layout keeps
+    // living with the render code, next to the markup it describes.
     const CSS = [
-      '.sl-root { position: relative; height: 100%; min-height: 0; display: flex; flex-direction: column; color: inherit; }',
-      // Status colours are the only non-neutral hues in this UI. They are declared
-      // once here so the light theme can use darker, readable variants: the
-      // original hexes clear 4.5:1 on the dark canvas but only reach 1.8–3.0:1 on
-      // white. Dark keeps the values it was tuned against.
-      '.sl-root { --sl-danger: #f06a6a; --sl-danger-text: #f08a8a; --sl-warn: #f0b37e; --sl-info: #6aa9f0; }',
-      'body:not([data-ds-dark-theme]) .sl-root { --sl-danger: #b3261e; --sl-danger-text: #b3261e; --sl-warn: #8a5300; --sl-info: #1a5fb4; }',
+      // --- tokens -----------------------------------------------------------
+      // Colours are mixed against `Canvas`, so the page follows the host theme
+      // without a second palette. Status hues are the only saturated ones.
+      '.sl-root { position: relative; height: 100%; min-height: 0; width: 100%; align-self: stretch; justify-self: stretch; flex: 1 1 auto; display: flex; flex-direction: column; color: inherit;'
+        + ' --sl-line: color-mix(in srgb, currentColor 10%, transparent);'
+        + ' --sl-line-strong: color-mix(in srgb, currentColor 19%, transparent);'
+        + ' --sl-surface: color-mix(in srgb, currentColor 3.5%, Canvas);'
+        + ' --sl-surface-2: color-mix(in srgb, currentColor 6.5%, Canvas);'
+        + ' --sl-sheen: color-mix(in srgb, currentColor 5%, transparent);'
+        + ' --sl-muted: color-mix(in srgb, currentColor 56%, transparent);'
+        + ' --sl-faint: color-mix(in srgb, currentColor 44%, transparent);'
+        + ' --sl-accent: #6d93ff; --sl-accent-ink: #0a1020;'
+        + ' --sl-radius-lg: 14px; --sl-radius: 10px; --sl-radius-sm: 8px;'
+        // Status colours: declared once so the light theme can use variants that
+        // clear 4.5:1 on white (the dark values only reach 1.8–3.0:1 there).
+        + ' --sl-danger: #f06a6a; --sl-danger-text: #f08a8a; --sl-warn: #f0b37e; --sl-info: #6aa9f0; }',
+      'body:not([data-ds-dark-theme]) .sl-root { --sl-accent: #2f5bd7; --sl-accent-ink: #ffffff;'
+        + ' --sl-danger: #b3261e; --sl-danger-text: #b3261e; --sl-warn: #8a5300; --sl-info: #1a5fb4; }',
       '.sl-root * { box-sizing: border-box; }',
-      '.sl-scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 4px 24px 106px; }',
+      '.sl-root ::selection { background: color-mix(in srgb, var(--sl-accent) 30%, transparent); }',
+      '.sl-container { width: 1200px; max-width: 100%; margin: 0 auto; padding: 0 20px; }',
+
+      // --- page shell -------------------------------------------------------
+      // A whisper of tint at the top edge separates the header from the rows
+      // without drawing a box around it.
+      '.sl-header { flex: 0 0 auto; padding: 18px 0 10px; border-bottom: 1px solid var(--sl-line);'
+        + ' background: linear-gradient(180deg, color-mix(in srgb, currentColor 2.5%, Canvas) 0%, Canvas 72%); }',
+      '.sl-titlebar { display: flex; align-items: center; gap: 10px; min-height: 28px; }',
+      '.sl-heading { margin: 0; font-size: 16px; font-weight: 650; letter-spacing: 0.01em; }',
+      '.sl-subtitle { font-size: 12px; color: var(--sl-faint); font-variant-numeric: tabular-nums; }',
+      '.sl-actions { margin-left: auto; display: flex; align-items: center; gap: 2px; }',
+      '.sl-toolbar { display: flex; align-items: center; gap: 8px; margin-top: 12px; }',
+      '.sl-scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 12px 0 20px; }',
+
+      // --- buttons ----------------------------------------------------------
+      // One base for every text button: 1px hairline, 8px radius, and a press
+      // that lands in 140ms so the interface answers immediately.
+      '.sl-btn { border: 1px solid var(--sl-line-strong); border-radius: 8px; background: transparent; color: inherit;'
+        + ' font: inherit; cursor: pointer; transition: background-color 140ms ease, border-color 140ms ease, transform 140ms ease, opacity 140ms ease; }',
+      '.sl-btn:hover:not(:disabled) { background: var(--sl-surface-2); }',
+      '.sl-btn:active:not(:disabled) { transform: scale(0.97); }',
+      '.sl-btn:disabled { opacity: 0.45; cursor: not-allowed; }',
+      '.sl-ghost { display: inline-flex; align-items: center; gap: 6px; height: 28px; padding: 0 9px; border: 1px solid transparent;'
+        + ' border-radius: 8px; background: transparent; color: var(--sl-muted); font: inherit; font-size: 12.5px; cursor: pointer;'
+        + ' transition: background-color 140ms ease, color 140ms ease, transform 140ms ease; }',
+      '.sl-ghost:hover { background: var(--sl-surface-2); color: inherit; }',
+      '.sl-ghost:active { transform: scale(0.97); }',
+      '.sl-ghost svg { width: 14px; height: 14px; opacity: 0.8; }',
+
+      // --- search + segmented filter ---------------------------------------
+      '.sl-search { display: flex; align-items: center; gap: 8px; flex: 1 1 auto; min-width: 160px; height: 32px; padding: 0 8px 0 10px;'
+        + ' border: 1px solid var(--sl-line); border-radius: var(--sl-radius-sm); background: color-mix(in srgb, currentColor 2.5%, Canvas);'
+        + ' transition: border-color 140ms ease, box-shadow 140ms ease, background-color 140ms ease; }',
+      '.sl-search:focus-within { background: Canvas; border-color: color-mix(in srgb, var(--sl-accent) 55%, transparent);'
+        + ' box-shadow: 0 0 0 3px color-mix(in srgb, var(--sl-accent) 15%, transparent); }',
+      '.sl-search > svg { flex: 0 0 auto; width: 14px; height: 14px; color: var(--sl-faint); }',
+      '.sl-search input { flex: 1 1 auto; min-width: 0; height: 100%; padding: 0; border: none; outline: none; background: transparent;'
+        + ' color: inherit; font: inherit; font-size: 13px; }',
+      '.sl-search input::placeholder { color: color-mix(in srgb, currentColor 38%, transparent); }',
+      '.sl-search-clear { flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center; width: 18px; height: 18px; padding: 0;'
+        + ' border: none; border-radius: 999px; background: color-mix(in srgb, currentColor 11%, transparent); color: inherit;'
+        + ' cursor: pointer; opacity: 0.65; transition: opacity 120ms ease, background-color 120ms ease; }',
+      '.sl-search-clear:hover { opacity: 1; background: color-mix(in srgb, currentColor 16%, transparent); }',
+      '.sl-seg { display: inline-flex; align-items: center; gap: 2px; flex: 0 0 auto; padding: 2px; border: 1px solid var(--sl-line);'
+        + ' border-radius: var(--sl-radius-sm); background: color-mix(in srgb, currentColor 4%, Canvas); }',
+      '.sl-seg-btn { height: 24px; padding: 0 10px; border: none; border-radius: 6px; background: transparent; color: var(--sl-muted);'
+        + ' font: inherit; font-size: 12px; font-weight: 500; font-variant-numeric: tabular-nums; cursor: pointer;'
+        + ' transition: background-color 140ms ease, color 140ms ease, box-shadow 140ms ease; }',
+      '.sl-seg-btn:hover { color: inherit; }',
+      '.sl-seg-btn[data-active="true"] { background: color-mix(in srgb, currentColor 10%, Canvas); color: inherit;'
+        + ' box-shadow: 0 1px 2px rgba(0, 0, 0, 0.16); }',
+
+      // --- group card -------------------------------------------------------
+      // Groups are cards: a single hairline holds a dozen rows together, which
+      // reads calmer than one separator per row.
+      '.sl-group { margin: 0 0 8px; border: 1px solid var(--sl-line); border-radius: var(--sl-radius-lg); background: var(--sl-surface);'
+        + ' overflow: hidden; transition: border-color 160ms ease, background-color 160ms ease; }',
+      // Hover lifts the edge only: tinting the whole card would flash every row
+      // the moment the pointer crosses the group.
+      '.sl-group:hover { border-color: var(--sl-line-strong); }',
+      '.sl-group-head { display: flex; align-items: center; gap: 8px; width: 100%; padding: 9px 12px; border: none; background: transparent;'
+        + ' color: inherit; font: inherit; font-size: 13px; font-weight: 600; text-align: left; cursor: pointer;'
+        + ' transition: background-color 140ms ease; }',
+      '.sl-group-head:hover { background: var(--sl-sheen); }',
+      '.sl-group-head:active { background: color-mix(in srgb, currentColor 8%, transparent); }',
+      '.sl-group-body { padding: 0 6px 6px; }',
+      // The bin and the log use the same card shell for their flat lists.
+      '.sl-list-card { border: 1px solid var(--sl-line); border-radius: var(--sl-radius-lg); background: var(--sl-surface); overflow: hidden; }',
+      '.sl-list-card > *:last-child { border-bottom: none; }',
+      // The chevron is a drawn glyph, not a font character: it rotates in place
+      // and keeps its optical centre on every platform.
+      '.sl-chevron { flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px;'
+        + ' color: var(--sl-faint); transition: transform 200ms cubic-bezier(0.23, 1, 0.32, 1); }',
+      '.sl-chevron[data-open="true"] { transform: rotate(90deg); }',
+      '.sl-chevron svg { width: 16px; height: 16px; }',
+      '.sl-group-title { flex: 0 0 auto; max-width: 42%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }',
+      '.sl-group-path { flex: 1 1 auto; min-width: 0; font-size: 11.5px; font-weight: 400; color: var(--sl-faint);'
+        + ' overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }',
+      '.sl-count { flex: 0 0 auto; padding: 1px 7px; border-radius: 999px; background: color-mix(in srgb, currentColor 7%, transparent);'
+        + ' font-size: 11px; font-weight: 500; color: var(--sl-muted); font-variant-numeric: tabular-nums; }',
+      '.sl-time { flex: 0 0 auto; width: 68px; text-align: right; font-size: 11.5px; font-weight: 400; color: var(--sl-faint);'
+        + ' font-variant-numeric: tabular-nums; }',
+
+      // --- rows -------------------------------------------------------------
+      '.sl-row { display: flex; align-items: center; gap: 8px; width: 100%; margin: 1px 0; padding: 7px 10px 7px 36px; border: none;'
+        + ' border-radius: 8px; background: transparent; color: inherit; font: inherit; font-size: 13px; text-align: left; cursor: pointer;'
+        + ' transition: background-color 120ms ease, box-shadow 120ms ease; }',
+      '.sl-row:hover { background: color-mix(in srgb, currentColor 5%, transparent); }',
+      '.sl-row:active { background: color-mix(in srgb, currentColor 8%, transparent); }',
+      // A checked row keeps an accent tint plus a left bar, so the selection is
+      // still readable when the list is scrolled away from the checkboxes.
+      '.sl-row[data-checked="true"] { background: color-mix(in srgb, var(--sl-accent) 13%, transparent);'
+        + ' box-shadow: inset 2px 0 0 var(--sl-accent); }',
+      '.sl-row[data-checked="true"]:hover { background: color-mix(in srgb, var(--sl-accent) 17%, transparent); }',
+      '.sl-logrow { border-bottom: 1px solid color-mix(in srgb, currentColor 8%, transparent); transition: background-color 120ms ease; }',
+      '.sl-logrow:hover { background: var(--sl-sheen); }',
+      '.sl-badge { display: inline-flex; align-items: center; gap: 5px; flex: 0 0 auto; height: 18px; padding: 0 7px; border-radius: 999px;'
+        + ' background: color-mix(in srgb, currentColor 7%, transparent); color: var(--sl-muted); font-size: 11px; font-weight: 500;'
+        + ' line-height: 1; white-space: nowrap; }',
+      '.sl-badge[data-tone="running"] { color: color-mix(in srgb, #59c98d 80%, currentColor);'
+        + ' background: color-mix(in srgb, #59c98d 14%, transparent); }',
+      '.sl-dot { width: 5px; height: 5px; border-radius: 999px; background: currentColor; }',
+
+      // --- checkbox ---------------------------------------------------------
+      // The drawn box is 15px; a transparent halo grows the pointer target to
+      // 27px without moving a single row. `color: transparent` hides the glyph
+      // while `currentColor` still feeds the border, so the border uses the
+      // system text colour instead.
+      '.sl-check { position: relative; flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center;'
+        + ' width: 15px; height: 15px; border: 1.5px solid color-mix(in srgb, CanvasText 30%, transparent); border-radius: 4.5px;'
+        + ' background: transparent; color: transparent;'
+        + ' transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease; }',
+      '.sl-check::before { content: ""; position: absolute; inset: -6px; border-radius: 7px; }',
+      '.sl-check:hover { border-color: color-mix(in srgb, CanvasText 52%, transparent); }',
+      '.sl-check[aria-checked="true"], .sl-check[aria-checked="mixed"] { border-color: var(--sl-accent); background: var(--sl-accent);'
+        + ' color: var(--sl-accent-ink); }',
+      '.sl-check[aria-checked="true"]:hover, .sl-check[aria-checked="mixed"]:hover { border-color: var(--sl-accent); }',
+
+      // --- dock -------------------------------------------------------------
+      // A floating glass bar, sized to its content, sitting over the empty tail
+      // the list reserves for it.
+      '.sl-dock { border: 1px solid var(--sl-line-strong); border-radius: 15px;'
+        + ' background: color-mix(in srgb, Canvas 82%, transparent);'
+        + ' backdrop-filter: blur(18px) saturate(140%); -webkit-backdrop-filter: blur(18px) saturate(140%);'
+        + ' box-shadow: 0 14px 40px rgba(0, 0, 0, 0.26), 0 1px 0 color-mix(in srgb, currentColor 6%, transparent) inset; }',
+      '.sl-dock-btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: 32px; padding: 0 12px;'
+        + ' border: 1px solid transparent; border-radius: 10px; background: transparent; color: var(--sl-muted); font: inherit;'
+        + ' font-size: 12.5px; font-weight: 500; white-space: nowrap; cursor: pointer;'
+        + ' transition: background-color 140ms ease, color 140ms ease, border-color 140ms ease, transform 140ms ease; }',
+      '.sl-dock-btn:hover:not(:disabled) { background: var(--sl-surface-2); color: inherit; }',
+      '.sl-dock-btn:active:not(:disabled) { transform: scale(0.97); }',
+      '.sl-dock-btn:disabled { opacity: 0.4; cursor: not-allowed; }',
+      '.sl-dock-btn[data-tone="accent"]:not(:disabled) { color: inherit; background: var(--sl-surface-2); border-color: var(--sl-line-strong); }',
+      '.sl-dock-btn[data-tone="danger"]:not(:disabled) { color: var(--sl-danger-text);'
+        + ' background: color-mix(in srgb, var(--sl-danger) 10%, transparent);'
+        + ' border-color: color-mix(in srgb, var(--sl-danger) 38%, transparent); }',
+      '.sl-dock-btn[data-tone="danger"]:hover:not(:disabled) { background: color-mix(in srgb, var(--sl-danger) 16%, transparent);'
+        + ' color: var(--sl-danger-text); }',
+      '.sl-dock-count { min-width: 18px; height: 18px; padding: 0 5px; display: inline-flex; align-items: center; justify-content: center;'
+        + ' border-radius: 999px; background: color-mix(in srgb, currentColor 10%, transparent);'
+        + ' font-size: 11px; font-variant-numeric: tabular-nums; }',
+
+      // --- empty + loading --------------------------------------------------
+      '.sl-empty { display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 76px 20px; text-align: center; }',
+      '.sl-empty-icon { display: flex; align-items: center; justify-content: center; width: 44px; height: 44px; margin-bottom: 4px;'
+        + ' border: 1px solid var(--sl-line); border-radius: 14px; background: var(--sl-surface); color: var(--sl-faint); }',
+      '.sl-empty-title { font-size: 13.5px; font-weight: 600; }',
+      '.sl-empty-hint { max-width: 340px; font-size: 12px; line-height: 1.65; color: var(--sl-faint); }',
+      '.sl-skel { margin-bottom: 8px; padding: 14px; border: 1px solid var(--sl-line); border-radius: var(--sl-radius-lg);'
+        + ' background: var(--sl-surface); }',
+      '.sl-skel-line { height: 9px; border-radius: 999px; background: color-mix(in srgb, currentColor 9%, transparent);'
+        + ' animation: sl-breathe 1.6s ease-in-out infinite; }',
+      '.sl-skel-line + .sl-skel-line { margin-top: 9px; }',
+      '@keyframes sl-breathe { 0%, 100% { opacity: 0.55; } 50% { opacity: 1; } }',
+
+      // --- dialogs ----------------------------------------------------------
+      '.sl-overlay { position: fixed; inset: 0; z-index: 1000; display: flex; align-items: center; justify-content: center; padding: 24px;'
+        + ' background: color-mix(in srgb, #000 55%, transparent); backdrop-filter: blur(3px);'
+        + ' -webkit-backdrop-filter: blur(3px); animation: sl-fade 140ms ease-out both; }',
+      '.sl-dialog { border: 1px solid var(--sl-line-strong); border-radius: 16px; background: Canvas; color: CanvasText;'
+        + ' box-shadow: 0 24px 70px rgba(0, 0, 0, 0.42); animation: sl-pop 200ms cubic-bezier(0.23, 1, 0.32, 1) both; }',
+      '@keyframes sl-fade { from { opacity: 0; } to { opacity: 1; } }',
+      // Modals are the one surface that stays centred; they are not anchored to
+      // a trigger, so a 6px lift reads as "arrived", not "shot out of nowhere".
+      '@keyframes sl-pop { from { opacity: 0; transform: translateY(6px) scale(0.985); } to { opacity: 1; transform: none; } }',
+
+      // --- footer + inputs --------------------------------------------------
+      // Root-level footer: a fixed strip under the scroll area. It sits above the
+      // floating dock in the library view (the extra bottom padding is applied
+      // there in the markup). The text uses the same container as the list, so it
+      // lines up with the rows on a wide panel.
+      '.sl-footer { flex: 0 0 auto; padding: 6px 0 10px; }',
+      '.sl-footer .sl-container { font-size: 10.5px; color: var(--sl-faint); opacity: 0.8;'
+        + ' white-space: nowrap; overflow: hidden; text-overflow: ellipsis; pointer-events: none; }',
+      '.sl-input::placeholder { color: color-mix(in srgb, currentColor 38%, transparent); }',
+      '.sl-input:focus { outline: 2px solid color-mix(in srgb, var(--sl-accent) 45%, transparent); outline-offset: 1px;'
+        + ' border-color: color-mix(in srgb, var(--sl-accent) 55%, transparent); }',
       // Chosen exclusion paths: a fixed-height list with its own scrollbar, so a
       // long selection stays readable instead of stretching the dialog.
       '.sl-pathlist { scrollbar-gutter: stable; }',
       '.sl-pathlist-row { display: flex; align-items: center; gap: 8px; padding: 2px 8px; font-size: 12px; line-height: 1.7; border-radius: 4px; }',
-      '.sl-pathlist-row:hover { background: color-mix(in srgb, currentColor 6%, transparent); }',
+      '.sl-pathlist-row:hover { background: var(--sl-sheen); }',
       '.sl-pathlist-path { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }',
       '.sl-pathlist-empty { padding: 8px; font-size: 12px; opacity: 0.5; }',
-      // One scrollbar treatment for the page and for every dialog scroll area.
+
+      // --- scrollbar + focus + motion --------------------------------------
       '.sl-root ::-webkit-scrollbar { width: 10px; height: 10px; }',
-      '.sl-root ::-webkit-scrollbar-thumb { background: color-mix(in srgb, currentColor 18%, transparent); border-radius: 8px; border: 3px solid transparent; background-clip: content-box; }',
-      '.sl-root ::-webkit-scrollbar-thumb:hover { background: color-mix(in srgb, currentColor 30%, transparent); }',
+      '.sl-root ::-webkit-scrollbar-thumb { background: color-mix(in srgb, currentColor 15%, transparent); border-radius: 999px;'
+        + ' border: 3px solid transparent; background-clip: content-box; }',
+      '.sl-root ::-webkit-scrollbar-thumb:hover { background: color-mix(in srgb, currentColor 27%, transparent); }',
       '.sl-root ::-webkit-scrollbar-track, .sl-root ::-webkit-scrollbar-corner { background: transparent; }',
-      // Hover/press feedback is background-color only (paint, never layout), and
-      // short enough that a fast pointer reads as a state, not an animation.
-      '.sl-group-head, .sl-row, .sl-logrow, .sl-check { transition: background-color 120ms ease, border-color 120ms ease; }',
-      '.sl-group-head:hover { background: color-mix(in srgb, currentColor 6%, transparent); }',
-      '.sl-group-head:active { background: color-mix(in srgb, currentColor 9%, transparent); }',
-      '.sl-row:hover { background: color-mix(in srgb, currentColor 8%, transparent); }',
-      '.sl-row:active { background: color-mix(in srgb, currentColor 12%, transparent); }',
-      '.sl-logrow:hover { background: color-mix(in srgb, currentColor 5%, transparent); }',
-      '.sl-btn:hover { background: color-mix(in srgb, currentColor 8%, transparent); }',
-      '.sl-btn:active { background: color-mix(in srgb, currentColor 13%, transparent); }',
-      '.sl-btn:disabled { cursor: not-allowed; opacity: 0.5; }',
-      // Dock surfaces live in the stylesheet (not inline) so hover and press can
-      // actually reach them; the layout stays inline with the render code.
-      '.sl-fab { border: 1px solid color-mix(in srgb, currentColor 24%, transparent); background: color-mix(in srgb, currentColor 12%, Canvas); box-shadow: 0 6px 20px rgba(0, 0, 0, 0.28); transition: background-color 120ms ease, border-color 120ms ease, box-shadow 120ms ease, opacity 120ms ease; }',
-      '.sl-fab:disabled { opacity: 0.45; box-shadow: none; }',
-      '.sl-fab:hover:not(:disabled) { background: color-mix(in srgb, currentColor 18%, Canvas); border-color: color-mix(in srgb, currentColor 34%, transparent); }',
-      '.sl-fab:active:not(:disabled) { background: color-mix(in srgb, currentColor 23%, Canvas); }',
-      '.sl-dock-secondary { border: 1px solid color-mix(in srgb, currentColor 22%, transparent); background: color-mix(in srgb, currentColor 8%, Canvas); transition: background-color 120ms ease, border-color 120ms ease; }',
-      '.sl-dock-secondary:hover:not(:disabled) { background: color-mix(in srgb, currentColor 14%, Canvas); border-color: color-mix(in srgb, currentColor 30%, transparent); }',
-      '.sl-dock-secondary:active:not(:disabled) { background: color-mix(in srgb, currentColor 17%, Canvas); }',
-      '.sl-check { position: relative; border: 1px solid color-mix(in srgb, currentColor 38%, transparent); background: transparent; }',
-      // 5px transparent halo: the pointer target grows to 24x24 while the drawn
-      // box stays 14x14, so the row layout does not shift.
-      '.sl-check::before { content: ""; position: absolute; inset: -5px; border-radius: 6px; }',
-      '.sl-check[aria-checked="true"], .sl-check[aria-checked="mixed"] { border-color: color-mix(in srgb, currentColor 60%, transparent); background: color-mix(in srgb, currentColor 26%, transparent); }',
-      '.sl-check:hover { border-color: color-mix(in srgb, currentColor 62%, transparent); }',
-      // Keyboard focus only: a click never draws these rings. 50% of the label
-      // colour keeps the ring above the 3:1 non-text contrast bar on white too.
-      '.sl-row:focus-visible, .sl-group-head:focus-visible, .sl-check:focus-visible, .sl-btn:focus-visible, .sl-fab:focus-visible, .sl-logrow:focus-visible { outline: 2px solid color-mix(in srgb, currentColor 50%, transparent); outline-offset: 1px; }',
-      // Export dock backdrop: dark edges over a light theme, light edges over a
-      // dark theme, so the strip stays visible in both palettes.
-      '.sl-dock { background: linear-gradient(180deg, rgba(28, 32, 38, 0.04) 0%, rgba(110, 116, 126, 0.025) 26%, rgba(235, 238, 243, 0.015) 50%, rgba(110, 116, 126, 0.025) 74%, rgba(28, 32, 38, 0.04) 100%); }',
-      'body[data-ds-dark-theme] .sl-dock { background: linear-gradient(180deg, rgba(243, 246, 249, 0.04) 0%, rgba(196, 202, 210, 0.025) 26%, rgba(118, 124, 134, 0.02) 50%, rgba(196, 202, 210, 0.025) 74%, rgba(243, 246, 249, 0.04) 100%); }',
-      '.sl-input::placeholder { color: color-mix(in srgb, currentColor 45%, transparent); }',
-      '.sl-input:focus { outline: 2px solid color-mix(in srgb, currentColor 28%, transparent); outline-offset: -1px; }',
-      // Respect the OS setting: state changes stay instant, nothing animates.
-      '@media (prefers-reduced-motion: reduce) { .sl-group-head, .sl-row, .sl-logrow, .sl-check { transition: none; } }',
+      // Keyboard focus only: a pointer click never draws these rings.
+      '.sl-root :focus-visible { outline: 2px solid color-mix(in srgb, var(--sl-accent) 70%, transparent); outline-offset: 2px; }',
+      '.sl-search input:focus-visible { outline: none; }',
+      // The OS setting wins: state changes stay instant, nothing moves.
+      '@media (prefers-reduced-motion: reduce) {'
+        + ' .sl-root *, .sl-root *::before, .sl-root *::after { animation: none !important; transition: none !important; }'
+        + ' .sl-chevron[data-open="true"] { transform: rotate(90deg); } }',
     ].join('\n')
 
     /** Sidebar entry icon; the panellist passes the host size. */
@@ -331,6 +494,62 @@ window.__ModuleLoader__.load({
         h('path', { d: 'M4 12h16' }),
         h('path', { d: 'M4 17.5h9' }),
         h('path', { d: 'M15.5 15l3 2.5-3 2.5' }),
+      )
+    }
+
+    // Small stroke icon set (24px grid, 1.85px stroke) shared by the page and
+    // the dialogs. Drawn rather than typed: a glyph would inherit whichever
+    // font the host happens to load.
+    const ICONS = {
+      chevron: ['M9 5l7 7-7 7'],
+      search: ['M11 19a8 8 0 1 0 0-16 8 8 0 0 0 0 16z', 'M21 21l-4.3-4.3'],
+      close: ['M6 6l12 12', 'M18 6L6 18'],
+      refresh: ['M20.5 12a8.5 8.5 0 1 1-2.5-6', 'M20.5 3.5V10h-6.5'],
+      trash: ['M4 7h16', 'M9.5 7V4.8h5V7', 'M6.5 7l.9 12.2h9.2L17.5 7'],
+      log: ['M4 6.5h16', 'M4 12h16', 'M4 17.5h10'],
+      back: ['M15 5l-7 7 7 7'],
+      expand: [
+        'M9 4H5.5A1.5 1.5 0 0 0 4 5.5V9',
+        'M15 4h3.5A1.5 1.5 0 0 1 20 5.5V9',
+        'M9 20H5.5A1.5 1.5 0 0 1 4 18.5V15',
+        'M15 20h3.5a1.5 1.5 0 0 0 1.5-1.5V15',
+      ],
+      inbox: [
+        'M4 13.5h3.5l1.2 2.4h6.6l1.2-2.4H20',
+        'M4 13.5L6 5h12l2 8.5v4a1.5 1.5 0 0 1-1.5 1.5h-13A1.5 1.5 0 0 1 4 17.5z',
+      ],
+      export: [
+        'M12 15.5V4.5',
+        'M7.5 9L12 4.5 16.5 9',
+        'M5 14v4.5A1.5 1.5 0 0 0 6.5 20h11a1.5 1.5 0 0 0 1.5-1.5V14',
+      ],
+    }
+
+    /**
+     * Render one stroke icon from {@link ICONS}.
+     *
+     * @param {object} props element props.
+     * @param {string} props.name key in the icon set.
+     * @param {number} [props.size] edge length in px.
+     * @returns {object} React element.
+     */
+    function Icon(props) {
+      const { name, size = 14 } = props
+      const paths = ICONS[name] || []
+      return h(
+        'svg',
+        {
+          viewBox: '0 0 24 24',
+          width: size,
+          height: size,
+          fill: 'none',
+          stroke: 'currentColor',
+          strokeWidth: 1.85,
+          strokeLinecap: 'round',
+          strokeLinejoin: 'round',
+          'aria-hidden': true,
+        },
+        paths.map((path, index) => h('path', { key: index, d: path })),
       )
     }
 
@@ -1893,19 +2112,21 @@ window.__ModuleLoader__.load({
          * @returns {object} React element.
          */
         function dockCountButton(options) {
-          const { label, count, onClick, idleTitle, activeTitle } = options
+          const { label, count, onClick, idleTitle, activeTitle, tone, icon } = options
           const active = count > 0
           return h(
             'button',
             {
               type: 'button',
-              className: 'sl-btn sl-fab',
-              style: active ? fabButtonStyle : fabDisabledStyle,
+              className: 'sl-dock-btn',
+              'data-tone': tone === undefined ? 'plain' : tone,
               disabled: !active,
               title: active ? activeTitle : idleTitle,
               onClick,
             },
-            active ? `${label} ${count}` : label,
+            icon ? h(Icon, { name: icon, size: 13 }) : null,
+            label,
+            active ? h('span', { className: 'sl-dock-count' }, count) : null,
           )
         }
 
@@ -1946,25 +2167,27 @@ window.__ModuleLoader__.load({
         function renderSession(session) {
           const title = session.title && session.title.trim() !== '' ? session.title : '未命名'
           const badges = []
-          if (session.pinned) badges.push(h('span', { key: 'pin', style: badgeStyle }, '置顶'))
-          if (session.archived) badges.push(h('span', { key: 'archived', style: badgeStyle }, '已归档'))
-          if (session.running) badges.push(h('span', { key: 'running', style: badgeStyle }, '运行中'))
+          if (session.pinned) badges.push(h('span', { key: 'pin', className: 'sl-badge' }, '置顶'))
+          if (session.archived) badges.push(h('span', { key: 'archived', className: 'sl-badge' }, '已归档'))
+          if (session.running) {
+            badges.push(
+              h(
+                'span',
+                { key: 'running', className: 'sl-badge', 'data-tone': 'running' },
+                h('span', { className: 'sl-dot' }),
+                '运行中',
+              ),
+            )
+          }
           const checked = selected[session.id] === true
-          const baseRowStyle = session.archived ? { ...rowStyle, opacity: 0.72 } : rowStyle
-          // A checked row keeps a tint plus a left accent bar, so the selection is
-          // readable when the list is scrolled away from the checkboxes.
-          const rowStyleForSession = checked
-            ? {
-                ...baseRowStyle,
-                background: 'color-mix(in srgb, currentColor 9%, transparent)',
-                boxShadow: 'inset 2px 0 0 color-mix(in srgb, currentColor 48%, transparent)',
-              }
-            : baseRowStyle
+          const rowStyleForSession = session.archived ? { ...rowStyle, opacity: 0.66 } : rowStyle
           return h(
             'div',
             {
               key: session.id,
               className: 'sl-row',
+              // Selection is painted by the stylesheet so hover can still win.
+              'data-checked': checked ? 'true' : 'false',
               role: 'button',
               tabIndex: 0,
               style: rowStyleForSession,
@@ -2021,7 +2244,7 @@ window.__ModuleLoader__.load({
               className: 'sl-group-head',
               role: 'button',
               tabIndex: 0,
-              style: groupHeaderStyle,
+              'aria-expanded': open ? 'true' : 'false',
               onClick: () => toggleGroup(group.id),
               onKeyDown: (event) => {
                 if (event.key !== 'Enter' && event.key !== ' ') return
@@ -2034,13 +2257,17 @@ window.__ModuleLoader__.load({
               () => toggleGroupSelection(group.sessions),
               `勾选「${group.title}」中的会话`,
             ),
-            h('span', { style: chevronStyle }, open ? '▾' : '▸'),
-            h('span', { style: groupTitleStyle }, group.title),
+            h(
+              'span',
+              { className: 'sl-chevron', 'data-open': open ? 'true' : 'false' },
+              h(Icon, { name: 'chevron', size: 16 }),
+            ),
+            h('span', { className: 'sl-group-title' }, group.title),
             group.kind === 'ungrouped'
-              ? h('span', { style: groupPathStyle }, '工作区之外')
-              : h('span', { style: groupPathStyle, title: group.path }, group.path || ''),
-            h('span', { style: groupCountStyle }, countLabel),
-            h('span', { style: groupTimeStyle }, formatRelative(newest?.updatedAt)),
+              ? h('span', { className: 'sl-group-path' }, '工作区之外')
+              : h('span', { className: 'sl-group-path', title: group.path }, group.path || ''),
+            h('span', { className: 'sl-count' }, countLabel),
+            h('span', { className: 'sl-time' }, formatRelative(newest?.updatedAt)),
           )
 
           if (open && hasMore) {
@@ -2058,7 +2285,12 @@ window.__ModuleLoader__.load({
             )
           }
 
-          return h('section', { key: group.id, style: groupStyle }, head, rows)
+          return h(
+            'section',
+            { key: group.id, className: 'sl-group' },
+            head,
+            open ? h('div', { className: 'sl-group-body' }, rows) : null,
+          )
         }
 
         function renderTrash() {
@@ -2191,36 +2423,40 @@ window.__ModuleLoader__.load({
             'div',
             null,
             logsError !== null ? h('div', { style: warnStyle }, logsError) : null,
-            visibleLogs.map((entry, index) => {
-              const at = Date.parse(entry && entry.at)
-              const rowId = entry && typeof entry.id === 'string' ? entry.id : ''
-              const checked = rowId !== '' && logsSelected[rowId] === true
-              return h(
-                'div',
-                {
-                  key: rowId !== '' ? rowId : `${entry && entry.at ? entry.at : ''}-${index}`,
-                  className: rowId !== '' ? 'sl-logrow' : undefined,
-                  role: rowId !== '' ? 'button' : undefined,
-                  tabIndex: rowId !== '' ? 0 : undefined,
-                  style: rowId !== ''
-                    ? { ...logsRowStyle, cursor: 'pointer' }
-                    : logsRowStyle,
-                  onClick: rowId !== '' ? () => toggleLogSelection(rowId) : undefined,
-                  onKeyDown: rowId !== ''
-                    ? (event) => {
-                        if (event.key !== 'Enter' && event.key !== ' ') return
-                        event.preventDefault()
-                        toggleLogSelection(rowId)
-                      }
-                    : undefined,
-                },
-                rowId !== ''
-                  ? renderCheckbox(checked ? 'all' : 'none', () => toggleLogSelection(rowId), '勾选这条日志')
-                  : null,
-                h('span', { style: logsTextStyle }, formatLogEntry(entry)),
-                h('span', { style: trashTimeStyle }, formatAbsolute(Number.isFinite(at) ? at : 0)),
-              )
-            }),
+            h(
+              'div',
+              { className: 'sl-list-card' },
+              visibleLogs.map((entry, index) => {
+                const at = Date.parse(entry && entry.at)
+                const rowId = entry && typeof entry.id === 'string' ? entry.id : ''
+                const checked = rowId !== '' && logsSelected[rowId] === true
+                return h(
+                  'div',
+                  {
+                    key: rowId !== '' ? rowId : `${entry && entry.at ? entry.at : ''}-${index}`,
+                    className: 'sl-logrow',
+                    role: rowId !== '' ? 'button' : undefined,
+                    tabIndex: rowId !== '' ? 0 : undefined,
+                    style: rowId !== ''
+                      ? { ...logsRowStyle, cursor: 'pointer' }
+                      : logsRowStyle,
+                    onClick: rowId !== '' ? () => toggleLogSelection(rowId) : undefined,
+                    onKeyDown: rowId !== ''
+                      ? (event) => {
+                          if (event.key !== 'Enter' && event.key !== ' ') return
+                          event.preventDefault()
+                          toggleLogSelection(rowId)
+                        }
+                      : undefined,
+                  },
+                  rowId !== ''
+                    ? renderCheckbox(checked ? 'all' : 'none', () => toggleLogSelection(rowId), '勾选这条日志')
+                    : null,
+                  h('span', { style: logsTextStyle }, formatLogEntry(entry)),
+                  h('span', { style: trashTimeStyle }, formatAbsolute(Number.isFinite(at) ? at : 0)),
+                )
+              }),
+            ),
           )
         }
 
@@ -2320,10 +2556,10 @@ window.__ModuleLoader__.load({
 
           return h(
             'div',
-            { style: overlayStyle },
+            { className: 'sl-overlay', style: overlayStyle },
             h(
               'div',
-              { style: dialogStyle, onClick: (event) => event.stopPropagation() },
+              { className: 'sl-dialog', style: dialogStyle, onClick: (event) => event.stopPropagation() },
               h('h2', { style: dialogTitleStyle }, dialog.phase === 'done' ? '已移入回收站' : '移入回收站'),
               h(
                 'p',
@@ -2448,10 +2684,10 @@ window.__ModuleLoader__.load({
 
           return h(
             'div',
-            { style: overlayStyle },
+            { className: 'sl-overlay', style: overlayStyle },
             h(
               'div',
-              { style: dialogStyle, onClick: (event) => event.stopPropagation() },
+              { className: 'sl-dialog', style: dialogStyle, onClick: (event) => event.stopPropagation() },
               h('h2', { style: dialogTitleStyle }, purgeDialog.phase === 'done' ? doneTitle : '永久删除'),
               h(
                 'p',
@@ -2520,10 +2756,10 @@ window.__ModuleLoader__.load({
         function renderClearLogsDialog() {
           return h(
             'div',
-            { style: overlayStyle },
+            { className: 'sl-overlay', style: overlayStyle },
             h(
               'div',
-              { style: dialogStyle, onClick: (event) => event.stopPropagation() },
+              { className: 'sl-dialog', style: dialogStyle, onClick: (event) => event.stopPropagation() },
               h('h2', { style: dialogTitleStyle }, '清空操作日志'),
               h(
                 'p',
@@ -2558,10 +2794,10 @@ window.__ModuleLoader__.load({
           const count = Array.isArray(logsDeleteDialog.ids) ? logsDeleteDialog.ids.length : 0
           return h(
             'div',
-            { style: overlayStyle },
+            { className: 'sl-overlay', style: overlayStyle },
             h(
               'div',
-              { style: dialogStyle, onClick: (event) => event.stopPropagation() },
+              { className: 'sl-dialog', style: dialogStyle, onClick: (event) => event.stopPropagation() },
               h('h2', { style: dialogTitleStyle }, '删除所选日志'),
               h(
                 'p',
@@ -2678,10 +2914,10 @@ window.__ModuleLoader__.load({
 
           return h(
             'div',
-            { style: overlayStyle },
+            { className: 'sl-overlay', style: overlayStyle },
             h(
               'div',
-              { style: dialogStyle, onClick: (event) => event.stopPropagation() },
+              { className: 'sl-dialog', style: dialogStyle, onClick: (event) => event.stopPropagation() },
               h('h2', { style: dialogTitleStyle }, phase === 'done' ? '导入结果' : '导入会话包'),
 
               phase === 'source'
@@ -2992,10 +3228,10 @@ window.__ModuleLoader__.load({
           }
           return h(
             'div',
-            { style: overlayStyle },
+            { className: 'sl-overlay', style: overlayStyle },
             h(
               'div',
-              { style: dialogStyle, onClick: (event) => event.stopPropagation() },
+              { className: 'sl-dialog', style: dialogStyle, onClick: (event) => event.stopPropagation() },
               h('h2', { style: dialogTitleStyle }, title),
               choosing
                 ? h(
@@ -3171,10 +3407,10 @@ window.__ModuleLoader__.load({
             : ''
           return h(
             'div',
-            { style: overlayStyle },
+            { className: 'sl-overlay', style: overlayStyle },
             h(
               'div',
-              { style: dialogStyle, onClick: (event) => event.stopPropagation() },
+              { className: 'sl-dialog', style: dialogStyle, onClick: (event) => event.stopPropagation() },
               h('h2', { style: dialogTitleStyle }, '文件夹不存在'),
               h(
                 'p',
@@ -3226,7 +3462,7 @@ window.__ModuleLoader__.load({
           // Nested mode adds no scrim: the export overlay underneath already dims
           // the page, and a second layer made it visibly darker.
           const layerStyle = options.transparent === true
-            ? { ...overlayStyle, background: 'transparent' }
+            ? { ...overlayStyle, background: 'transparent', backdropFilter: 'none', WebkitBackdropFilter: 'none', animation: 'none' }
             : overlayStyle
           const selection = exportDialog && Array.isArray(exportDialog.excludePaths)
             ? exportDialog.excludePaths
@@ -3262,10 +3498,10 @@ window.__ModuleLoader__.load({
           }
           return h(
             'div',
-            { style: layerStyle },
+            { className: 'sl-overlay', style: layerStyle },
             h(
               'div',
-              { style: dialogStyle, onClick: (event) => event.stopPropagation() },
+              { className: 'sl-dialog', style: dialogStyle, onClick: (event) => event.stopPropagation() },
               h('h2', { style: dialogTitleStyle }, '选择要排除的目录或文件'),
               h(
                 'p',
@@ -3387,17 +3623,76 @@ window.__ModuleLoader__.load({
         function renderPlaceholder(title, hint) {
           return h(
             'div',
-            { style: placeholderStyle },
-            h('div', null, title),
-            hint ? h('div', { style: placeholderHintStyle }, hint) : null,
+            { className: 'sl-empty' },
+            h('div', { className: 'sl-empty-icon' }, h(Icon, { name: 'inbox', size: 20 })),
+            h('div', { className: 'sl-empty-title' }, title),
+            hint ? h('div', { className: 'sl-empty-hint' }, hint) : null,
           )
         }
+
+        /**
+         * Skeleton cards for the first load.
+         *
+         * The page keeps its shape while the snapshot arrives, so the real rows
+         * land without the layout jumping under the pointer.
+         *
+         * @returns {object} React element.
+         */
+        function renderSkeleton() {
+          return h(
+            'div',
+            { 'aria-hidden': true },
+            [0, 1, 2].map((index) => h(
+              'div',
+              { key: index, className: 'sl-skel' },
+              h('div', { className: 'sl-skel-line', style: { width: `${36 + index * 8}%` } }),
+              h('div', { className: 'sl-skel-line', style: { width: '16%' } }),
+            )),
+          )
+        }
+
+        /**
+         * Render the shared search field.
+         *
+         * The magnifier and the clear button live inside the field so the box
+         * keeps a single 32px height and never shifts while typing.
+         *
+         * @param {string} value current query.
+         * @param {string} placeholder hint text, also used as the accessible name.
+         * @param {Function} onChange change handler.
+         * @returns {object} React element.
+         */
+        const searchBox = (value, placeholder, onChange) => h(
+          'div',
+          { className: 'sl-search' },
+          h(Icon, { name: 'search', size: 14 }),
+          h('input', {
+            value,
+            placeholder,
+            'aria-label': placeholder,
+            onChange: (event) => onChange(event.target.value),
+          }),
+          value !== ''
+            ? h(
+                'button',
+                {
+                  key: 'clear',
+                  type: 'button',
+                  className: 'sl-search-clear',
+                  title: '清空搜索',
+                  'aria-label': '清空搜索',
+                  onClick: () => onChange(''),
+                },
+                h(Icon, { name: 'close', size: 11 }),
+              )
+            : null,
+        )
 
         const filterButton = (value, label, count) => h(
           'button',
           {
-            className: 'sl-btn',
-            style: filterButtonStyle(filter === value),
+            className: 'sl-seg-btn',
+            'data-active': filter === value ? 'true' : 'false',
             onClick: () => changeFilter(value),
           },
           `${label} ${count}`,
@@ -3424,77 +3719,32 @@ window.__ModuleLoader__.load({
 
         const libraryControls = h(
           'div',
-          { style: controlsStyle },
-          h('input', {
-            className: 'sl-input',
-            style: searchStyle,
-            value: query,
-            placeholder: '搜索标题或工作区',
-            onChange: (event) => setQuery(event.target.value),
-          }),
+          { className: 'sl-toolbar' },
+          searchBox(query, '搜索标题或工作区', setQuery),
           h(
             'div',
-            { style: segmentedStyle },
+            { className: 'sl-seg' },
             filterButton('unarchived', '未归档会话', totals.active),
             filterButton('all', '全部会话', totals.total),
           ),
           h(
             'button',
-            {
-              className: 'sl-btn',
-              style: actionButtonStyle,
-              onClick: toggleAllGroups,
-            },
+            { className: 'sl-ghost', onClick: toggleAllGroups },
+            h(Icon, { name: 'expand', size: 14 }),
             anyOpen ? '全部收起' : '全部展开',
-          ),
-          h(
-            'button',
-            {
-              className: 'sl-btn',
-              style: actionButtonStyle,
-              onClick: () => setReloadToken((token) => token + 1),
-            },
-            '刷新',
-          ),
-          h(
-            'button',
-            {
-              className: 'sl-btn',
-              style: actionButtonStyle,
-              onClick: openTrash,
-            },
-            '回收站',
-          ),
-          h(
-            'button',
-            {
-              className: 'sl-btn',
-              style: actionButtonStyle,
-              onClick: openLogs,
-            },
-            '操作日志',
           ),
         )
 
         const trashControls = h(
           'div',
-          { style: controlsStyle },
+          { className: 'sl-toolbar' },
           h(
             'button',
-            {
-              className: 'sl-btn',
-              style: actionButtonStyle,
-              onClick: closeTrash,
-            },
-            '返回会话库',
+            { className: 'sl-ghost', onClick: closeTrash },
+            h(Icon, { name: 'back', size: 14 }),
+            '会话库',
           ),
-          h('input', {
-            className: 'sl-input',
-            style: searchStyle,
-            value: trashQuery,
-            placeholder: '搜索标题或会话 ID',
-            onChange: (event) => setTrashQuery(event.target.value),
-          }),
+          searchBox(trashQuery, '搜索标题或会话 ID', setTrashQuery),
           sortSelect(trashSort, [
             { value: 'newest', label: '删除时间 新→旧' },
             { value: 'oldest', label: '删除时间 旧→新' },
@@ -3503,43 +3753,21 @@ window.__ModuleLoader__.load({
           ], setTrashSort),
           h(
             'button',
-            {
-              className: 'sl-btn',
-              style: actionButtonStyle,
-              onClick: refreshTrash,
-            },
-            '刷新回收站',
-          ),
-          h(
-            'button',
-            {
-              className: 'sl-btn',
-              style: actionButtonStyle,
-              onClick: toggleTrashSelectAll,
-            },
+            { className: 'sl-ghost', onClick: toggleTrashSelectAll },
             allTrashSelected ? '取消全选' : '全选',
           ),
         )
 
         const logsControls = h(
           'div',
-          { style: controlsStyle },
+          { className: 'sl-toolbar' },
           h(
             'button',
-            {
-              className: 'sl-btn',
-              style: actionButtonStyle,
-              onClick: closeLogs,
-            },
-            '返回会话库',
+            { className: 'sl-ghost', onClick: closeLogs },
+            h(Icon, { name: 'back', size: 14 }),
+            '会话库',
           ),
-          h('input', {
-            className: 'sl-input',
-            style: searchStyle,
-            value: logsQuery,
-            placeholder: '搜索日志内容或会话 ID',
-            onChange: (event) => setLogsQuery(event.target.value),
-          }),
+          searchBox(logsQuery, '搜索日志内容或会话 ID', setLogsQuery),
           sortSelect(logsSort, [
             { value: 'newest', label: '时间 新→旧' },
             { value: 'oldest', label: '时间 旧→新' },
@@ -3547,18 +3775,9 @@ window.__ModuleLoader__.load({
           h(
             'button',
             {
-              className: 'sl-btn',
-              style: actionButtonStyle,
-              onClick: () => refreshLogs(),
-            },
-            '刷新日志',
-          ),
-          h(
-            'button',
-            {
-              className: 'sl-btn',
-              style: logsSelectable ? actionButtonStyle : { ...actionButtonStyle, opacity: 0.45, cursor: 'not-allowed' },
+              className: 'sl-ghost',
               disabled: !logsSelectable,
+              style: logsSelectable ? undefined : { opacity: 0.45, cursor: 'not-allowed' },
               onClick: toggleLogsSelectAll,
             },
             allLogsSelected ? '取消全选' : '全选',
@@ -3570,6 +3789,42 @@ window.__ModuleLoader__.load({
           : view === 'logs'
             ? logsControls
             : libraryControls
+
+        // View switching and refresh live in the title bar, so the toolbar row
+        // stays dedicated to finding and filtering.
+        const headerActions = h(
+          'div',
+          { className: 'sl-actions' },
+          h(
+            'button',
+            {
+              className: 'sl-ghost',
+              onClick: () => {
+                if (view === 'trash') refreshTrash()
+                else if (view === 'logs') refreshLogs()
+                else setReloadToken((token) => token + 1)
+              },
+            },
+            h(Icon, { name: 'refresh', size: 14 }),
+            '刷新',
+          ),
+          view === 'library'
+            ? h(
+                'button',
+                { key: 'trash', className: 'sl-ghost', onClick: openTrash },
+                h(Icon, { name: 'trash', size: 14 }),
+                '回收站',
+              )
+            : null,
+          view === 'library'
+            ? h(
+                'button',
+                { key: 'logs', className: 'sl-ghost', onClick: openLogs },
+                h(Icon, { name: 'log', size: 14 }),
+                '操作日志',
+              )
+            : null,
+        )
 
         let body = null
         if (view === 'trash') {
@@ -3608,85 +3863,120 @@ window.__ModuleLoader__.load({
           ? `数据来源：工作区 ${snapshot.sources.workspaces} · 会话 ${snapshot.sources.sessions ?? snapshot.sources.summaries} · 标题 ${snapshot.sources.titles}`
           : ''
 
+        const loading = view === 'library' && (phase === 'loading' || phase === 'idle')
+
         return h(
           'div',
           { className: 'sl-root', ref: rootRef },
           h('style', null, CSS),
           h(
             'header',
-            { style: headerStyle },
+            { className: 'sl-header' },
             h(
               'div',
-              { style: titleRowStyle },
-              h('h1', { style: headingStyle }, '会话库'),
+              { className: 'sl-container' },
               h(
-                'span',
-                { style: subtitleStyle },
-                view === 'trash'
-                  ? `回收站 · ${trashFamilies.length} 组 · ${trash.length} 个会话`
-                  : view === 'logs'
-                    ? `操作日志 · ${visibleLogs.length} 条${logsQuery.trim() !== '' ? ` / 共 ${logs.length} 条` : ''}${selectedLogsCount > 0 ? ` · 已选 ${selectedLogsCount}` : ''}`
-                    : snapshot
-                    ? [
-                        `${visibleCount} 个会话 · ${groups.length} 个工作区`,
-                        selectedCount > 0 ? `已选 ${selectedCount}` : '',
-                        addedCount > 0 ? `新增 ${addedCount}` : '',
-                      ]
-                        .filter((part) => part !== '')
-                        .join(' · ')
-                    : '',
+                'div',
+                { className: 'sl-titlebar' },
+                h('h1', { className: 'sl-heading' }, '会话库'),
+                h(
+                  'span',
+                  { className: 'sl-subtitle' },
+                  view === 'trash'
+                    ? `回收站 · ${trashFamilies.length} 组 · ${trash.length} 个会话`
+                    : view === 'logs'
+                      ? `操作日志 · ${visibleLogs.length} 条${logsQuery.trim() !== '' ? ` / 共 ${logs.length} 条` : ''}${selectedLogsCount > 0 ? ` · 已选 ${selectedLogsCount}` : ''}`
+                      : snapshot
+                      ? [
+                          `${visibleCount} 个会话 · ${groups.length} 个工作区`,
+                          selectedCount > 0 ? `已选 ${selectedCount}` : '',
+                          addedCount > 0 ? `新增 ${addedCount}` : '',
+                        ]
+                          .filter((part) => part !== '')
+                          .join(' · ')
+                      : '',
+                ),
+                headerActions,
               ),
+              controls,
             ),
-            controls,
           ),
-          refreshError !== null
-            ? h('div', { style: warnStyle }, `刷新失败：${refreshError}（显示的是上次读取的结果）`)
+          refreshError !== null || (view === 'library' && unarchiveNotice !== null)
+            ? h(
+                'div',
+                { className: 'sl-container', style: { paddingTop: 8 } },
+                refreshError !== null
+                  ? h('div', { style: warnStyle }, `刷新失败：${refreshError}（显示的是上次读取的结果）`)
+                  : null,
+                view === 'library' && unarchiveNotice !== null
+                  ? h('div', { style: infoStyle }, unarchiveNotice)
+                  : null,
+              )
             : null,
-          view === 'library' && unarchiveNotice !== null
-            ? h('div', { style: infoStyle }, unarchiveNotice)
+          h(
+            'div',
+            { className: 'sl-scroll' },
+            h(
+              'div',
+              { className: 'sl-container' },
+              loading ? renderSkeleton() : body,
+            ),
+          ),
+          // Provenance line: pinned under the list as panel chrome. Inside the
+          // scroll area it looked like a stray row floating above empty space.
+          sources !== ''
+            ? h(
+                'div',
+                {
+                  className: 'sl-footer',
+                  style: view === 'library' ? { paddingBottom: 62 } : undefined,
+                  title: sources,
+                },
+                h('div', { className: 'sl-container' }, sources),
+              )
             : null,
-          h('div', { className: 'sl-scroll' }, body),
-          // Floating action docks: a soft gradient panel hovering over the rows,
-          // each action disabled until something is selected.
+          // Floating dock: one glass bar sized to its actions, each action dim
+          // until something is selected.
           view === 'library'
             ? h(
                 'div',
                 { className: 'sl-dock', style: exportDockStyle },
                 h(
-                  'div',
-                  { style: dockActionsStyle },
-                  h(
-                    'button',
-                    {
-                      type: 'button',
-                      className: 'sl-btn sl-dock-secondary',
-                      style: dockSecondaryButtonStyle,
-                      onClick: openImportDialog,
-                    },
-                    '导入会话',
-                  ),
-                  dockCountButton({
-                    label: '清除选择',
-                    count: selectedCount,
-                    onClick: clearSelection,
-                    idleTitle: '没有已选的会话',
-                    activeTitle: `清除已选的 ${selectedCount} 个会话`,
-                  }),
-                  dockCountButton({
-                    label: '移入回收站',
-                    count: selectedCount,
-                    onClick: () => beginDelete(false),
-                    idleTitle: '请先勾选要移入回收站的会话',
-                    activeTitle: `把选中的 ${selectedCount} 个会话移入回收站`,
-                  }),
-                  dockCountButton({
-                    label: '导出所选',
-                    count: selectedCount,
-                    onClick: openExportDialog,
-                    idleTitle: '请先勾选要导出的会话',
-                    activeTitle: `导出所选的 ${selectedCount} 个会话`,
-                  }),
+                  'button',
+                  {
+                    type: 'button',
+                    className: 'sl-dock-btn',
+                    onClick: openImportDialog,
+                  },
+                  h(Icon, { name: 'inbox', size: 14 }),
+                  '导入会话',
                 ),
+                dockCountButton({
+                  label: '清除选择',
+                  count: selectedCount,
+                  icon: 'close',
+                  onClick: clearSelection,
+                  idleTitle: '没有已选的会话',
+                  activeTitle: `清除已选的 ${selectedCount} 个会话`,
+                }),
+                dockCountButton({
+                  label: '移入回收站',
+                  count: selectedCount,
+                  tone: 'danger',
+                  icon: 'trash',
+                  onClick: () => beginDelete(false),
+                  idleTitle: '请先勾选要移入回收站的会话',
+                  activeTitle: `把选中的 ${selectedCount} 个会话移入回收站`,
+                }),
+                dockCountButton({
+                  label: '导出所选',
+                  count: selectedCount,
+                  tone: 'accent',
+                  icon: 'export',
+                  onClick: openExportDialog,
+                  idleTitle: '请先勾选要导出的会话',
+                  activeTitle: `导出所选的 ${selectedCount} 个会话`,
+                }),
               )
             : null,
           // The permanent-delete action lives in the same dock so it stays put
@@ -3696,17 +3986,15 @@ window.__ModuleLoader__.load({
             ? h(
                 'div',
                 { className: 'sl-dock', style: exportDockStyle },
-                h(
-                  'div',
-                  { style: dockActionsStyle },
-                  dockCountButton({
-                    label: '永久删除',
-                    count: selectedTrashCount,
-                    onClick: openPurgeDialog,
-                    idleTitle: '请先勾选要永久删除的会话',
-                    activeTitle: `永久删除所选的 ${selectedTrashCount} 个会话`,
-                  }),
-                ),
+                dockCountButton({
+                  label: '永久删除',
+                  count: selectedTrashCount,
+                  tone: 'danger',
+                  icon: 'trash',
+                  onClick: openPurgeDialog,
+                  idleTitle: '请先勾选要永久删除的会话',
+                  activeTitle: `永久删除所选的 ${selectedTrashCount} 个会话`,
+                }),
               )
             : null,
           // Log page: the same dock, so the destructive actions sit in one place
@@ -3717,30 +4005,24 @@ window.__ModuleLoader__.load({
                 'div',
                 { className: 'sl-dock', style: exportDockStyle },
                 h(
-                  'div',
-                  { style: dockActionsStyle },
-                  h(
-                    'button',
-                    {
-                      type: 'button',
-                      className: 'sl-btn sl-dock-secondary',
-                      style: dockSecondaryButtonStyle,
-                      onClick: () => setClearLogsDialog(true),
-                    },
-                    '清空日志',
-                  ),
-                  dockCountButton({
-                    label: '删除所选',
-                    count: selectedLogsCount,
-                    onClick: openLogsDeleteDialog,
-                    idleTitle: '请先勾选要删除的日志',
-                    activeTitle: `删除所选的 ${selectedLogsCount} 条日志`,
-                  }),
+                  'button',
+                  {
+                    type: 'button',
+                    className: 'sl-dock-btn',
+                    onClick: () => setClearLogsDialog(true),
+                  },
+                  '清空日志',
                 ),
+                dockCountButton({
+                  label: '删除所选',
+                  count: selectedLogsCount,
+                  tone: 'danger',
+                  icon: 'trash',
+                  onClick: openLogsDeleteDialog,
+                  idleTitle: '请先勾选要删除的日志',
+                  activeTitle: `删除所选的 ${selectedLogsCount} 条日志`,
+                }),
               )
-            : null,
-          sources !== ''
-            ? h('div', { style: footerStyle }, sources)
             : null,
           dialog !== null ? renderDialog() : null,
           purgeDialog !== null ? renderPurgeDialog() : null,
@@ -3756,73 +4038,22 @@ window.__ModuleLoader__.load({
       }
     }
 
-    const groupStyle = {
-      borderBottom: '1px solid color-mix(in srgb, currentColor 10%, transparent)',
-      padding: '4px 0',
-    }
-    const groupHeaderStyle = {
-      display: 'flex',
-      alignItems: 'center',
-      gap: 8,
-      width: '100%',
-      padding: '8px 10px',
-      border: 'none',
-      borderRadius: 6,
-      color: 'inherit',
-      font: 'inherit',
-      fontSize: 13,
-      fontWeight: 600,
-      cursor: 'pointer',
-      textAlign: 'left',
-    }
-    const chevronStyle = { width: 14, flex: '0 0 auto', opacity: 0.6 }
-    const groupTitleStyle = {
-      flex: '0 0 auto',
-      maxWidth: '38%',
-      overflow: 'hidden',
-      textOverflow: 'ellipsis',
-      whiteSpace: 'nowrap',
-    }
-    const groupPathStyle = {
-      flex: '1 1 auto',
-      minWidth: 0,
-      fontWeight: 400,
-      fontSize: 12,
-      opacity: 0.45,
-      overflow: 'hidden',
-      textOverflow: 'ellipsis',
-      whiteSpace: 'nowrap',
-    }
-    const groupCountStyle = {
-      flex: '0 0 auto',
-      fontSize: 12,
-      fontWeight: 400,
-      opacity: 0.6,
-      fontVariantNumeric: 'tabular-nums',
-    }
-    const groupTimeStyle = {
-      flex: '0 0 auto',
-      fontSize: 12,
-      fontWeight: 400,
-      opacity: 0.45,
-      width: 72,
-      textAlign: 'right',
-      fontVariantNumeric: 'tabular-nums',
-    }
-    // Rows and group heads keep their background unset: the stylesheet owns the
-    // hover/press tint, and an inline "transparent" would outrank it.
+    // Layout constants. Colour, border, radius, shadow and motion live in the
+    // stylesheet; what stays here is box geometry the render code reads best
+    // next to the markup that uses it.
+
     const rowStyle = {
       display: 'flex',
       alignItems: 'center',
       gap: 8,
       width: '100%',
-      textAlign: 'left',
-      padding: '7px 10px 7px 32px',
+      padding: '7px 10px 7px 26px',
       border: 'none',
-      borderRadius: 6,
+      borderRadius: 8,
       color: 'inherit',
       font: 'inherit',
       fontSize: 13,
+      textAlign: 'left',
       cursor: 'pointer',
     }
     const sessionTitleStyle = {
@@ -3834,56 +4065,54 @@ window.__ModuleLoader__.load({
     }
     const sessionTimeStyle = {
       flex: '0 0 auto',
-      fontSize: 12,
-      opacity: 0.45,
-      width: 72,
+      width: 68,
       textAlign: 'right',
+      fontSize: 11.5,
+      color: 'var(--sl-faint)',
       // Equal-width digits keep the time column from jittering between rows.
       fontVariantNumeric: 'tabular-nums',
     }
-    // Inline row action (currently only "取消归档"): small, quiet and clearly
+    // Inline row action (currently only "取消归档"): small, quiet, and clearly
     // separate from the row's own click target.
     const rowActionStyle = {
       flex: '0 0 auto',
-      height: 22,
-      padding: '0 9px',
+      height: 20,
+      padding: '0 8px',
       borderRadius: 999,
-      border: '1px solid color-mix(in srgb, currentColor 30%, transparent)',
-      color: 'inherit',
-      font: 'inherit',
       fontSize: 11,
       fontWeight: 500,
+      color: 'var(--sl-muted)',
       cursor: 'pointer',
     }
     const badgeStyle = {
-      flex: '0 0 auto',
-      fontSize: 11,
-      lineHeight: '16px',
-      padding: '0 6px',
-      borderRadius: 999,
-      border: '1px solid color-mix(in srgb, currentColor 24%, transparent)',
-      opacity: 0.75,
-    }
-    // Layout only: the border and fill live in the stylesheet, keyed off
-    // `aria-checked`, so the hover state is not blocked by an inline value.
-    const checkboxStyle = () => ({
-      flex: '0 0 auto',
-      width: 14,
-      height: 14,
-      position: 'relative',
       display: 'inline-flex',
       alignItems: 'center',
-      justifyContent: 'center',
-      borderRadius: 4,
-      fontSize: 10,
+      flex: '0 0 auto',
+      height: 18,
+      padding: '0 7px',
+      borderRadius: 999,
+      background: 'color-mix(in srgb, currentColor 7%, transparent)',
+      color: 'var(--sl-muted)',
+      fontSize: 11,
+      lineHeight: 1,
+      whiteSpace: 'nowrap',
+    }
+    // Layout only: the border, fill and glyph colour live in the stylesheet,
+    // keyed off `aria-checked`, so hover is never blocked by an inline value.
+    const checkboxStyle = () => ({
+      flex: '0 0 auto',
+      width: 15,
+      height: 15,
+      fontSize: 9.5,
       lineHeight: 1,
       cursor: 'pointer',
       userSelect: 'none',
     })
     const showAllButtonStyle = {
-      display: 'block',
-      margin: '2px 0 6px 54px',
-      padding: '5px 10px',
+      display: 'inline-flex',
+      alignItems: 'center',
+      margin: '2px 0 6px 36px',
+      padding: '4px 8px',
       border: 'none',
       borderRadius: 6,
       color: 'inherit',
@@ -3892,128 +4121,76 @@ window.__ModuleLoader__.load({
       opacity: 0.6,
       cursor: 'pointer',
     }
-    const headerStyle = {
-      flex: '0 0 auto',
-      padding: '18px 24px 12px',
-      borderBottom: '1px solid color-mix(in srgb, currentColor 10%, transparent)',
-    }
-    const titleRowStyle = { display: 'flex', alignItems: 'baseline', gap: 12, marginBottom: 12 }
-    const headingStyle = { margin: 0, fontSize: 17, fontWeight: 600 }
-    const subtitleStyle = { fontSize: 12, opacity: 0.5 }
-    const controlsStyle = { display: 'flex', alignItems: 'center', gap: 8 }
-    const searchStyle = {
-      flex: '1 1 auto',
-      minWidth: 120,
-      height: 30,
-      padding: '0 10px',
-      borderRadius: 6,
-      border: '1px solid color-mix(in srgb, currentColor 18%, transparent)',
-      background: 'transparent',
-      color: 'inherit',
-      font: 'inherit',
-      fontSize: 13,
-    }
     const sortSelectStyle = {
       flex: '0 0 auto',
-      height: 30,
+      height: 32,
       padding: '0 8px',
-      borderRadius: 6,
-      border: '1px solid color-mix(in srgb, currentColor 18%, transparent)',
+      borderRadius: 8,
+      border: '1px solid var(--sl-line)',
       background: 'Canvas',
       color: 'inherit',
       font: 'inherit',
       fontSize: 12,
       cursor: 'pointer',
     }
-    const segmentedStyle = {
-      display: 'flex',
-      flex: '0 0 auto',
-      padding: 2,
-      gap: 2,
-      borderRadius: 7,
-      border: '1px solid color-mix(in srgb, currentColor 18%, transparent)',
-    }
-    const filterButtonStyle = (active) => ({
-      padding: '4px 10px',
-      border: 'none',
-      borderRadius: 5,
-      // The active chip keeps its own fill; the inactive one leaves the
-      // background to the stylesheet so hover feedback can show through.
-      background: active ? 'color-mix(in srgb, currentColor 14%, transparent)' : undefined,
-      color: 'inherit',
-      font: 'inherit',
-      fontSize: 12,
-      fontWeight: active ? 600 : 400,
-      cursor: 'pointer',
-    })
     const actionButtonStyle = {
       flex: '0 0 auto',
       height: 30,
       padding: '0 12px',
-      borderRadius: 6,
-      border: '1px solid color-mix(in srgb, currentColor 18%, transparent)',
-      color: 'inherit',
       font: 'inherit',
       fontSize: 12,
       cursor: 'pointer',
     }
     const blockedBadgeStyle = {
       flex: '0 0 auto',
-      fontSize: 11,
-      lineHeight: '16px',
-      padding: '0 6px',
+      height: 18,
+      padding: '0 7px',
       borderRadius: 999,
       border: '1px solid color-mix(in srgb, var(--sl-danger, #f06a6a) 55%, transparent)',
       color: 'var(--sl-danger-text, #f08a8a)',
-      opacity: 0.9,
+      fontSize: 11,
+      lineHeight: '16px',
+      whiteSpace: 'nowrap',
     }
     // Neutral sibling of the blocked badge: the row is importable, it just needs
     // the session un-archived first, so it must not read as an error.
     const adoptBadgeStyle = {
       flex: '0 0 auto',
+      height: 18,
+      padding: '0 7px',
+      borderRadius: 999,
+      border: '1px solid color-mix(in srgb, currentColor 30%, transparent)',
+      background: 'color-mix(in srgb, currentColor 8%, transparent)',
       fontSize: 11,
       lineHeight: '16px',
-      padding: '0 6px',
-      borderRadius: 999,
-      border: '1px solid color-mix(in srgb, currentColor 34%, transparent)',
-      background: 'color-mix(in srgb, currentColor 10%, Canvas)',
       whiteSpace: 'nowrap',
-      opacity: 0.9,
     }
     const dangerButtonStyle = {
       flex: '0 0 auto',
       height: 30,
       padding: '0 12px',
-      borderRadius: 6,
-      border: '1px solid color-mix(in srgb, var(--sl-danger, #f06a6a) 55%, transparent)',
-      background: 'color-mix(in srgb, var(--sl-danger, #f06a6a) 14%, transparent)',
+      borderRadius: 8,
+      border: '1px solid color-mix(in srgb, var(--sl-danger, #f06a6a) 52%, transparent)',
+      background: 'color-mix(in srgb, var(--sl-danger, #f06a6a) 12%, transparent)',
       color: 'inherit',
       font: 'inherit',
       fontSize: 12,
       cursor: 'pointer',
     }
-    const trashRowStyle = {
-      display: 'flex',
-      alignItems: 'center',
-      gap: 8,
-      padding: '8px 10px',
-      borderBottom: '1px solid color-mix(in srgb, currentColor 10%, transparent)',
-      fontSize: 13,
-    }
     const trashMetaStyle = {
       flex: '0 0 auto',
-      fontSize: 12,
-      opacity: 0.5,
       width: 88,
       textAlign: 'right',
+      fontSize: 12,
+      color: 'var(--sl-faint)',
       fontVariantNumeric: 'tabular-nums',
     }
     // Deletion timestamps are long enough to wrap inside the fixed meta column,
     // so they get their own single-line slot.
     const trashTimeStyle = {
       flex: '0 0 auto',
-      fontSize: 12,
-      opacity: 0.5,
+      fontSize: 11.5,
+      color: 'var(--sl-faint)',
       whiteSpace: 'nowrap',
       fontVariantNumeric: 'tabular-nums',
     }
@@ -4021,8 +4198,7 @@ window.__ModuleLoader__.load({
       display: 'flex',
       alignItems: 'center',
       gap: 12,
-      padding: '8px 10px',
-      borderBottom: '1px solid color-mix(in srgb, currentColor 10%, transparent)',
+      padding: '9px 12px',
       fontSize: 13,
     }
     const logsTextStyle = {
@@ -4032,24 +4208,24 @@ window.__ModuleLoader__.load({
       textOverflow: 'ellipsis',
       whiteSpace: 'nowrap',
     }
-    const progressBlockStyle = { margin: '8px 0 2px' }
-    const progressLabelStyle = { fontSize: 12, opacity: 0.75, marginBottom: 6 }
+    const progressBlockStyle = { margin: '10px 0 2px' }
+    const progressLabelStyle = { fontSize: 12, color: 'var(--sl-muted)', marginBottom: 6 }
     const progressTrackStyle = {
       height: 6,
       borderRadius: 999,
       overflow: 'hidden',
-      background: 'color-mix(in srgb, currentColor 14%, transparent)',
+      background: 'color-mix(in srgb, currentColor 12%, transparent)',
     }
     const progressFillStyle = (pct) => ({
       height: '100%',
       width: `${pct}%`,
       borderRadius: 999,
-      background: 'color-mix(in srgb, currentColor 55%, transparent)',
-      transition: 'width 0.2s linear',
+      background: 'var(--sl-accent)',
+      transition: 'width 200ms linear',
     })
     const progressCurrentStyle = {
       fontSize: 12,
-      opacity: 0.5,
+      color: 'var(--sl-faint)',
       marginTop: 6,
       overflow: 'hidden',
       textOverflow: 'ellipsis',
@@ -4066,11 +4242,11 @@ window.__ModuleLoader__.load({
     }
     const exportChooserStyle = { margin: '4px 0 10px' }
     const exportChooserActionsStyle = { display: 'flex', gap: 8, marginTop: 8 }
-    // Attachment opt-in row: the checkbox keeps its 14px box, the label carries
+    // Attachment opt-in row: the checkbox keeps its 15px box, the label carries
     // the count and size so the option is judged before exporting.
-    const exportOptionRowStyle = { display: 'flex', alignItems: 'center', gap: 8, marginTop: 12 }
-    const exportOptionLabelStyle = { fontSize: 12, opacity: 0.75, lineHeight: 1.5 }
-    const exportExcludeBlockStyle = { marginTop: 12 }
+    const exportOptionRowStyle = { display: 'flex', alignItems: 'center', gap: 8, marginTop: 14 }
+    const exportOptionLabelStyle = { fontSize: 12, color: 'var(--sl-muted)', lineHeight: 1.5 }
+    const exportExcludeBlockStyle = { marginTop: 14 }
     const exportExcludeActionsStyle = { display: 'flex', gap: 8, marginTop: 6, marginBottom: 6 }
     // Fixed-height scroll box for the chosen paths: one item or ten, the box keeps
     // the same footprint so the dialog does not jump while paths are picked.
@@ -4078,16 +4254,16 @@ window.__ModuleLoader__.load({
       height: 104,
       overflowY: 'auto',
       padding: '4px 2px',
-      borderRadius: 6,
-      border: '1px solid color-mix(in srgb, currentColor 16%, transparent)',
-      background: 'Canvas',
+      borderRadius: 8,
+      border: '1px solid var(--sl-line)',
+      background: 'color-mix(in srgb, currentColor 2%, Canvas)',
     }
     const exportPathRemoveStyle = {
       flex: '0 0 auto',
       padding: '1px 6px',
       fontSize: 11,
       borderRadius: 4,
-      border: '1px solid color-mix(in srgb, currentColor 18%, transparent)',
+      border: '1px solid var(--sl-line-strong)',
       background: 'transparent',
       color: 'inherit',
       cursor: 'pointer',
@@ -4096,20 +4272,20 @@ window.__ModuleLoader__.load({
     const exportPickerPathStyle = {
       marginBottom: 6,
       fontSize: 12,
-      opacity: 0.8,
+      color: 'var(--sl-muted)',
       overflow: 'hidden',
       textOverflow: 'ellipsis',
       whiteSpace: 'nowrap',
     }
     const exportPickerBarStyle = { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }
-    const exportPickerCountStyle = { fontSize: 12, opacity: 0.55 }
+    const exportPickerCountStyle = { fontSize: 12, color: 'var(--sl-faint)' }
     // Fixed height: the dialog keeps its size while navigating between a folder
     // with three entries and one with three hundred.
     const exportPickerListStyle = {
       height: 260,
       overflow: 'auto',
-      border: '1px solid color-mix(in srgb, currentColor 12%, transparent)',
-      borderRadius: 6,
+      border: '1px solid var(--sl-line)',
+      borderRadius: 8,
       padding: '4px 2px',
     }
     const exportPickerRowStyle = {
@@ -4121,7 +4297,7 @@ window.__ModuleLoader__.load({
     }
     const exportPickerDirStyle = { flex: '1 1 auto', cursor: 'pointer', fontSize: 13 }
     const exportPickerFileStyle = { flex: '1 1 auto', cursor: 'default', fontSize: 13, opacity: 0.85 }
-    const exportPickerSizeStyle = { fontSize: 11, opacity: 0.45, minWidth: 56, textAlign: 'right' }
+    const exportPickerSizeStyle = { fontSize: 11, color: 'var(--sl-faint)', minWidth: 56, textAlign: 'right' }
     const importListStyle = {
       display: 'flex',
       flexDirection: 'column',
@@ -4133,8 +4309,8 @@ window.__ModuleLoader__.load({
     const importFileButtonStyle = {
       height: 30,
       padding: '0 10px',
-      borderRadius: 6,
-      border: '1px solid color-mix(in srgb, currentColor 16%, transparent)',
+      borderRadius: 8,
+      border: '1px solid var(--sl-line)',
       color: 'inherit',
       font: 'inherit',
       fontSize: 12,
@@ -4144,19 +4320,19 @@ window.__ModuleLoader__.load({
       textOverflow: 'ellipsis',
       whiteSpace: 'nowrap',
     }
-    // Same highlight recipe as the dock's enabled export action: a light fill
-    // mixed over Canvas, a slightly stronger border, and semibold text.
+    // Same highlight recipe as the dock's enabled action: a light fill mixed over
+    // Canvas, a slightly stronger border, and semibold text.
     const importFileButtonSelectedStyle = {
       ...importFileButtonStyle,
-      border: '1px solid color-mix(in srgb, currentColor 24%, transparent)',
-      background: 'color-mix(in srgb, currentColor 12%, Canvas)',
+      border: '1px solid color-mix(in srgb, var(--sl-accent) 45%, transparent)',
+      background: 'color-mix(in srgb, var(--sl-accent) 10%, Canvas)',
       fontWeight: 600,
     }
     const importSectionTitleStyle = {
-      margin: '12px 0 6px',
+      margin: '14px 0 6px',
       fontSize: 12,
       fontWeight: 600,
-      opacity: 0.75,
+      color: 'var(--sl-muted)',
     }
     const importMappingLabelStyle = {
       flex: '1 1 auto',
@@ -4168,7 +4344,7 @@ window.__ModuleLoader__.load({
     }
     const importPathHintStyle = {
       fontSize: 11,
-      opacity: 0.45,
+      color: 'var(--sl-faint)',
       overflow: 'hidden',
       textOverflow: 'ellipsis',
       whiteSpace: 'nowrap',
@@ -4177,10 +4353,10 @@ window.__ModuleLoader__.load({
     const importConflictBlockStyle = { marginTop: 14 }
     const importConflictSelectStyle = {
       width: '100%',
-      height: 30,
+      height: 32,
       padding: '0 8px',
-      borderRadius: 6,
-      border: '1px solid color-mix(in srgb, currentColor 18%, transparent)',
+      borderRadius: 8,
+      border: '1px solid var(--sl-line)',
       background: 'Canvas',
       color: 'inherit',
       font: 'inherit',
@@ -4189,133 +4365,74 @@ window.__ModuleLoader__.load({
     }
     const exportInputStyle = {
       width: '100%',
-      height: 32,
+      height: 34,
       marginTop: 6,
       padding: '0 10px',
-      borderRadius: 6,
-      border: '1px solid color-mix(in srgb, currentColor 22%, transparent)',
+      borderRadius: 8,
+      border: '1px solid var(--sl-line-strong)',
       background: 'transparent',
       color: 'inherit',
       font: 'inherit',
       fontSize: 13,
     }
-    // Full-width export dock: a bottom gradient strip floating over the session
-    // list, with the action pinned to its right edge.
+    // Floating dock: one bar, centred over the empty tail the list reserves for
+    // it. It is sized by its actions, so it never blocks a row it does not cover.
     const exportDockStyle = {
       position: 'absolute',
-      left: 12,
-      right: 12,
-      bottom: 24,
-      height: 80,
-      borderRadius: 20,
-      overflow: 'hidden',
+      left: '50%',
+      bottom: 16,
+      transform: 'translateX(-50%)',
       zIndex: 30,
       display: 'flex',
       alignItems: 'center',
-      justifyContent: 'flex-end',
-      padding: '0 20px',
-      // A hairline edge keeps the strip readable when it floats over a row of
-      // similar brightness; the backdrop blur stays the only expensive effect.
-      border: '1px solid color-mix(in srgb, currentColor 7%, transparent)',
-      backdropFilter: 'blur(8px)',
-      WebkitBackdropFilter: 'blur(8px)',
-      pointerEvents: 'none',
+      gap: 4,
+      padding: 6,
+      maxWidth: 'calc(100% - 24px)',
     }
-    const dockActionsStyle = {
-      position: 'relative',
-      zIndex: 1,
-      display: 'flex',
-      alignItems: 'center',
-      gap: 15,
-      pointerEvents: 'none',
-    }
-    const dockSecondaryButtonStyle = {
-      display: 'inline-flex',
-      alignItems: 'center',
-      justifyContent: 'center',
-      // Same fixed box as the export action so the dock reads as one row. The
-      // surface (background/border) comes from the `.sl-dock-secondary` class so
-      // hover and pressed states are not blocked by an inline value.
-      width: 116,
-      height: 38,
-      padding: 0,
-      borderRadius: 999,
-      color: 'inherit',
-      font: 'inherit',
-      fontSize: 13,
-      fontWeight: 500,
-      cursor: 'pointer',
-      pointerEvents: 'auto',
-    }
-    const fabButtonStyle = {
-      position: 'relative',
-      zIndex: 1,
-      display: 'inline-flex',
-      alignItems: 'center',
-      justifyContent: 'center',
-      // Fixed width: the label gains a count while selecting, and a growing
-      // button reads as jitter next to the dock's other action.
-      width: 116,
-      height: 38,
-      padding: 0,
-      borderRadius: 999,
-      color: 'inherit',
-      font: 'inherit',
-      fontSize: 13,
-      fontWeight: 600,
-      cursor: 'pointer',
-      pointerEvents: 'auto',
-    }
-    // The disabled look (dim, no shadow) comes from `.sl-fab:disabled`; the style
-    // object only has to stay layout-compatible.
-    const fabDisabledStyle = { ...fabButtonStyle }
+    // Modals keep `transform-origin: center`: they are not anchored to a trigger.
     const overlayStyle = {
       position: 'fixed',
       inset: 0,
-      background: 'rgba(0, 0, 0, 0.45)',
+      zIndex: 1000,
       display: 'flex',
       alignItems: 'center',
       justifyContent: 'center',
-      zIndex: 1000,
+      padding: 24,
     }
     const dialogStyle = {
-      width: 'min(560px, 90vw)',
-      maxHeight: '78vh',
+      width: 'min(560px, 92vw)',
+      maxHeight: '80vh',
       overflow: 'auto',
       padding: '20px 22px',
-      borderRadius: 12,
-      border: '1px solid color-mix(in srgb, currentColor 18%, transparent)',
-      background: 'Canvas',
-      color: 'CanvasText',
-      boxShadow: '0 18px 50px rgba(0, 0, 0, 0.45)',
     }
-    const dialogTitleStyle = { margin: '0 0 8px', fontSize: 16, fontWeight: 600 }
-    const dialogHintStyle = { margin: '0 0 12px', fontSize: 12, opacity: 0.6, lineHeight: 1.6 }
-    const dialogTextStyle = { fontSize: 13, opacity: 0.7, padding: '8px 0' }
+    const dialogTitleStyle = { margin: '0 0 8px', fontSize: 16, fontWeight: 600, letterSpacing: '0.01em' }
+    const dialogHintStyle = { margin: '0 0 12px', fontSize: 12, lineHeight: 1.65, color: 'var(--sl-muted)' }
+    const dialogTextStyle = { padding: '8px 0', fontSize: 13, color: 'var(--sl-muted)' }
     const dialogListStyle = {
-      borderTop: '1px solid color-mix(in srgb, currentColor 12%, transparent)',
       margin: '4px 0 12px',
+      borderTop: '1px solid var(--sl-line)',
     }
     const dialogRowStyle = {
       display: 'flex',
       alignItems: 'center',
       gap: 8,
       padding: '8px 2px',
-      borderBottom: '1px solid color-mix(in srgb, currentColor 10%, transparent)',
+      borderBottom: '1px solid var(--sl-line)',
       fontSize: 13,
     }
-    const dialogActionsStyle = { display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 8 }
+    const dialogActionsStyle = { display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 14 }
     const dialogFamilyStyle = {
-      border: '1px solid color-mix(in srgb, currentColor 12%, transparent)',
-      borderRadius: 8,
-      padding: '6px 8px',
+      border: '1px solid var(--sl-line)',
+      borderRadius: 12,
+      background: 'var(--sl-surface)',
+      padding: '8px 10px',
       marginBottom: 10,
     }
     const dialogFamilyHeadStyle = {
       display: 'flex',
       alignItems: 'center',
       gap: 8,
-      padding: '6px 2px',
+      padding: '4px 2px',
       fontWeight: 600,
     }
     const forkOptionStyle = {
@@ -4323,25 +4440,25 @@ window.__ModuleLoader__.load({
       alignItems: 'center',
       gap: 6,
       fontSize: 12,
-      opacity: 0.85,
+      color: 'var(--sl-muted)',
       margin: '4px 0 10px',
       cursor: 'pointer',
     }
     const loadedHintStyle = {
-      fontSize: 12,
-      lineHeight: 1.6,
       padding: '8px 10px',
       margin: '4px 0 10px',
-      borderRadius: 6,
-      border: '1px solid color-mix(in srgb, var(--sl-warn, #f0b37e) 45%, transparent)',
+      borderRadius: 8,
+      border: '1px solid color-mix(in srgb, var(--sl-warn, #f0b37e) 42%, transparent)',
       color: 'var(--sl-warn, #f0b37e)',
-      background: 'color-mix(in srgb, var(--sl-warn, #f0b37e) 10%, transparent)',
+      background: 'color-mix(in srgb, var(--sl-warn, #f0b37e) 9%, transparent)',
+      fontSize: 12,
+      lineHeight: 1.6,
     }
     const purgeInputStyle = {
       width: '100%',
-      height: 32,
+      height: 34,
       padding: '0 10px',
-      borderRadius: 6,
+      borderRadius: 8,
       border: '1px solid color-mix(in srgb, var(--sl-danger, #f06a6a) 45%, transparent)',
       background: 'transparent',
       color: 'inherit',
@@ -4349,41 +4466,40 @@ window.__ModuleLoader__.load({
       fontSize: 13,
     }
     const placeholderStyle = {
-      padding: '56px 16px',
-      fontSize: 13,
-      opacity: 0.55,
+      padding: '56px 20px',
       textAlign: 'center',
-      lineHeight: 1.6,
+      fontSize: 13,
+      lineHeight: 1.7,
+      color: 'var(--sl-muted)',
     }
-    const placeholderHintStyle = { marginTop: 6, fontSize: 12, opacity: 0.6 }
     const infoStyle = {
-      fontSize: 12,
-      lineHeight: 1.6,
       padding: '8px 10px',
       margin: '4px 0 10px',
-      borderRadius: 6,
-      border: '1px solid color-mix(in srgb, var(--sl-info, #6aa9f0) 45%, transparent)',
+      borderRadius: 8,
+      border: '1px solid color-mix(in srgb, var(--sl-info, #6aa9f0) 42%, transparent)',
       color: 'var(--sl-info, #6aa9f0)',
-      background: 'color-mix(in srgb, var(--sl-info, #6aa9f0) 10%, transparent)',
-    }
-    const dialogBlockerStyle = {
+      background: 'color-mix(in srgb, var(--sl-info, #6aa9f0) 9%, transparent)',
       fontSize: 12,
       lineHeight: 1.6,
+    }
+    const dialogBlockerStyle = {
       padding: '6px 8px',
       margin: '6px 0 2px',
-      borderRadius: 6,
+      borderRadius: 8,
       color: 'var(--sl-warn, #f0b37e)',
-      background: 'color-mix(in srgb, var(--sl-warn, #f0b37e) 12%, transparent)',
+      background: 'color-mix(in srgb, var(--sl-warn, #f0b37e) 11%, transparent)',
+      fontSize: 12,
+      lineHeight: 1.6,
       textAlign: 'left',
     }
     const warnStyle = {
       flex: '0 0 auto',
-      padding: '6px 24px',
-      fontSize: 12,
+      padding: '7px 12px',
+      borderRadius: 8,
       color: 'var(--sl-warn, #f0b37e)',
-      background: 'color-mix(in srgb, var(--sl-warn, #f0b37e) 12%, transparent)',
+      background: 'color-mix(in srgb, var(--sl-warn, #f0b37e) 11%, transparent)',
+      fontSize: 12,
     }
-    const footerStyle = { flex: '0 0 auto', padding: '6px 24px', fontSize: 11, opacity: 0.35 }
 
     return {
       name: 'dsh-sessions-library',
