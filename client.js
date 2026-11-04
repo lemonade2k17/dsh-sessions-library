@@ -28,6 +28,13 @@ window.__ModuleLoader__.load({
     const IMPORT_RUN_PATH = 'api/sessions-library/import-run'
     const EXPORT_DIR_STORAGE_KEY = 'dsh-sessions-library:export-dir'
     const WORKSPACE_BROWSE_PATH = 'api/sessions-library/workspace-browse'
+    // Per-request budgets. The Host does not roll back file work when the
+    // browser aborts, so a request that is merely slow must be allowed to
+    // finish: packaging an export, writing an import or moving a full delete
+    // batch all take far longer than a page read.
+    const REQUEST_TIMEOUT_MS = 30000
+    const BATCH_TIMEOUT_MS = 90000
+    const LONG_REQUEST_TIMEOUT_MS = 180000
 
     /**
      * Read the last chosen export directory.
@@ -285,8 +292,15 @@ window.__ModuleLoader__.load({
       '.sl-heading { margin: 0; font-size: 16px; font-weight: 650; letter-spacing: 0.01em; }',
       '.sl-subtitle { font-size: 12px; color: var(--sl-faint); font-variant-numeric: tabular-nums; }',
       '.sl-actions { margin-left: auto; display: flex; align-items: center; gap: 2px; }',
-      '.sl-toolbar { display: flex; align-items: center; gap: 8px; margin-top: 12px; }',
+      '.sl-toolbar { display: flex; align-items: center; gap: 8px; margin-top: 12px; animation: sl-toolbar-in 160ms cubic-bezier(0.23, 1, 0.32, 1); }',
       '.sl-scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 12px 0 20px; }',
+      // View panels arrive instead of switching: the incoming view fades and
+      // rises over an already-vacated frame, so the swap never flashes as a
+      // hard cut. The toolbar above moves less (4px) and slightly faster —
+      // chrome settles first, content lands second.
+      '.sl-panel { animation: sl-panel-in 200ms cubic-bezier(0.23, 1, 0.32, 1); }',
+      '@keyframes sl-panel-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }',
+      '@keyframes sl-toolbar-in { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }',
 
       // --- buttons ----------------------------------------------------------
       // One base for every text button: 1px hairline, 8px radius, and a press
@@ -296,6 +310,15 @@ window.__ModuleLoader__.load({
       '.sl-btn:hover:not(:disabled) { background: var(--sl-surface-2); }',
       '.sl-btn:active:not(:disabled) { transform: scale(0.97); }',
       '.sl-btn:disabled { opacity: 0.45; cursor: not-allowed; }',
+      // Destructive confirmations keep their hue on hover: the tint deepens behind
+      // the same border instead of flashing the neutral grey hover over it.
+      '.sl-btn[data-tone="danger"] { border-color: color-mix(in srgb, var(--sl-danger) 52%, transparent);'
+        + ' background: color-mix(in srgb, var(--sl-danger) 12%, transparent); }',
+      '.sl-btn[data-tone="danger"]:hover:not(:disabled) { border-color: color-mix(in srgb, var(--sl-danger) 68%, transparent);'
+        + ' background: color-mix(in srgb, var(--sl-danger) 18%, transparent); }',
+      '.sl-btn[data-tone="danger"]:active:not(:disabled) { background: color-mix(in srgb, var(--sl-danger) 24%, transparent); }',
+      '.sl-btn[data-tone="danger"]:disabled { border-color: color-mix(in srgb, var(--sl-danger) 26%, transparent);'
+        + ' background: color-mix(in srgb, var(--sl-danger) 6%, transparent); color: var(--sl-faint); }',
       '.sl-ghost { display: inline-flex; align-items: center; gap: 6px; height: 28px; padding: 0 9px; border: 1px solid transparent;'
         + ' border-radius: 8px; background: transparent; color: var(--sl-muted); font: inherit; font-size: 12.5px; cursor: pointer;'
         + ' transition: background-color 140ms ease, color 140ms ease, transform 140ms ease; }',
@@ -315,14 +338,19 @@ window.__ModuleLoader__.load({
       '.sl-search input::placeholder { color: color-mix(in srgb, currentColor 38%, transparent); }',
       '.sl-search-clear { flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center; width: 18px; height: 18px; padding: 0;'
         + ' border: none; border-radius: 999px; background: color-mix(in srgb, currentColor 11%, transparent); color: inherit;'
-        + ' cursor: pointer; opacity: 0.65; transition: opacity 120ms ease, background-color 120ms ease; }',
+        + ' cursor: pointer; opacity: 0.65; transition: opacity 120ms ease, background-color 120ms ease, transform 120ms ease; }',
       '.sl-search-clear:hover { opacity: 1; background: color-mix(in srgb, currentColor 16%, transparent); }',
+      // Micro-control floor: an 18px icon button needs a visible shrink to read
+      // as pressed (4% would be invisible), so the press baseline is 0.90 here —
+      // the deliberate small-size exception to the 0.96 surface-button scale.
+      '.sl-search-clear:active { transform: scale(0.9); }',
       '.sl-seg { display: inline-flex; align-items: center; gap: 2px; flex: 0 0 auto; padding: 2px; border: 1px solid var(--sl-line);'
         + ' border-radius: var(--sl-radius-sm); background: color-mix(in srgb, currentColor 4%, Canvas); }',
       '.sl-seg-btn { height: 24px; padding: 0 10px; border: none; border-radius: 6px; background: transparent; color: var(--sl-muted);'
         + ' font: inherit; font-size: 12px; font-weight: 500; font-variant-numeric: tabular-nums; cursor: pointer;'
-        + ' transition: background-color 140ms ease, color 140ms ease, box-shadow 140ms ease; }',
+        + ' transition: background-color 140ms ease, color 140ms ease, box-shadow 140ms ease, transform 140ms ease; }',
       '.sl-seg-btn:hover { color: inherit; }',
+      '.sl-seg-btn:active { transform: scale(0.96); }',
       '.sl-seg-btn[data-active="true"] { background: color-mix(in srgb, currentColor 10%, Canvas); color: inherit;'
         + ' box-shadow: 0 1px 2px rgba(0, 0, 0, 0.16); }',
 
@@ -339,7 +367,9 @@ window.__ModuleLoader__.load({
         + ' transition: background-color 140ms ease; }',
       '.sl-group-head:hover { background: var(--sl-sheen); }',
       '.sl-group-head:active { background: color-mix(in srgb, currentColor 8%, transparent); }',
-      '.sl-group-body { padding: 0 6px 6px; }',
+      '.sl-group-body { padding: 0 6px 6px; animation: sl-reveal 170ms cubic-bezier(0.23, 1, 0.32, 1); }',
+      // Rows arrive by settling down 3px, the way a card lands when dropped;
+      // collapsing stays instant because removing chrome should never wait.
       // The bin and the log use the same card shell for their flat lists.
       '.sl-list-card { border: 1px solid var(--sl-line); border-radius: var(--sl-radius-lg); background: var(--sl-surface); overflow: hidden; }',
       '.sl-list-card > *:last-child { border-bottom: none; }',
@@ -358,7 +388,7 @@ window.__ModuleLoader__.load({
         + ' font-variant-numeric: tabular-nums; }',
 
       // --- rows -------------------------------------------------------------
-      '.sl-row { display: flex; align-items: center; gap: 8px; width: 100%; margin: 1px 0; padding: 7px 10px 7px 36px; border: none;'
+      '.sl-row { display: flex; align-items: center; gap: 8px; width: 100%; margin: 1px 0; padding: 7px 10px 7px 26px; border: none;'
         + ' border-radius: 8px; background: transparent; color: inherit; font: inherit; font-size: 13px; text-align: left; cursor: pointer;'
         + ' transition: background-color 120ms ease, box-shadow 120ms ease; }',
       '.sl-row:hover { background: color-mix(in srgb, currentColor 5%, transparent); }',
@@ -376,6 +406,10 @@ window.__ModuleLoader__.load({
       '.sl-badge[data-tone="running"] { color: color-mix(in srgb, #59c98d 80%, currentColor);'
         + ' background: color-mix(in srgb, #59c98d 14%, transparent); }',
       '.sl-dot { width: 5px; height: 5px; border-radius: 999px; background: currentColor; }',
+      // "运行中" breathes on the dot alone: it marks a live state without
+      // pushing a whole-badge flicker into the periphery.
+      '.sl-badge[data-tone="running"] .sl-dot { animation: sl-pulse 2.4s ease-in-out infinite; }',
+      '@keyframes sl-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }',
 
       // --- checkbox ---------------------------------------------------------
       // The drawn box is 15px; a transparent halo grows the pointer target to
@@ -385,11 +419,13 @@ window.__ModuleLoader__.load({
       '.sl-check { position: relative; flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center;'
         + ' width: 15px; height: 15px; border: 1.5px solid color-mix(in srgb, CanvasText 30%, transparent); border-radius: 4.5px;'
         + ' background: transparent; color: transparent;'
-        + ' transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease; }',
+        + ' transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease, transform 140ms cubic-bezier(0.23, 1, 0.32, 1); }',
       '.sl-check::before { content: ""; position: absolute; inset: -6px; border-radius: 7px; }',
       '.sl-check:hover { border-color: color-mix(in srgb, CanvasText 52%, transparent); }',
+      // A 5% breathe up sells "recorded": the box settles a touch larger when the
+      // answer is on, without ever crossing into a wobble.
       '.sl-check[aria-checked="true"], .sl-check[aria-checked="mixed"] { border-color: var(--sl-accent); background: var(--sl-accent);'
-        + ' color: var(--sl-accent-ink); }',
+        + ' color: var(--sl-accent-ink); transform: scale(1.05); }',
       '.sl-check[aria-checked="true"]:hover, .sl-check[aria-checked="mixed"]:hover { border-color: var(--sl-accent); }',
 
       // --- dock -------------------------------------------------------------
@@ -415,6 +451,10 @@ window.__ModuleLoader__.load({
       '.sl-dock-count { min-width: 18px; height: 18px; padding: 0 5px; display: inline-flex; align-items: center; justify-content: center;'
         + ' border-radius: 999px; background: color-mix(in srgb, currentColor 10%, transparent);'
         + ' font-size: 11px; font-variant-numeric: tabular-nums; }',
+      // The dock rises 10px while fading in: it floats into place instead of
+      // snapping over the last rows the pointer may still be resting on.
+      '.sl-dock { animation: sl-dock-in 200ms cubic-bezier(0.23, 1, 0.32, 1) both; }',
+      '@keyframes sl-dock-in { from { opacity: 0; transform: translate(-50%, 10px); } to { opacity: 1; transform: translate(-50%, 0); } }',
 
       // --- empty + loading --------------------------------------------------
       '.sl-empty { display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 76px 20px; text-align: center; }',
@@ -439,6 +479,25 @@ window.__ModuleLoader__.load({
       // Modals are the one surface that stays centred; they are not anchored to
       // a trigger, so a 6px lift reads as "arrived", not "shot out of nowhere".
       '@keyframes sl-pop { from { opacity: 0; transform: translateY(6px) scale(0.985); } to { opacity: 1; transform: none; } }',
+      // Expansion reveal for group bodies; reserved space, no keyframe below it.
+      '@keyframes sl-reveal { from { opacity: 0; transform: translateY(-3px); } }',
+
+      // --- notices ----------------------------------------------------------
+      // One recipe for every inline status strip: tone and amount of tint are
+      // decided by data-tone, so an error in any dialog looks like the rest.
+      '.sl-note { margin: 4px 0 10px; padding: 8px 10px; border: 1px solid transparent; border-radius: 8px; font-size: 12px; line-height: 1.6;'
+        + ' animation: sl-note-in 160ms cubic-bezier(0.23, 1, 0.32, 1); }',
+      '.sl-note[data-tone="info"] { border-color: color-mix(in srgb, var(--sl-info) 42%, transparent); color: var(--sl-info);'
+        + ' background: color-mix(in srgb, var(--sl-info) 9%, transparent); }',
+      // Stand-alone strips (top of a view) sit alone and keep their own spacing.
+      '.sl-note[data-tone="warn"] { border-color: color-mix(in srgb, var(--sl-warn) 42%, transparent); color: var(--sl-warn);'
+        + ' background: color-mix(in srgb, var(--sl-warn) 11%, transparent); padding: 7px 12px; margin: 0; }',
+      '.sl-note[data-tone="caution"] { border-color: color-mix(in srgb, var(--sl-warn) 42%, transparent); color: var(--sl-warn);'
+        + ' background: color-mix(in srgb, var(--sl-warn) 9%, transparent); }',
+      // Inline error copy inside dialogs tucks closer to the fields above it.
+      '.sl-note[data-tone="blocker"] { border-color: color-mix(in srgb, var(--sl-warn) 44%, transparent); color: var(--sl-warn);'
+        + ' background: color-mix(in srgb, var(--sl-warn) 11%, transparent); padding: 6px 8px; margin: 6px 0 2px; }',
+      '@keyframes sl-note-in { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: none; } }',
 
       // --- footer + inputs --------------------------------------------------
       // Root-level footer: a fixed strip under the scroll area. It sits above the
@@ -448,9 +507,15 @@ window.__ModuleLoader__.load({
       '.sl-footer { flex: 0 0 auto; padding: 6px 0 10px; }',
       '.sl-footer .sl-container { font-size: 10.5px; color: var(--sl-faint); opacity: 0.8;'
         + ' white-space: nowrap; overflow: hidden; text-overflow: ellipsis; pointer-events: none; }',
+      // Shared field chrome: border, fill, radius and the focus ring live here
+      // so per-slot inline styles only carry geometry (width, margins, height).
+      '.sl-input { height: 32px; padding: 0 8px; border: 1px solid var(--sl-line-strong); border-radius: 8px;'
+        + ' background: color-mix(in srgb, currentColor 2.5%, Canvas); color: inherit; font: inherit; font-size: 12.5px; cursor: pointer;'
+        + ' transition: border-color 140ms ease, background-color 140ms ease, box-shadow 140ms ease; }',
       '.sl-input::placeholder { color: color-mix(in srgb, currentColor 38%, transparent); }',
-      '.sl-input:focus { outline: 2px solid color-mix(in srgb, var(--sl-accent) 45%, transparent); outline-offset: 1px;'
-        + ' border-color: color-mix(in srgb, var(--sl-accent) 55%, transparent); }',
+      '.sl-input:focus { outline: none; border-color: color-mix(in srgb, var(--sl-accent) 55%, transparent);'
+        + ' box-shadow: 0 0 0 3px color-mix(in srgb, var(--sl-accent) 12%, transparent); }',
+      '.sl-input[data-variant="danger"] { border-color: color-mix(in srgb, var(--sl-danger) 45%, transparent); }',
       // Chosen exclusion paths: a fixed-height list with its own scrollbar, so a
       // long selection stays readable instead of stretching the dialog.
       '.sl-pathlist { scrollbar-gutter: stable; }',
@@ -458,6 +523,20 @@ window.__ModuleLoader__.load({
       '.sl-pathlist-row:hover { background: var(--sl-sheen); }',
       '.sl-pathlist-path { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }',
       '.sl-pathlist-empty { padding: 8px; font-size: 12px; opacity: 0.5; }',
+
+      // --- package list buttons (import wheel) ------------------------------
+      // Selecting one is a durable state: its accent fill stays put while
+      // hover lifts the border a notch above the resting line.
+      '.sl-filebtn { height: 30px; padding: 0 10px; border: 1px solid var(--sl-line); border-radius: 8px; background: transparent;'
+        + ' color: inherit; font: inherit; font-size: 12px; text-align: left; cursor: pointer; overflow: hidden; text-overflow: ellipsis;'
+        + ' white-space: nowrap;'
+        + ' transition: background-color 140ms ease, border-color 140ms ease, transform 140ms ease; }',
+      '.sl-filebtn:hover { border-color: var(--sl-line-strong); background: color-mix(in srgb, currentColor 4%, Canvas); }',
+      '.sl-filebtn:active { transform: scale(0.97); }',
+      '.sl-filebtn[data-selected="true"] { border-color: color-mix(in srgb, var(--sl-accent) 45%, transparent);'
+        + ' background: color-mix(in srgb, var(--sl-accent) 10%, Canvas); font-weight: 600; }',
+      '.sl-filebtn[data-selected="true"]:hover { border-color: color-mix(in srgb, var(--sl-accent) 62%, transparent);'
+        + ' background: color-mix(in srgb, var(--sl-accent) 15%, Canvas); }',
 
       // --- scrollbar + focus + motion --------------------------------------
       '.sl-root ::-webkit-scrollbar { width: 10px; height: 10px; }',
@@ -637,8 +716,12 @@ window.__ModuleLoader__.load({
      * @returns {Promise<object>} the snapshot payload.
      */
     async function fetchSnapshot() {
+      // The Host reads the workspace baseline, the session store and the title
+      // batch one after another with bounded waits, so a slow machine can take
+      // well over 20 s to answer; aborting first only reported a timeout for a
+      // request that was still going to succeed.
       const controller = new AbortController()
-      const timer = setTimeout(() => controller.abort(), 20000)
+      const timer = setTimeout(() => controller.abort(), 45000)
       const request = {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
@@ -658,7 +741,7 @@ window.__ModuleLoader__.load({
         return payload
       } catch (failure) {
         if (failure && failure.name === 'AbortError') {
-          throw new Error('读取超时（20 秒）')
+          throw new Error('读取超时（45 秒）')
         }
         throw failure
       } finally {
@@ -671,11 +754,20 @@ window.__ModuleLoader__.load({
      *
      * @param {string} path route path relative to the document.
      * @param {object} body request payload.
+     * @param {{ timeoutMs?: number }} [options] per-call abort budget.
      * @returns {Promise<object>} the parsed response payload.
      */
-    async function postJson(path, body) {
+    async function postJson(path, body, options = {}) {
+      // Long operations (packaging an export, writing an import, moving a whole
+      // delete batch) legitimately run past the default budget. The Host keeps
+      // working after the browser gives up, so an early abort only produced a
+      // false failure followed by a retry on half-applied state.
+      const requestedTimeout = Number(options.timeoutMs)
+      const timeoutMs = Number.isFinite(requestedTimeout) && requestedTimeout > 0
+        ? requestedTimeout
+        : REQUEST_TIMEOUT_MS
       const controller = new AbortController()
-      const timer = setTimeout(() => controller.abort(), 30000)
+      const timer = setTimeout(() => controller.abort(), timeoutMs)
       try {
         const response = await fetch(path, {
           method: 'POST',
@@ -705,6 +797,13 @@ window.__ModuleLoader__.load({
           throw error
         }
         return payload
+      } catch (failure) {
+        if (failure && failure.name === 'AbortError') {
+          throw new Error(
+            `请求超过 ${Math.round(timeoutMs / 1000)} 秒没有返回；Host 可能仍在处理，请刷新页面确认结果后再重试`,
+          )
+        }
+        throw failure
       } finally {
         clearTimeout(timer)
       }
@@ -777,6 +876,10 @@ window.__ModuleLoader__.load({
         // Root element, used to tell clicks inside this page from clicks in the
         // native sidebar or another panel.
         const rootRef = React.useRef(null)
+        // Scroll container; a view switch resets its offset so the new view
+        // starts at its own top instead of inheriting the previous list's
+        // position (which makes the swap read as a content flash).
+        const scrollRef = React.useRef(null)
 
         React.useEffect(() => {
           let cancelled = false
@@ -909,6 +1012,14 @@ window.__ModuleLoader__.load({
           const timer = setTimeout(() => setUnarchiveNotice(null), 5000)
           return () => clearTimeout(timer)
         }, [unarchiveNotice])
+
+        // Re-enter each view from the top. useLayoutEffect runs before the
+        // browser paints, so the previous view's offset cannot flash for a
+        // frame while the new panel is still transparent.
+        React.useLayoutEffect(() => {
+          const container = scrollRef.current
+          if (container) container.scrollTop = 0
+        }, [view])
 
         // Every group, independent of the filter and the query.
         const allGroups = React.useMemo(() => {
@@ -1385,7 +1496,7 @@ window.__ModuleLoader__.load({
             const payload = await postJson('api/sessions-library/delete-preflight', {
               sessionIds: ids,
               includeForks: withForks,
-            })
+            }, { timeoutMs: BATCH_TIMEOUT_MS })
             setDialog({
               phase: 'ready',
               families: Array.isArray(payload.families) ? payload.families : [],
@@ -1498,7 +1609,7 @@ window.__ModuleLoader__.load({
           if (zipPath === '') return
           setImportDialog((current) => (current ? { ...current, phase: 'checking', error: null } : current))
           try {
-            const payload = await postJson(IMPORT_PREFLIGHT_PATH, { path: zipPath })
+            const payload = await postJson(IMPORT_PREFLIGHT_PATH, { path: zipPath }, { timeoutMs: BATCH_TIMEOUT_MS })
             const report = payload && payload.report ? payload.report : null
             if (!report) throw new Error('预检没有返回结果')
             const mapping = {}
@@ -1543,7 +1654,9 @@ window.__ModuleLoader__.load({
             : 'skip'
           setImportDialog((current) => (current ? { ...current, phase: 'importing', error: null } : current))
           try {
-            const payload = await postJson(IMPORT_RUN_PATH, { path: zipPath, mapping, workspaceConflict })
+            const payload = await postJson(IMPORT_RUN_PATH, { path: zipPath, mapping, workspaceConflict }, {
+              timeoutMs: LONG_REQUEST_TIMEOUT_MS,
+            })
             setImportDialog((current) => (current
               ? {
                   ...current,
@@ -1611,11 +1724,14 @@ window.__ModuleLoader__.load({
           const workspaceResult = await postJson(WORKSPACE_PREFLIGHT_PATH, {
             sessionIds: ids,
             excludePaths: Array.isArray(excludePaths) ? excludePaths : [],
-          }).catch(() => null)
+          }, { timeoutMs: BATCH_TIMEOUT_MS }).catch(() => null)
           const workspaceInfo = {
             count: workspaceResult ? Number(workspaceResult.totalFiles) || 0 : 0,
             bytes: workspaceResult ? Number(workspaceResult.totalBytes) || 0 : 0,
             truncated: workspaceResult ? workspaceResult.truncated === true : false,
+            // The Host caps one batch; echo it so the dialog can say the
+            // preview (and the export) only covers the head of the selection.
+            limit: readBatchLimit(workspaceResult && workspaceResult.limit),
             workspaces: workspaceResult && Array.isArray(workspaceResult.workspaces)
               ? workspaceResult.workspaces
               : [],
@@ -1815,7 +1931,7 @@ window.__ModuleLoader__.load({
               ...(exportDialog !== null ? {
                 excludePaths: Array.isArray(exportDialog.excludePaths) ? exportDialog.excludePaths : [],
               } : {}),
-            })
+            }, { timeoutMs: LONG_REQUEST_TIMEOUT_MS })
             saveExportDir(targetDir)
             setExportDialog({
               phase: 'done',
@@ -1827,6 +1943,7 @@ window.__ModuleLoader__.load({
               workspaceFileBytes: Number(payload.workspaceFileBytes) || 0,
               workspaceFilesSkipped: Number(payload.workspaceFilesSkipped) || 0,
               bytes: Number(payload.bytes) || 0,
+              limit: readBatchLimit(payload.limit),
               error: null,
             })
           } catch (failure) {
@@ -1890,7 +2007,7 @@ window.__ModuleLoader__.load({
               sessionIds: ids,
               includeForks: withForks,
               progressToken,
-            })
+            }, { timeoutMs: LONG_REQUEST_TIMEOUT_MS })
             const results = Array.isArray(payload.results) ? payload.results : []
             const trashedIds = results.filter((result) => result.status === 'trashed').map((result) => result.id)
             const deferredCount = results.filter((result) => result.status === 'deferred').length
@@ -1943,7 +2060,7 @@ window.__ModuleLoader__.load({
             const payload = await postJson('api/sessions-library/trash-restore', {
               entryNames,
               cancelPurgeOnly: true,
-            })
+            }, { timeoutMs: BATCH_TIMEOUT_MS })
             const results = Array.isArray(payload.results) ? payload.results : []
             const failed = results.find((result) => result.status !== 'canceled')
             if (failed) {
@@ -1972,7 +2089,9 @@ window.__ModuleLoader__.load({
           setTrashError(null)
           setTrashNotice(null)
           try {
-            const payload = await postJson('api/sessions-library/trash-restore', { entryNames })
+            const payload = await postJson('api/sessions-library/trash-restore', { entryNames }, {
+              timeoutMs: BATCH_TIMEOUT_MS,
+            })
             const results = Array.isArray(payload.results) ? payload.results : []
             const failed = results.find((result) => result.status !== 'restored')
             if (failed) {
@@ -2082,7 +2201,9 @@ window.__ModuleLoader__.load({
           )
           setPurgeDialog((current) => ({ ...(current || {}), phase: 'busy' }))
           try {
-            const payload = await postJson('api/sessions-library/trash-purge', { entryNames })
+            const payload = await postJson('api/sessions-library/trash-purge', { entryNames }, {
+              timeoutMs: BATCH_TIMEOUT_MS,
+            })
             const results = Array.isArray(payload.results) ? payload.results : []
             setPurgeDialog((current) => ({ ...(current || {}), phase: 'done', results }))
             setTrashSelected({})
@@ -2317,8 +2438,8 @@ window.__ModuleLoader__.load({
           return h(
             'div',
             null,
-            trashError !== null ? h('div', { style: warnStyle }, trashError) : null,
-            trashNotice !== null ? h('div', { style: infoStyle }, trashNotice) : null,
+            trashError !== null ? h('div', { className: 'sl-note', 'data-tone': 'warn' }, trashError) : null,
+            trashNotice !== null ? h('div', { className: 'sl-note', 'data-tone': 'info' }, trashNotice) : null,
             families.map((family) => {
               const rootEntry = family.entries.find((entry) => entry.role === 'root') || family.entries[0]
               const canRestore = family.entries.every((entry) => entry.restoreAvailable === true)
@@ -2422,7 +2543,7 @@ window.__ModuleLoader__.load({
           return h(
             'div',
             null,
-            logsError !== null ? h('div', { style: warnStyle }, logsError) : null,
+            logsError !== null ? h('div', { className: 'sl-note', 'data-tone': 'warn' }, logsError) : null,
             h(
               'div',
               { className: 'sl-list-card' },
@@ -2550,7 +2671,7 @@ window.__ModuleLoader__.load({
                 )
               : null,
             family.blockers.length > 0
-              ? h('div', { style: dialogBlockerStyle }, family.blockers.map((blocker) => blocker.message).join('；'))
+              ? h('div', { className: 'sl-note', 'data-tone': 'blocker' }, family.blockers.map((blocker) => blocker.message).join('；'))
               : null,
           ))
 
@@ -2574,12 +2695,12 @@ window.__ModuleLoader__.load({
               truncated
                 ? h(
                     'div',
-                    { style: loadedHintStyle },
+                    { className: 'sl-note', 'data-tone': 'caution' },
                     `本次勾选了 ${limit.requested} 个会话，单次最多处理 ${limit.max} 个，因此只会处理前 ${limit.accepted} 个；其余 ${limit.requested - limit.accepted} 个请再删一次。`,
                   )
                 : null,
               dialog.phase === 'busy' ? renderDeleteProgress(dialog.progress) : null,
-              dialog.phase === 'error' ? h('div', { style: dialogBlockerStyle }, `失败：${dialog.error}`) : null,
+              dialog.phase === 'error' ? h('div', { className: 'sl-note', 'data-tone': 'blocker' }, `失败：${dialog.error}`) : null,
               dialog.phase === 'ready' ? h('div', { style: dialogListStyle }, familyBlocks) : null,
               dialog.phase === 'ready' && forkCandidates > 0
                 ? h(
@@ -2597,7 +2718,7 @@ window.__ModuleLoader__.load({
                 && families.some((family) => (family.warnings || []).some((warning) => warning.code === 'loaded'))
                 ? h(
                     'div',
-                    { style: loadedHintStyle },
+                    { className: 'sl-note', 'data-tone': 'caution' },
                     '提示：仍被应用保留（已打开）的会话会立即从侧边栏隐藏并出现在回收站（标为待重启整理），日志文件在下次启动 DSH 时完成移动；期间不影响任何使用。',
                   )
                 : null,
@@ -2627,7 +2748,8 @@ window.__ModuleLoader__.load({
                       'button',
                       {
                         className: 'sl-btn',
-                        style: dangerButtonStyle,
+                        style: actionButtonStyle,
+                        'data-tone': 'danger',
                         disabled: blocked.length > 0 || memberTotal === 0,
                         onClick: confirmDelete,
                       },
@@ -2697,7 +2819,7 @@ window.__ModuleLoader__.load({
                   : `将永久删除 ${sessionCount} 个会话（${(totalBytes / 1048576).toFixed(1)} MB）。此操作不可恢复；附件与成本账本不会被清理。${pendingCount > 0 ? `其中 ${pendingCount} 个仍被应用打开，将在重启 DSH 后删除。` : ''}`,
               ),
               purgeDialog.phase === 'confirm' ? h('div', { style: dialogListStyle }, familyBlocks) : null,
-              purgeDialog.error ? h('div', { style: dialogBlockerStyle }, `失败：${purgeDialog.error}`) : null,
+              purgeDialog.error ? h('div', { className: 'sl-note', 'data-tone': 'blocker' }, `失败：${purgeDialog.error}`) : null,
               purgeDialog.phase === 'confirm'
                 ? h(
                     'div',
@@ -2705,6 +2827,7 @@ window.__ModuleLoader__.load({
                     h('div', { style: dialogHintStyle }, '请输入「永久删除」以确认：'),
                     h('input', {
                       className: 'sl-input',
+                      'data-variant': 'danger',
                       style: purgeInputStyle,
                       value: confirmText,
                       placeholder: '永久删除',
@@ -2741,7 +2864,8 @@ window.__ModuleLoader__.load({
                       'button',
                       {
                         className: 'sl-btn',
-                        style: dangerButtonStyle,
+                        style: actionButtonStyle,
+                        'data-tone': 'danger',
                         disabled: confirmText.trim() !== '永久删除',
                         onClick: confirmPurge,
                       },
@@ -2776,7 +2900,7 @@ window.__ModuleLoader__.load({
                 ),
                 h(
                   'button',
-                  { className: 'sl-btn', style: dangerButtonStyle, onClick: confirmClearLogs },
+                  { className: 'sl-btn', style: actionButtonStyle, 'data-tone': 'danger', onClick: confirmClearLogs },
                   '清空日志',
                 ),
               ),
@@ -2805,7 +2929,7 @@ window.__ModuleLoader__.load({
                 `将删除所选的 ${count} 条操作日志。已经执行的删除、恢复操作本身不受影响。`,
               ),
               logsDeleteDialog.error
-                ? h('div', { style: dialogBlockerStyle }, `失败：${logsDeleteDialog.error}`)
+                ? h('div', { className: 'sl-note', 'data-tone': 'blocker' }, `失败：${logsDeleteDialog.error}`)
                 : null,
               h(
                 'div',
@@ -2824,7 +2948,8 @@ window.__ModuleLoader__.load({
                   'button',
                   {
                     className: 'sl-btn',
-                    style: dangerButtonStyle,
+                    style: actionButtonStyle,
+                    'data-tone': 'danger',
                     disabled: busy,
                     onClick: confirmDeleteLogs,
                   },
@@ -2959,8 +3084,8 @@ window.__ModuleLoader__.load({
                               'button',
                               {
                                 key: file.path,
-                                className: 'sl-btn',
-                                style: selected ? importFileButtonSelectedStyle : importFileButtonStyle,
+                                className: 'sl-filebtn',
+                                'data-selected': selected ? 'true' : 'false',
                                 'aria-pressed': selected ? 'true' : 'false',
                                 onClick: () => setImportDialog((current) => (current
                                   ? { ...current, path: file.path, error: null }
@@ -3001,7 +3126,7 @@ window.__ModuleLoader__.load({
                     ),
                     ...(report.warnings || []).map((warning, index) => h(
                       'div',
-                      { key: `warning-${index}`, style: loadedHintStyle },
+                      { key: `warning-${index}`, className: 'sl-note', 'data-tone': 'caution' },
                       warning,
                     )),
                     h(
@@ -3094,7 +3219,7 @@ window.__ModuleLoader__.load({
                             h('option', { value: 'newer' }, '保留较新：仅当包内文件更新时覆盖'),
                           ),
                           importDialog.workspaceConflict === 'overwrite'
-                            ? h('div', { style: dialogBlockerStyle }, '覆盖不可撤销：本地已有的同名文件会被包内版本替换。')
+                            ? h('div', { className: 'sl-note', 'data-tone': 'blocker' }, '覆盖不可撤销：本地已有的同名文件会被包内版本替换。')
                             : null,
                           importDialog.workspaceConflict === 'newer'
                             ? h(
@@ -3156,7 +3281,7 @@ window.__ModuleLoader__.load({
                 : null,
 
               importDialog.error
-                ? h('div', { style: dialogBlockerStyle }, importDialog.error)
+                ? h('div', { className: 'sl-note', 'data-tone': 'blocker' }, importDialog.error)
                 : null,
 
               actions.length > 0
@@ -3181,6 +3306,12 @@ window.__ModuleLoader__.load({
           const title = done ? '已导出会话' : failed ? '导出失败' : '导出会话'
           const workspaceInfo = exportDialog.workspaceInfo || null
           const workspaceFileCount = workspaceInfo ? Number(workspaceInfo.count) || 0 : 0
+          // Batch bound: the Host caps one request, so the preview and the
+          // finished package only cover the head of the selection. Say so
+          // instead of letting "exported N" read as the whole selection.
+          const batchLimit = readBatchLimit(exportDialog.limit)
+            || (workspaceInfo !== null ? readBatchLimit(workspaceInfo.limit) : null)
+          const batchTruncated = Boolean(batchLimit && batchLimit.requested > batchLimit.accepted)
           const includeWorkspaceFiles = exportDialog.includeWorkspaceFiles === true && workspaceFileCount > 0
           const workspaceLabel = workspaceInfo === null
             ? '正在统计工作区文件…'
@@ -3238,6 +3369,13 @@ window.__ModuleLoader__.load({
                     'div',
                     { style: exportChooserStyle },
                     h('p', { style: dialogHintStyle }, '选择保存位置后开始导出；留空则保存到插件默认目录（~/.dsh/sessions-library/exports）。'),
+                    batchTruncated
+                      ? h(
+                          'div',
+                          { className: 'sl-note', 'data-tone': 'caution' },
+                          `本次勾选了 ${batchLimit.requested} 个会话，单次最多导出 ${batchLimit.max} 个，因此只会导出前 ${batchLimit.accepted} 个；其余 ${batchLimit.requested - batchLimit.accepted} 个请再导一次。`,
+                        )
+                      : null,
                     h('div', { style: dialogHintStyle }, '导出位置'),
                     h('input', {
                       className: 'sl-input',
@@ -3359,7 +3497,7 @@ window.__ModuleLoader__.load({
                 ? h('p', { style: dialogHintStyle }, '正在打包会话日志与工作区信息…')
                 : null,
               exportDialog.error
-                ? h('div', { style: dialogBlockerStyle }, exportDialog.error)
+                ? h('div', { className: 'sl-note', 'data-tone': 'blocker' }, exportDialog.error)
                 : null,
               done
                 ? h(
@@ -3382,6 +3520,13 @@ window.__ModuleLoader__.load({
                         )
                       : null,
                     h('div', { style: exportPathStyle }, exportDialog.path),
+                    batchTruncated
+                      ? h(
+                          'div',
+                          { className: 'sl-note', 'data-tone': 'caution' },
+                          `本次只导出了前 ${batchLimit.accepted} 个会话（单次上限 ${batchLimit.max} 个）；其余 ${batchLimit.requested - batchLimit.accepted} 个未包含在这个包里，请再导一次。`,
+                        )
+                      : null,
                     h('p', { style: dialogHintStyle }, '会话日志按原存储格式逐字节复制；对方可用本插件的「导入会话」还原，工作区附件会写回所选工作区目录。'),
                   )
                 : null,
@@ -3559,7 +3704,7 @@ window.__ModuleLoader__.load({
                 ),
               ),
               picker.error !== null
-                ? h('div', { style: dialogBlockerStyle }, `读取目录失败：${picker.error}`)
+                ? h('div', { className: 'sl-note', 'data-tone': 'blocker' }, `读取目录失败：${picker.error}`)
                 : null,
               h(
                 'div',
@@ -3719,7 +3864,9 @@ window.__ModuleLoader__.load({
 
         const libraryControls = h(
           'div',
-          { className: 'sl-toolbar' },
+          // Keyed by view so the toolbar remounts on view switches and its
+          // entrance animation plays; the same position renders children only.
+          { className: 'sl-toolbar', key: view },
           searchBox(query, '搜索标题或工作区', setQuery),
           h(
             'div',
@@ -3737,7 +3884,7 @@ window.__ModuleLoader__.load({
 
         const trashControls = h(
           'div',
-          { className: 'sl-toolbar' },
+          { className: 'sl-toolbar', key: view },
           h(
             'button',
             { className: 'sl-ghost', onClick: closeTrash },
@@ -3760,7 +3907,7 @@ window.__ModuleLoader__.load({
 
         const logsControls = h(
           'div',
-          { className: 'sl-toolbar' },
+          { className: 'sl-toolbar', key: view },
           h(
             'button',
             { className: 'sl-ghost', onClick: closeLogs },
@@ -3906,19 +4053,21 @@ window.__ModuleLoader__.load({
                 'div',
                 { className: 'sl-container', style: { paddingTop: 8 } },
                 refreshError !== null
-                  ? h('div', { style: warnStyle }, `刷新失败：${refreshError}（显示的是上次读取的结果）`)
+                  ? h('div', { className: 'sl-note', 'data-tone': 'warn' }, `刷新失败：${refreshError}（显示的是上次读取的结果）`)
                   : null,
                 view === 'library' && unarchiveNotice !== null
-                  ? h('div', { style: infoStyle }, unarchiveNotice)
+                  ? h('div', { className: 'sl-note', 'data-tone': 'info' }, unarchiveNotice)
                   : null,
               )
             : null,
           h(
             'div',
-            { className: 'sl-scroll' },
+            { className: 'sl-scroll', ref: scrollRef },
             h(
               'div',
-              { className: 'sl-container' },
+              // Keyed by view: switching panels remounts this wrapper, so the
+              // entrance animation plays exactly at the moment of the swap.
+              { key: view, className: 'sl-panel sl-container' },
               loading ? renderSkeleton() : body,
             ),
           ),
@@ -4082,7 +4231,6 @@ window.__ModuleLoader__.load({
       fontSize: 11,
       fontWeight: 500,
       color: 'var(--sl-muted)',
-      cursor: 'pointer',
     }
     const badgeStyle = {
       display: 'inline-flex',
@@ -4111,7 +4259,7 @@ window.__ModuleLoader__.load({
     const showAllButtonStyle = {
       display: 'inline-flex',
       alignItems: 'center',
-      margin: '2px 0 6px 36px',
+      margin: '2px 0 6px 26px',
       padding: '4px 8px',
       border: 'none',
       borderRadius: 6,
@@ -4121,25 +4269,13 @@ window.__ModuleLoader__.load({
       opacity: 0.6,
       cursor: 'pointer',
     }
-    const sortSelectStyle = {
-      flex: '0 0 auto',
-      height: 32,
-      padding: '0 8px',
-      borderRadius: 8,
-      border: '1px solid var(--sl-line)',
-      background: 'Canvas',
-      color: 'inherit',
-      font: 'inherit',
-      fontSize: 12,
-      cursor: 'pointer',
-    }
+    const sortSelectStyle = { flex: '0 0 auto', cursor: 'pointer' }
     const actionButtonStyle = {
       flex: '0 0 auto',
       height: 30,
       padding: '0 12px',
       font: 'inherit',
       fontSize: 12,
-      cursor: 'pointer',
     }
     const blockedBadgeStyle = {
       flex: '0 0 auto',
@@ -4165,18 +4301,9 @@ window.__ModuleLoader__.load({
       lineHeight: '16px',
       whiteSpace: 'nowrap',
     }
-    const dangerButtonStyle = {
-      flex: '0 0 auto',
-      height: 30,
-      padding: '0 12px',
-      borderRadius: 8,
-      border: '1px solid color-mix(in srgb, var(--sl-danger, #f06a6a) 52%, transparent)',
-      background: 'color-mix(in srgb, var(--sl-danger, #f06a6a) 12%, transparent)',
-      color: 'inherit',
-      font: 'inherit',
-      fontSize: 12,
-      cursor: 'pointer',
-    }
+    // Danger confirmations carry their border/fill from the stylesheet's
+    // data-tone rules, so hover, active and disabled states stay reachable;
+    // the inline style here would pin those colours and lock the button flat.
     const trashMetaStyle = {
       flex: '0 0 auto',
       width: 88,
@@ -4216,12 +4343,16 @@ window.__ModuleLoader__.load({
       overflow: 'hidden',
       background: 'color-mix(in srgb, currentColor 12%, transparent)',
     }
+    // Fill works on the compositor: the bar is always full width and scaleX
+    // carries the percentage, so advancing progress never reflows layout.
     const progressFillStyle = (pct) => ({
       height: '100%',
-      width: `${pct}%`,
-      borderRadius: 999,
+      width: '100%',
+      borderRadius: '999px',
       background: 'var(--sl-accent)',
-      transition: 'width 200ms linear',
+      transform: `scaleX(${Math.max(0, Math.min(1, pct / 100))})`,
+      transformOrigin: '0 50%',
+      transition: 'transform 200ms linear',
     })
     const progressCurrentStyle = {
       fontSize: 12,
@@ -4263,10 +4394,6 @@ window.__ModuleLoader__.load({
       padding: '1px 6px',
       fontSize: 11,
       borderRadius: 4,
-      border: '1px solid var(--sl-line-strong)',
-      background: 'transparent',
-      color: 'inherit',
-      cursor: 'pointer',
     }
     // Exclusion browser (directory list) styles.
     const exportPickerPathStyle = {
@@ -4306,28 +4433,9 @@ window.__ModuleLoader__.load({
       maxHeight: 180,
       overflowY: 'auto',
     }
-    const importFileButtonStyle = {
-      height: 30,
-      padding: '0 10px',
-      borderRadius: 8,
-      border: '1px solid var(--sl-line)',
-      color: 'inherit',
-      font: 'inherit',
-      fontSize: 12,
-      textAlign: 'left',
-      cursor: 'pointer',
-      overflow: 'hidden',
-      textOverflow: 'ellipsis',
-      whiteSpace: 'nowrap',
-    }
-    // Same highlight recipe as the dock's enabled action: a light fill mixed over
-    // Canvas, a slightly stronger border, and semibold text.
-    const importFileButtonSelectedStyle = {
-      ...importFileButtonStyle,
-      border: '1px solid color-mix(in srgb, var(--sl-accent) 45%, transparent)',
-      background: 'color-mix(in srgb, var(--sl-accent) 10%, Canvas)',
-      fontWeight: 600,
-    }
+    // Package buttons carry their chrome from the .sl-filebtn stylesheet rule;
+    // selected state is a data attribute so the accent fill can change under
+    // hover rather than being pinned by an inline value.
     const importSectionTitleStyle = {
       margin: '14px 0 6px',
       fontSize: 12,
@@ -4351,28 +4459,13 @@ window.__ModuleLoader__.load({
     }
     // Workspace-file conflict policy block: a full-width select plus its hint.
     const importConflictBlockStyle = { marginTop: 14 }
-    const importConflictSelectStyle = {
-      width: '100%',
-      height: 32,
-      padding: '0 8px',
-      borderRadius: 8,
-      border: '1px solid var(--sl-line)',
-      background: 'Canvas',
-      color: 'inherit',
-      font: 'inherit',
-      fontSize: 12,
-      cursor: 'pointer',
-    }
+    const importConflictSelectStyle = { width: '100%' }
     const exportInputStyle = {
       width: '100%',
       height: 34,
       marginTop: 6,
       padding: '0 10px',
-      borderRadius: 8,
-      border: '1px solid var(--sl-line-strong)',
-      background: 'transparent',
-      color: 'inherit',
-      font: 'inherit',
+      cursor: 'text',
       fontSize: 13,
     }
     // Floating dock: one bar, centred over the empty tail the list reserves for
@@ -4444,25 +4537,11 @@ window.__ModuleLoader__.load({
       margin: '4px 0 10px',
       cursor: 'pointer',
     }
-    const loadedHintStyle = {
-      padding: '8px 10px',
-      margin: '4px 0 10px',
-      borderRadius: 8,
-      border: '1px solid color-mix(in srgb, var(--sl-warn, #f0b37e) 42%, transparent)',
-      color: 'var(--sl-warn, #f0b37e)',
-      background: 'color-mix(in srgb, var(--sl-warn, #f0b37e) 9%, transparent)',
-      fontSize: 12,
-      lineHeight: 1.6,
-    }
     const purgeInputStyle = {
       width: '100%',
       height: 34,
       padding: '0 10px',
-      borderRadius: 8,
-      border: '1px solid color-mix(in srgb, var(--sl-danger, #f06a6a) 45%, transparent)',
-      background: 'transparent',
-      color: 'inherit',
-      font: 'inherit',
+      cursor: 'text',
       fontSize: 13,
     }
     const placeholderStyle = {
@@ -4472,34 +4551,8 @@ window.__ModuleLoader__.load({
       lineHeight: 1.7,
       color: 'var(--sl-muted)',
     }
-    const infoStyle = {
-      padding: '8px 10px',
-      margin: '4px 0 10px',
-      borderRadius: 8,
-      border: '1px solid color-mix(in srgb, var(--sl-info, #6aa9f0) 42%, transparent)',
-      color: 'var(--sl-info, #6aa9f0)',
-      background: 'color-mix(in srgb, var(--sl-info, #6aa9f0) 9%, transparent)',
-      fontSize: 12,
-      lineHeight: 1.6,
-    }
-    const dialogBlockerStyle = {
-      padding: '6px 8px',
-      margin: '6px 0 2px',
-      borderRadius: 8,
-      color: 'var(--sl-warn, #f0b37e)',
-      background: 'color-mix(in srgb, var(--sl-warn, #f0b37e) 11%, transparent)',
-      fontSize: 12,
-      lineHeight: 1.6,
-      textAlign: 'left',
-    }
-    const warnStyle = {
-      flex: '0 0 auto',
-      padding: '7px 12px',
-      borderRadius: 8,
-      color: 'var(--sl-warn, #f0b37e)',
-      background: 'color-mix(in srgb, var(--sl-warn, #f0b37e) 11%, transparent)',
-      fontSize: 12,
-    }
+    // The remaining inline styles here carry geometry only; colour, hover and
+    // motion decisions live in the stylesheet so every state stays reachable.
 
     return {
       name: 'dsh-sessions-library',

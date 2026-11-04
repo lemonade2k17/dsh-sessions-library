@@ -75,6 +75,10 @@ const IMPORT_LIST_PATH = '/api/sessions-library/import-list'
 const IMPORT_PREFLIGHT_PATH = '/api/sessions-library/import-preflight'
 const IMPORT_RUN_PATH = '/api/sessions-library/import-run'
 const DELETE_BATCH_LIMIT = 100
+// Exports apply the same per-request bound today, but the two limits answer
+// different questions (how many sessions one delete may move vs how much one
+// package may carry), so they are named separately.
+const EXPORT_BATCH_LIMIT = DELETE_BATCH_LIMIT
 const PURGE_AUDIT_FILE = join(DSH_HOME, 'sessions-library', 'audit.log')
 // Sessions deleted while still loaded are queued here and moved on next start.
 const PENDING_TRASH_FILE = join(DSH_HOME, 'sessions-library', 'pending-trash.json')
@@ -147,7 +151,11 @@ function trimOperations() {
     const lines = readFileSync(OPERATIONS_FILE, 'utf8')
       .split('\n')
       .filter((line) => line.trim() !== '')
-    writeFileSync(OPERATIONS_FILE, `${lines.slice(-OPERATIONS_KEEP).join('\n')}\n`)
+    // Rewrite through a temporary file so an interrupted trim cannot leave the
+    // history half-written (this file is the only record of past operations).
+    const temporary = `${OPERATIONS_FILE}.trim`
+    writeFileSync(temporary, `${lines.slice(-OPERATIONS_KEEP).join('\n')}\n`)
+    renameSync(temporary, OPERATIONS_FILE)
   } catch {
     // A failed trim only costs disk space.
   }
@@ -440,9 +448,11 @@ async function readWorkspaceBaseline(ctx, requestId) {
     trace(requestId, 'workspaces', 'follow:start')
     const abort = new AbortController()
     const attempt = (async () => {
+      // The stream may open with a frame that is not the baseline (a keepalive,
+      // a delta on a warm cache): keep reading until the baseline arrives. The
+      // bounded wait below is what stops a stream that never sends one.
       for await (const frame of controller.follow(abort.signal)) {
         if (frame && frame.type === 'baseline' && frame.value) return frame.value
-        return undefined
       }
       return undefined
     })()
@@ -524,15 +534,39 @@ function normalizeSummary(item) {
 }
 
 /**
+ * Normalize one persistence snapshot into a summary-shaped row.
+ *
+ * A snapshot only carries what the stored header knows: no activity time, no
+ * running or blank state, no projection title.
+ *
+ * @param {any} snapshot persistence snapshot.
+ * @returns {object} normalized summary.
+ */
+function summaryFromSnapshot(snapshot) {
+  const source = snapshot && typeof snapshot === 'object' ? snapshot : {}
+  const header = source.header && typeof source.header === 'object' ? source.header : {}
+  return normalizeSummary({
+    sessionId: header.id,
+    cwd: header.cwd,
+    origin: header.origin,
+    updatedAt: header.createdAt,
+    blank: false,
+    running: false,
+    formatStatus: source.formatStatus,
+  })
+}
+
+/**
  * Read every session summary visible to the Host: the controller projection
  * first (it carries activity time), then the persistence snapshots.
  *
  * @param {object} ctx Cordis context.
  * @param {AbortSignal} signal request cancellation.
  * @param {string} requestId trace identity.
+ * @param {Array<object> | null} [hydratedSnapshots] snapshots the caller already read.
  * @returns {Promise<{ items: Array<object>, source: string }>} normalized summaries and the source tag.
  */
-async function readSummaries(ctx, signal, requestId) {
+async function readSummaries(ctx, signal, requestId, hydratedSnapshots = null) {
   const controller = ctx.get('sessionController')
   if (controller && typeof controller.list === 'function') {
     trace(requestId, 'summaries', 'controller:start')
@@ -552,6 +586,12 @@ async function readSummaries(ctx, signal, requestId) {
 
   const persistence = ctx.get('sessionPersistence')
   if (persistence && typeof persistence.list === 'function') {
+    if (Array.isArray(hydratedSnapshots)) {
+      // `buildSnapshot` already listed the store for the authoritative set; a
+      // second full listing per request (every 15 s poll) is pure overhead.
+      trace(requestId, 'summaries', `persistence:reused items=${hydratedSnapshots.length}`)
+      return { items: hydratedSnapshots.map(summaryFromSnapshot), source: 'persistence' }
+    }
     const outcome = await withTimeout(Promise.resolve().then(() => persistence.list({ signal })), SUMMARIES_TIMEOUT_MS)
     if (outcome.timedOut) {
       trace(requestId, 'summaries', `persistence:timeout>${SUMMARIES_TIMEOUT_MS}ms`)
@@ -560,16 +600,7 @@ async function readSummaries(ctx, signal, requestId) {
     } else {
       const snapshots = Array.isArray(outcome.value) ? outcome.value : []
       trace(requestId, 'summaries', `persistence:ok items=${snapshots.length}`)
-      const items = snapshots.map((snapshot) => normalizeSummary({
-        sessionId: snapshot.header.id,
-        cwd: snapshot.header.cwd,
-        origin: snapshot.header.origin,
-        updatedAt: snapshot.header.createdAt,
-        blank: false,
-        running: false,
-        formatStatus: snapshot.formatStatus,
-      }))
-      return { items, source: 'persistence' }
+      return { items: snapshots.map(summaryFromSnapshot), source: 'persistence' }
     }
   } else {
     trace(requestId, 'summaries', 'persistence:unavailable')
@@ -648,7 +679,12 @@ function readPendingTrash() {
 function writePendingTrash(items) {
   try {
     mkdirSync(dirname(PENDING_TRASH_FILE), { recursive: true })
-    writeFileSync(PENDING_TRASH_FILE, JSON.stringify({ items }, null, 2))
+    // The queue decides whether a session is hidden and what the next start
+    // does with it, so it is written atomically: a truncated file would read
+    // back as "nothing pending" and resurrect a deleted session in the list.
+    const temporary = `${PENDING_TRASH_FILE}.tmp`
+    writeFileSync(temporary, JSON.stringify({ items }, null, 2))
+    renameSync(temporary, PENDING_TRASH_FILE)
   } catch {
     // Best effort: an unreadable registry only delays the move.
   }
@@ -698,7 +734,12 @@ async function readPersistedSessions(ctx, signal, requestId) {
 async function buildSnapshot(ctx, signal, requestId) {
   const workspace = await readWorkspaceBaseline(ctx, requestId)
   const persisted = await readPersistedSessions(ctx, signal, requestId)
-  const summaryResult = await readSummaries(ctx, signal, requestId)
+  const summaryResult = await readSummaries(
+    ctx,
+    signal,
+    requestId,
+    persisted.source === 'persistence' ? persisted.snapshots : null,
+  )
   const baseline = workspace.baseline
   const archived = new Set(baseline.archivedSessionIds)
   const pinned = new Set(baseline.pinnedSessionIds)
@@ -810,6 +851,15 @@ async function buildSnapshot(ctx, signal, requestId) {
 }
 
 /**
+ * Minimum gap between two diagnostic snapshot writes.
+ *
+ * The page polls every 15 seconds, and rewriting a full snapshot file on every
+ * poll is pure disk churn for an artifact only used when debugging.
+ */
+const SNAPSHOT_WRITE_INTERVAL_MS = 20000
+let lastSnapshotWriteAt = 0
+
+/**
  * Run one snapshot request with tracing.
  *
  * @param {object} ctx Cordis context.
@@ -827,7 +877,11 @@ async function runSnapshot(ctx, signal) {
       `ok workspaces=${snapshot.workspaces.length} sessions=${snapshot.counts.total} ` +
         `archived=${snapshot.counts.archived} sources=${JSON.stringify(snapshot.sources)}`,
     )
-    writeSnapshotFile(snapshot)
+    const now = Date.now()
+    if (now - lastSnapshotWriteAt >= SNAPSHOT_WRITE_INTERVAL_MS) {
+      lastSnapshotWriteAt = now
+      writeSnapshotFile(snapshot)
+    }
     return snapshot
   } catch (error) {
     trace(requestId, 'end', `throw ${describeError(error)}`)
@@ -853,21 +907,41 @@ async function readJsonBody(request) {
 }
 
 /**
+ * Decide whether one value is usable as a single directory name.
+ *
+ * Session ids and project directory names are joined straight into paths, so a
+ * value that carries a separator or a parent segment must be rejected before it
+ * reaches the filesystem — including ids read back from a package manifest or a
+ * recycle-bin manifest, which are plain files a user can edit.
+ *
+ * @param {any} value candidate.
+ * @returns {boolean} whether the value is one safe path segment.
+ */
+function isSafeSegment(value) {
+  if (typeof value !== 'string') return false
+  if (value === '' || value === '.' || value === '..') return false
+  if (value.includes('/') || value.includes('\\')) return false
+  if (value.includes('\0') || value.includes(':')) return false
+  return true
+}
+
+/**
  * Normalize a session-id list and report how much of it the batch accepts.
  *
  * @param {any} value raw value.
+ * @param {number} [limit] accepted-id cap for this batch.
  * @returns {{ ids: string[], requested: number }} accepted ids and requested unique count.
  */
-function normalizeIdList(value) {
+function normalizeIdList(value, limit = DELETE_BATCH_LIMIT) {
   if (!Array.isArray(value)) return { ids: [], requested: 0 }
   const unique = []
   for (const item of value) {
     if (typeof item !== 'string') continue
     const id = item.trim()
-    if (id === '' || id.includes('/') || id.includes('\\') || id.includes('..')) continue
+    if (!isSafeSegment(id) || id.includes('..')) continue
     if (!unique.includes(id)) unique.push(id)
   }
-  return { ids: unique.slice(0, DELETE_BATCH_LIMIT), requested: unique.length }
+  return { ids: unique.slice(0, limit), requested: unique.length }
 }
 
 /**
@@ -1095,17 +1169,19 @@ function collectDirectoryEntries(root, prefix, entries, budget) {
 // --- Workspace backup support -----------------------------------------------
 
 /**
- * Normalize a user-supplied exclusion list into plain directory names.
+ * Normalize a user-supplied exclusion list.
  *
- * Accepts an array or a comma / semicolon / whitespace separated string, keeps
- * only single-segment names so a crafted value can never point outside the
- * workspace, and caps the list length.
+ * Accepts an array or a newline separated string and keeps only absolute paths
+ * (a relative fragment could silently match nothing), drops any entry carrying
+ * `..`, de-duplicates after resolving, and caps the list length. Absolute paths
+ * are kept as-is because the walk compares resolved path keys: an exclusion is
+ * always one concrete file or directory, and clicking a directory in the picker
+ * removes that whole subtree.
  *
  * @param {any} raw raw value from the Client (array or newline separated string).
- * @param {Set<string>} [fallback] unused legacy parameter kept for call sites.
  * @returns {string[]} normalized absolute paths.
  */
-function normalizeExcludePaths(raw, fallback = new Set()) {
+function normalizeExcludePaths(raw) {
   const source = Array.isArray(raw)
     ? raw
     : typeof raw === 'string'
@@ -1123,7 +1199,6 @@ function normalizeExcludePaths(raw, fallback = new Set()) {
     cleaned.push(resolved)
     if (cleaned.length >= 500) break
   }
-  void fallback
   return cleaned
 }
 
@@ -1136,6 +1211,24 @@ function normalizeExcludePaths(raw, fallback = new Set()) {
 function pathKey(value) {
   const resolved = resolve(value)
   return process.platform === 'win32' ? resolved.toLowerCase() : resolved
+}
+
+/**
+ * Decide whether one normalized path key sits inside a root key.
+ *
+ * The separator must only be appended when the root does not already end with
+ * one: a workspace at a drive root keys as `c:\`, and `${rootKey}${sep}` then
+ * became `c:\\`, which matched no child at all and made the exclusion browser
+ * refuse every subdirectory of such a workspace.
+ *
+ * @param {string} targetKey {@link pathKey} of the candidate path.
+ * @param {string} rootKey {@link pathKey} of the allowed root.
+ * @returns {boolean} whether the candidate is the root itself or below it.
+ */
+function isInsideRoot(targetKey, rootKey) {
+  if (targetKey === rootKey) return true
+  const prefix = rootKey.endsWith(sep) ? rootKey : `${rootKey}${sep}`
+  return targetKey.startsWith(prefix)
 }
 
 /**
@@ -1153,9 +1246,7 @@ function listDirectoryLevel(rawPath, rawRoot) {
   const target = resolve(rawPath)
   const root = typeof rawRoot === 'string' && rawRoot.trim() !== '' ? resolve(rawRoot) : ''
   if (root !== '') {
-    const targetKey = pathKey(target)
-    const rootKey = pathKey(root)
-    if (targetKey !== rootKey && !targetKey.startsWith(`${rootKey}${sep}`)) {
+    if (!isInsideRoot(pathKey(target), pathKey(root))) {
       throw new Error('不能超出工作区目录浏览')
     }
   }
@@ -1393,6 +1484,41 @@ async function waitForSessionVisibility(ctx, sessionId, timeoutMs = 3000) {
 }
 
 /**
+ * Attach one session to one workspace, retrying once after a visibility wait.
+ *
+ * `workspace.attachSession` validates the session through the persistence
+ * listing before it records membership, and that listing can lag behind files
+ * this plugin just wrote or just moved. Every call site that attaches a session
+ * has to survive that lag, so the retry lives here instead of being repeated
+ * (or forgotten) per path.
+ *
+ * @param {object} ctx Cordis context.
+ * @param {object | undefined} registry workspace registry service.
+ * @param {string} workspaceId target workspace id.
+ * @param {string} sessionId session id.
+ * @returns {Promise<{ ok: boolean, error?: string }>} whether membership stuck.
+ */
+async function attachWorkspaceSession(ctx, registry, workspaceId, sessionId) {
+  const workspace = registry && typeof registry.get === 'function' ? registry.get(workspaceId) : undefined
+  if (!workspace || typeof workspace.attachSession !== 'function') {
+    return { ok: false, error: `工作区 ${workspaceId} 不可用` }
+  }
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      await workspace.attachSession(sessionId)
+      return { ok: true }
+    } catch (error) {
+      if (attempt === 0) {
+        await waitForSessionVisibility(ctx, sessionId, 1500)
+        continue
+      }
+      return { ok: false, error: describeError(error) }
+    }
+  }
+  return { ok: false, error: `工作区 ${workspaceId} 挂载失败` }
+}
+
+/**
  * Attach one freshly written session to its target workspaces.
  *
  * Each workspace is tried twice: the first attempt often lands before the store
@@ -1412,26 +1538,9 @@ async function attachFreshSession(ctx, registry, sessionId, workspaceIds) {
   }
   await waitForSessionVisibility(ctx, sessionId)
   for (const workspaceId of workspaceIds) {
-    const workspace = registry.get(workspaceId)
-    if (!workspace || typeof workspace.attachSession !== 'function') {
-      errors.push(`工作区 ${workspaceId} 不可用`)
-      continue
-    }
-    let done = false
-    for (let attempt = 0; attempt < 2 && !done; attempt += 1) {
-      try {
-        await workspace.attachSession(sessionId)
-        attached.push(workspaceId)
-        done = true
-      } catch (error) {
-        if (attempt === 0) {
-          // Give the session listing another moment, then retry once.
-          await waitForSessionVisibility(ctx, sessionId, 1500)
-          continue
-        }
-        errors.push(describeError(error))
-      }
-    }
+    const outcome = await attachWorkspaceSession(ctx, registry, workspaceId, sessionId)
+    if (outcome.ok) attached.push(workspaceId)
+    else errors.push(outcome.error || `工作区 ${workspaceId} 不可用`)
   }
   if (errors.length > 0) {
     trace('import', 'attach-fail', `id=${sessionId} ${errors.join(' | ')}`)
@@ -1595,6 +1704,7 @@ function readZipEntries(buffer) {
   const entries = []
   let cursor = centralOffset
   let unpacked = 0
+  let unpackedActual = 0
   for (let index = 0; index < count; index += 1) {
     if (buffer.readUInt32LE(cursor) !== 0x02014b50) throw new Error('ZIP 目录损坏')
     const method = buffer.readUInt16LE(cursor + 10)
@@ -1621,6 +1731,10 @@ function readZipEntries(buffer) {
     if (method === 0) data = raw
     else if (method === 8) data = inflateRawSync(raw)
     else throw new Error(`不支持的 ZIP 压缩方式：${method}`)
+    // The declared size in the directory is attacker-controlled: a crafted
+    // deflate stream can expand far past it, so the real output is counted too.
+    unpackedActual += data.length
+    if (unpackedActual > IMPORT_UNPACKED_BYTES_LIMIT) throw new Error('包解压后体积超过上限')
     entries.push({ name: entryName, data })
   }
   return entries
@@ -1790,20 +1904,68 @@ function firstZstdFrameLength(buffer) {
 }
 
 /**
- * Locate the stored log file inside one session directory.
+ * Rank one stored log file by its format version.
+ *
+ * A session directory keeps every log it ever had (`session.jsonl.zstd`,
+ * `session.v3.jsonl.zstd`, `session.v4.jsonl.zstd`, ...), and the store reads
+ * the newest one. Directory order is filesystem dependent, so picking "the
+ * first `.jsonl.zstd`" reliably selected the oldest log on Windows — the
+ * rewrite then hit a file the store no longer reads while the current log kept
+ * the old cwd.
+ *
+ * @param {string} name file name inside a session directory.
+ * @returns {number | null} higher is newer; null when the file is not a log.
+ */
+function logFormatRank(name) {
+  if (typeof name !== 'string' || !name.endsWith('.jsonl.zstd')) return null
+  const versioned = /^session\.v(\d+)\.jsonl\.zstd$/.exec(name)
+  if (versioned !== null) return Number(versioned[1])
+  // The unversioned name is the original format: older than every `vN` log.
+  if (name === 'session.jsonl.zstd') return 0
+  // An unrecognised variant is still a log; keep it as the last resort.
+  return -1
+}
+
+/**
+ * List every stored log of one session, newest format first.
+ *
+ * @param {string} sessionDir session directory.
+ * @returns {string[]} absolute log paths.
+ */
+function listSessionLogFiles(sessionDir) {
+  let children = []
+  try {
+    children = readdirSync(sessionDir, { withFileTypes: true })
+  } catch {
+    return []
+  }
+  const ranked = []
+  for (const child of children) {
+    if (!child.isFile()) continue
+    const rank = logFormatRank(child.name)
+    if (rank === null) continue
+    ranked.push({ rank, path: join(sessionDir, child.name) })
+  }
+  ranked.sort((left, right) => right.rank - left.rank)
+  return ranked.map((entry) => entry.path)
+}
+
+/**
+ * Locate the stored log file the session store currently reads.
  *
  * @param {string} sessionDir session directory.
  * @returns {string | undefined} log path.
  */
 function findSessionLogFile(sessionDir) {
+  const logs = listSessionLogFiles(sessionDir)
+  if (logs.length > 0) return logs[0]
+  // Compressed logs are the only supported shape; an uncompressed file is kept
+  // as a best-effort fallback so an unknown layout is still readable.
   let children = []
   try {
     children = readdirSync(sessionDir, { withFileTypes: true })
   } catch {
     return undefined
-  }
-  for (const child of children) {
-    if (child.isFile() && child.name.endsWith('.jsonl.zstd')) return join(sessionDir, child.name)
   }
   for (const child of children) {
     if (child.isFile() && child.name.startsWith('session.')) return join(sessionDir, child.name)
@@ -1812,10 +1974,77 @@ function findSessionLogFile(sessionDir) {
 }
 
 /**
+ * Rewrite the recorded cwd in every stored log of one session.
+ *
+ * The current-format log is what the store validates workspace membership
+ * against, but a session waiting for a format migration is still read from its
+ * previous log, so leaving that one stale keeps the session ungroupable. Each
+ * file is written through a temporary file and a rename: a crash mid-write must
+ * never truncate a session log.
+ *
+ * @param {string} sessionDir session directory.
+ * @param {string} targetCwd workspace directory to record.
+ * @returns {{ changed: boolean, files: number, errors: string[], currentFailed: boolean }} outcome;
+ *   `currentFailed` means the newest log (the one the store validates) kept its old cwd.
+ */
+function rewriteSessionCwdEverywhere(sessionDir, targetCwd) {
+  const logs = listSessionLogFiles(sessionDir)
+  if (logs.length === 0) {
+    return { changed: false, files: 0, errors: ['找不到会话日志'], currentFailed: true }
+  }
+  let changed = false
+  let files = 0
+  let currentFailed = false
+  const errors = []
+  for (let index = 0; index < logs.length; index += 1) {
+    const logFile = logs[index]
+    try {
+      if (rewriteSessionHeaderCwd(logFile, targetCwd)) changed = true
+      files += 1
+    } catch (error) {
+      errors.push(`${basename(logFile)}: ${describeError(error)}`)
+      // The first entry is the newest format: if that one fails, the session
+      // still records the source cwd and can never be grouped.
+      if (index === 0) currentFailed = true
+    }
+  }
+  return { changed, files, errors, currentFailed }
+}
+
+/**
+ * How much of a session log the header probe reads.
+ *
+ * The header always sits in the first zstd frame, and reading the complete log
+ * (hundreds of megabytes after a long session) just to parse one line made the
+ * import preflight read every selected session in full.
+ */
+const SESSION_HEADER_PROBE_BYTES = 8 * 1024 * 1024
+
+/**
+ * Read the leading bytes of one file.
+ *
+ * @param {string} filePath absolute file path.
+ * @param {number} limit maximum number of bytes to read.
+ * @returns {Buffer} the bytes that were read.
+ */
+function readFileHead(filePath, limit) {
+  const stats = statSync(filePath)
+  const length = Math.min(stats.size, limit)
+  const fd = openSync(filePath, 'r')
+  try {
+    return readFileRange(fd, 0, length)
+  } finally {
+    closeSync(fd)
+  }
+}
+
+/**
  * Read the cwd one stored session records in its header.
  *
  * Only the first zstd frame is decoded: that frame carries the session header,
- * and the event frames after it are never touched.
+ * and the event frames after it are never touched. Only the head of the file is
+ * read — a log whose header frame exceeds that window is reported as unreadable
+ * instead of loading the whole session into memory.
  *
  * @param {string} sessionDir session directory.
  * @returns {string | null} recorded cwd, or null when it cannot be read.
@@ -1824,7 +2053,7 @@ function readSessionHeaderCwd(sessionDir) {
   const logFile = findSessionLogFile(sessionDir)
   if (logFile === undefined) return null
   try {
-    const buffer = readFileSync(logFile)
+    const buffer = readFileHead(logFile, SESSION_HEADER_PROBE_BYTES)
     const frameLength = firstZstdFrameLength(buffer)
     const frameText = zstdDecompressSync(buffer.subarray(0, frameLength)).toString('utf8')
     const line = frameText.split('\n').find((candidate) => candidate.trim() !== '')
@@ -1867,7 +2096,21 @@ function rewriteSessionHeaderCwd(filePath, targetCwd) {
   header.cwd = targetCwd
   lines[index] = JSON.stringify(header)
   const nextFrame = zstdCompressSync(Buffer.from(lines.join('\n'), 'utf8'))
-  writeFileSync(filePath, Buffer.concat([nextFrame, buffer.subarray(frameLength)]))
+  // Write through a sibling temporary file and rename: the rewrite replaces the
+  // only copy of the session history, so a crash or a full disk must leave the
+  // original file intact instead of a truncated log.
+  const temporary = `${filePath}.rewrite`
+  try {
+    writeFileSync(temporary, Buffer.concat([nextFrame, buffer.subarray(frameLength)]))
+    renameSync(temporary, filePath)
+  } catch (error) {
+    try {
+      rmSync(temporary, { force: true })
+    } catch {
+      // A leftover temporary file is harmless next to the untouched log.
+    }
+    throw error
+  }
   return true
 }
 
@@ -1942,9 +2185,10 @@ function readZipDirectoryFromFile(fd, size) {
  *
  * @param {number} fd open file descriptor.
  * @param {object} entry member descriptor.
+ * @param {number} [maxBytes] hard cap for both the stored and the inflated bytes.
  * @returns {Buffer} member data.
  */
-function readZipMemberFromFile(fd, entry) {
+function readZipMemberFromFile(fd, entry, maxBytes = 4 * 1024 * 1024) {
   if (entry.compressedSize === 0xffffffff || entry.localOffset === 0xffffffff) {
     throw new Error('暂不支持 ZIP64 格式的包')
   }
@@ -1953,9 +2197,15 @@ function readZipMemberFromFile(fd, entry) {
   const nameLength = local.readUInt16LE(26)
   const extraLength = local.readUInt16LE(28)
   const dataStart = entry.localOffset + 30 + nameLength + extraLength
+  if (entry.compressedSize > maxBytes) throw new Error('包内文件过大')
   const raw = readFileRange(fd, dataStart, entry.compressedSize)
   if (entry.method === 0) return raw
-  if (entry.method === 8) return inflateRawSync(raw)
+  if (entry.method === 8) {
+    // The declared size is not trusted; the inflated bytes are what allocate.
+    const data = inflateRawSync(raw)
+    if (data.length > maxBytes) throw new Error('包内文件过大')
+    return data
+  }
   throw new Error(`不支持的 ZIP 压缩方式：${entry.method}`)
 }
 
@@ -2190,6 +2440,7 @@ async function inspectImport(ctx, rawPath) {
  * directory (header cwd rewrite only; the event frames stay byte-identical).
  *
  * @param {object} options adoption inputs.
+ * @param {object} options.ctx Cordis context (used for the visibility wait).
  * @param {string} options.id session id.
  * @param {string | null} options.title session title.
  * @param {string} options.role session role.
@@ -2200,7 +2451,7 @@ async function inspectImport(ctx, rawPath) {
  * @returns {Promise<object>} per-session result.
  */
 async function adoptLocalSession(options) {
-  const { id, title, role, localDir, targetWorkspaceIds, targetCwd, registry } = options
+  const { ctx, id, title, role, localDir, targetWorkspaceIds, targetCwd, registry } = options
   const localCwd = readSessionHeaderCwd(localDir)
   const warnings = []
   let moved = false
@@ -2244,16 +2495,12 @@ async function adoptLocalSession(options) {
     // The store derives the project directory from the header cwd, so the two
     // may only disagree when the move succeeded or was unnecessary.
     if (moved || inPlace) {
-      const logFile = findSessionLogFile(activeDir)
-      if (logFile === undefined) {
-        warnings.push('找不到会话日志，工作目录未改写')
-      } else {
-        try {
-          rewritten = rewriteSessionHeaderCwd(logFile, targetPath)
-        } catch (error) {
-          warnings.push(`工作目录未改写：${describeError(error)}`)
-        }
-      }
+      // Every stored log is rewritten: a session waiting for a format migration
+      // is still read from its previous log, so rewriting only the newest one
+      // would leave the old cwd in charge for those sessions.
+      const rewriteOutcome = rewriteSessionCwdEverywhere(activeDir, targetPath)
+      rewritten = rewriteOutcome.changed
+      for (const error of rewriteOutcome.errors) warnings.push(`工作目录未改写：${error}`)
       if (registry && typeof registry.get === 'function') {
         // Moving the log means the previous membership no longer describes it.
         try {
@@ -2261,18 +2508,15 @@ async function adoptLocalSession(options) {
         } catch {
           // Accounting cleanup is best effort.
         }
+        // The copy was just moved and rewritten, so the store listing lags the
+        // same way it does after an import: wait before recording membership.
+        await waitForSessionVisibility(ctx, id)
         for (const workspaceId of targetWorkspaceIds) {
-          try {
-            const workspace = registry.get(workspaceId)
-            if (workspace && typeof workspace.attachSession === 'function') {
-              await workspace.attachSession(id)
-              attached.push(workspaceId)
-            }
-          } catch (error) {
-            // Membership is best effort here, but never silent: the result
-            // warning reaches the import dialog.
-            warnings.push(`未能归入工作区 ${workspaceId}：${describeError(error)}`)
-          }
+          const outcome = await attachWorkspaceSession(ctx, registry, workspaceId, id)
+          if (outcome.ok) attached.push(workspaceId)
+          // Membership is best effort here, but never silent: the result
+          // warning reaches the import dialog.
+          else warnings.push(`未能归入工作区 ${workspaceId}：${outcome.error}`)
         }
       }
     }
@@ -2341,6 +2585,13 @@ async function importPackage(ctx, rawPath, rawMapping, options = {}) {
     const files = bySession.get(id) ?? []
     const title = typeof session.title === 'string' ? session.title : null
     const role = typeof session.role === 'string' ? session.role : 'root'
+    // A package manifest is an editable file: an id that is not one path
+    // segment would be joined straight into the sessions root.
+    if (!isSafeSegment(id) || id.includes('..')) {
+      failed += 1
+      results.push({ id, title, status: 'failed', reason: '包内的会话 id 非法' })
+      continue
+    }
     if (files.length === 0) {
       failed += 1
       results.push({ id, title, status: 'failed', reason: '包内缺少该会话的文件' })
@@ -2381,6 +2632,7 @@ async function importPackage(ctx, rawPath, rawMapping, options = {}) {
       }
       try {
         const outcome = await adoptLocalSession({
+          ctx,
           id,
           title,
           role,
@@ -2425,9 +2677,15 @@ async function importPackage(ctx, rawPath, rawMapping, options = {}) {
         writeFileSync(target, file.data)
       }
       if (rewrite) {
-        const logFile = findSessionLogFile(sessionDir)
-        if (logFile === undefined) throw new Error('包内没有可改写的会话日志')
-        rewriteSessionHeaderCwd(logFile, targetCwd)
+        const rewriteOutcome = rewriteSessionCwdEverywhere(sessionDir, targetCwd)
+        // Only the newest log decides whether the session can be grouped; an
+        // older log that cannot be parsed is recorded, not fatal.
+        if (rewriteOutcome.currentFailed) {
+          throw new Error(`会话日志改写失败：${rewriteOutcome.errors.join('；') || '找不到会话日志'}`)
+        }
+        if (rewriteOutcome.errors.length > 0) {
+          trace('import', 'rewrite-partial', `id=${id} ${rewriteOutcome.errors.join(' | ')}`)
+        }
       }
 
       const attachOutcome = await attachFreshSession(ctx, registry, id, targetWorkspaceIds)
@@ -2521,6 +2779,30 @@ async function importPackage(ctx, rawPath, rawMapping, options = {}) {
 
 
 /**
+ * Size limit above which a restored attachment is trusted on its size alone.
+ *
+ * Attachment objects are content addressed, so an equal size is a strong hint;
+ * small objects are still compared byte for byte because a corrupted object of
+ * the same length would otherwise be kept forever.
+ */
+const ATTACHMENT_VERIFY_BYTES = 8 * 1024 * 1024
+
+/**
+ * Compare one on-disk file with the bytes a package carries.
+ *
+ * @param {string} filePath existing file.
+ * @param {Buffer} data expected bytes.
+ * @returns {boolean} whether the file already holds exactly these bytes.
+ */
+function sameFileContent(filePath, data) {
+  try {
+    return readFileSync(filePath).equals(data)
+  } catch {
+    return false
+  }
+}
+
+/**
  * Restore the attachment objects one package carries into the local store.
  *
  * @param {Array<{ segments: string[], data: Buffer }>} entries attachment members.
@@ -2537,15 +2819,14 @@ function restorePackageAttachments(entries) {
       continue
     }
     try {
-      // Identical bytes are already in place: the store is content addressed, so
-      // a size match is enough to skip the write.
       let existing = 0
       try {
         existing = statSync(target).size
       } catch {
         existing = -1
       }
-      if (existing === entry.data.length) {
+      if (existing === entry.data.length
+        && (entry.data.length > ATTACHMENT_VERIFY_BYTES || sameFileContent(target, entry.data))) {
         counters.skipped += 1
         continue
       }
@@ -2576,15 +2857,24 @@ async function detachFromWorkspaces(registry, sessionId) {
   } catch {
     return detached
   }
-  for (const workspace of workspaces) {
+  for (const listed of workspaces) {
     let contains = false
     try {
-      contains = [...workspace.sessionIds].map(String).includes(sessionId)
+      contains = [...listed.sessionIds].map(String).includes(sessionId)
     } catch {
       contains = false
     }
     if (!contains) continue
-    detached.push(String(workspace.id))
+    const workspaceId = String(listed.id)
+    // The mutators live on the service object. `registry.list()` may hand out a
+    // plain projection, so resolve through `registry.get()` first and only fall
+    // back to the listed entry; reading `detachSession` off the listing is what
+    // made removal silently a no-op when the listing had no methods.
+    const workspace = typeof registry.get === 'function'
+      ? (registry.get(workspaceId) || listed)
+      : listed
+    if (!workspace || typeof workspace.detachSession !== 'function') continue
+    detached.push(workspaceId)
     try {
       await workspace.detachSession(sessionId)
     } catch {
@@ -2660,6 +2950,9 @@ async function buildDeletePreflight(ctx, ids, signal, includeForks) {
     && Array.isArray(persistedOutcome.value)
     ? persistedOutcome.value
     : []
+  // A failed listing leaves every requested id "unknown", which used to be
+  // reported as "会话不存在" and hid the real cause from the dialog.
+  const listsFailed = Boolean(persistedOutcome.timedOut || persistedOutcome.error)
 
   const runningById = new Map()
   if (!summaryOutcome.timedOut
@@ -2671,35 +2964,36 @@ async function buildDeletePreflight(ctx, ids, signal, includeForks) {
 
   const byId = new Map(snapshots.map((snapshot) => [String(snapshot.header.id), snapshot]))
   const childrenByParent = new Map()
-  const parentById = new Map()
   for (const snapshot of snapshots) {
     const parent = snapshot.header.parentSession
     if (!parent) continue
     const childId = String(snapshot.header.id)
     const parentId = String(parent)
-    parentById.set(childId, parentId)
     if (!childrenByParent.has(parentId)) childrenByParent.set(parentId, [])
     childrenByParent.get(parentId).push(childId)
   }
 
   const agents = ctx.get('agents')
 
-  // Drop requested ids that sit inside another requested id's family: the
-  // ancestor's family already covers them.
-  const requested = new Set(ids)
-  const roots = ids.filter((id) => {
-    let cursor = parentById.get(id)
-    const visited = new Set()
-    while (cursor && !visited.has(cursor)) {
-      if (requested.has(cursor)) return false
-      visited.add(cursor)
-      cursor = parentById.get(cursor)
+  // Collect one family per requested id first, then drop the ids another
+  // family actually carries as a member. Dropping by "has a requested
+  // ancestor" instead used to discard an explicitly selected fork child: the
+  // parent's family only keeps forks in `forks` (they are not members unless
+  // `includeForks` is set), so nobody deleted it and no result row mentioned it.
+  const collected = ids.map((rootId) => collectFamily(rootId, byId, childrenByParent, includeForks))
+  const coveredByAncestor = new Set()
+  for (const family of collected) {
+    for (let index = 1; index < family.members.length; index += 1) {
+      coveredByAncestor.add(family.members[index].id)
     }
-    return true
-  })
-
-  const collected = roots.map((rootId) => collectFamily(rootId, byId, childrenByParent, includeForks))
-  const memberIds = [...new Set(collected.flatMap((family) => family.members.map((member) => member.id)))]
+  }
+  const kept = []
+  for (let index = 0; index < ids.length; index += 1) {
+    if (coveredByAncestor.has(ids[index])) continue
+    kept.push({ rootId: ids[index], family: collected[index] })
+  }
+  const roots = kept.map((entry) => entry.rootId)
+  const memberIds = [...new Set(kept.flatMap(({ family }) => family.members.map((member) => member.id)))]
   // Titles the page snapshot already resolved cost nothing here; only unknown
   // ids fall back to one bounded batch read.
   const titles = new Map()
@@ -2726,9 +3020,10 @@ async function buildDeletePreflight(ctx, ids, signal, includeForks) {
   )
 
   const families = []
-  for (let index = 0; index < roots.length; index += 1) {
-    const rootId = roots[index]
-    const family = collected[index]
+  // A fork that was selected explicitly is deleted as its own family, so it must
+  // not also be offered as "kept with the parent".
+  const keptIds = new Set(roots)
+  for (const { rootId, family } of kept) {
     const blockers = []
     const members = []
 
@@ -2743,7 +3038,14 @@ async function buildDeletePreflight(ctx, ids, signal, includeForks) {
         loaded = false
       }
       const running = runningById.get(entry.id) === true
-      if (!snapshot) blockers.push({ code: 'missing', message: `${label}不存在` })
+      if (!snapshot) {
+        blockers.push({
+          code: listsFailed ? 'list-failed' : 'missing',
+          message: listsFailed
+            ? `${label}列表读取失败，无法确认该会话`
+            : `${label}不存在`,
+        })
+      }
       if (running) blockers.push({ code: 'running', message: `${label}正在运行` })
       // A loaded-but-idle session is only a warning: `agents.get` means the
       // session was activated in this process (the startup-selected session
@@ -2759,14 +3061,16 @@ async function buildDeletePreflight(ctx, ids, signal, includeForks) {
       })
     }
 
-    const forks = family.forks.map((forkId) => {
-      const dir = findSessionDir(forkId)
-      return {
-        id: forkId,
-        title: titles.get(forkId) ?? null,
-        sizeBytes: dir ? dirSize(dir) : 0,
-      }
-    })
+    const forks = family.forks
+      .filter((forkId) => !keptIds.has(forkId))
+      .map((forkId) => {
+        const dir = findSessionDir(forkId)
+        return {
+          id: forkId,
+          title: titles.get(forkId) ?? null,
+          sizeBytes: dir ? dirSize(dir) : 0,
+        }
+      })
 
     const loadedMembers = members.filter((member) => member.loaded === true)
     const warnings = loadedMembers.length > 0
@@ -3118,13 +3422,16 @@ async function restoreTrashEntries(ctx, rawNames, signal, options = {}) {
         continue
       }
 
-      const projectDirName = typeof manifest.projectDirName === 'string'
-        && manifest.projectDirName !== ''
-        && !manifest.projectDirName.includes('/')
-        && !manifest.projectDirName.includes('\\')
+      const projectDirName = isSafeSegment(manifest.projectDirName)
         && !manifest.projectDirName.includes('..')
         ? manifest.projectDirName
         : '_no-cwd'
+      // The manifest is a plain file on disk: never let an edited id escape the
+      // sessions root.
+      if (!isSafeSegment(manifest.id)) {
+        results.push({ entryName: rawName, status: 'failed', reason: '回收站条目里的会话 id 非法' })
+        continue
+      }
       const projectDir = join(SESSIONS_ROOT, projectDirName)
       const target = join(projectDir, manifest.id)
       if (existsSync(target)) {
@@ -3136,13 +3443,22 @@ async function restoreTrashEntries(ctx, rawNames, signal, options = {}) {
       renameSync(sessionDir, target)
       rmSync(entryDir, { recursive: true, force: true })
 
-      if (Array.isArray(manifest.workspaceIds)) {
-        for (const workspaceId of manifest.workspaceIds) {
-          try {
-            const workspace = registry && typeof registry.get === 'function' ? registry.get(workspaceId) : undefined
-            if (workspace && typeof workspace.attachSession === 'function') await workspace.attachSession(manifest.id)
-          } catch {
-            // Restoring accounting is best effort.
+      // The directory was just moved back, so the store listing lags exactly
+      // like it does after an import. Attaching without the wait used to drop
+      // membership silently and leave the restored session ungrouped.
+      const restoredWorkspaces = []
+      const attachErrors = []
+      const targetWorkspaceIds = Array.isArray(manifest.workspaceIds)
+        ? manifest.workspaceIds.map(String).filter((id) => id !== '')
+        : []
+      if (targetWorkspaceIds.length > 0) {
+        await waitForSessionVisibility(ctx, manifest.id)
+        for (const workspaceId of targetWorkspaceIds) {
+          const outcome = await attachWorkspaceSession(ctx, registry, workspaceId, manifest.id)
+          if (outcome.ok) restoredWorkspaces.push(workspaceId)
+          else {
+            attachErrors.push(`${workspaceId}: ${outcome.error}`)
+            trace('restore', 'attach-fail', `id=${manifest.id} workspace=${workspaceId} ${outcome.error}`)
           }
         }
       }
@@ -3168,7 +3484,17 @@ async function restoreTrashEntries(ctx, rawNames, signal, options = {}) {
         title: typeof manifest.title === 'string' ? manifest.title : null,
         role: typeof manifest.role === 'string' ? manifest.role : 'root',
       })
-      results.push({ entryName: rawName, sessionId: manifest.id, status: 'restored' })
+      results.push({
+        entryName: rawName,
+        sessionId: manifest.id,
+        status: 'restored',
+        workspaceIds: restoredWorkspaces,
+        // Surfaced so the bin can tell the user a restore that landed on disk
+        // but could not be re-grouped instead of claiming a clean success.
+        warning: attachErrors.length > 0
+          ? `未能归入工作区：${attachErrors.join('；')}`
+          : undefined,
+      })
     } catch (error) {
       trace('restore', 'end', `throw entry=${rawName} ${describeError(error)}`)
       results.push({ entryName: rawName, status: 'failed', reason: describeError(error) })
@@ -3300,7 +3626,8 @@ async function purgeTrashEntries(rawNames) {
  * @returns {Promise<object>} archive description.
  */
 async function exportSessions(ctx, rawIds, signal, options = {}) {
-  const ids = normalizeIds(rawIds)
+  const normalizedIds = normalizeIdList(rawIds, EXPORT_BATCH_LIMIT)
+  const ids = normalizedIds.ids
   if (ids.length === 0) throw new Error('请先勾选要导出的会话')
 
   // Resolve and validate the destination before doing any reading work. A
@@ -3545,6 +3872,13 @@ async function exportSessions(ctx, rawIds, signal, options = {}) {
     workspaceFilesSkipped,
     bytes: archive.length,
     missing: ids.filter((id) => !byId.has(id)).length,
+    // The Host accepts a bounded batch; report it instead of letting the Client
+    // show "exported N" when the selection was larger than N.
+    limit: {
+      max: EXPORT_BATCH_LIMIT,
+      requested: normalizedIds.requested,
+      accepted: ids.length,
+    },
   }
 }
 
@@ -3666,7 +4000,16 @@ async function flushPendingTrash(ctx) {
       trace('trash', 'deferred-fail', `id=${id} ${describeError(error)}`)
     }
   }
-  writePendingTrash(remaining)
+  // Merge instead of replacing: a restore or a fresh delete can rewrite the
+  // queue while this flush runs, and writing back only `remaining` would drop
+  // whatever it just added.
+  const latest = readPendingTrash()
+  const merged = { ...latest }
+  for (const id of ids) {
+    if (remaining[id] !== undefined) merged[id] = remaining[id]
+    else delete merged[id]
+  }
+  writePendingTrash(merged)
 }
 
 /**
@@ -3857,8 +4200,8 @@ export function apply(ctx) {
         label: 'workspace-preflight',
         handler: async (request) => {
           const body = await readJsonBody(request)
-          const ids = normalizeIds(body.sessionIds)
-          const backup = await collectWorkspaceBackup(ctx, ids, body.excludePaths)
+          const normalized = normalizeIdList(body.sessionIds, EXPORT_BATCH_LIMIT)
+          const backup = await collectWorkspaceBackup(ctx, normalized.ids, body.excludePaths)
           const workspaces = backup.workspaces.map((workspace) => ({
             workspaceId: workspace.workspaceId,
             title: workspace.title,
@@ -3875,6 +4218,13 @@ export function apply(ctx) {
             totalBytes: workspaces.reduce((sum, item) => sum + item.bytes, 0),
             truncated: workspaces.some((item) => item.truncated === true),
             unmatched: backup.unmatched,
+            // Same batch bound the export applies; the Client warns when the
+            // selection is larger, because the preview only covers the head.
+            limit: {
+              max: EXPORT_BATCH_LIMIT,
+              requested: normalized.requested,
+              accepted: normalized.ids.length,
+            },
             // Echo the normalized picked paths so the Client can show what the
             // Host actually applied.
             excludePaths: backup.excludePaths,
