@@ -1228,6 +1228,9 @@ window.__ModuleLoader__.load({
         }
 
         function toggleGroup(groupId) {
+          // Collapsing resets this group's "查看全部": reopening it should start
+          // from the short list again rather than remembering the wide view.
+          const closing = (expandedByFilter[filter] || {})[groupId] === true
           setExpandedByFilter((current) => {
             const scoped = { ...(current[filter] || {}) }
             if (scoped[groupId] === true) delete scoped[groupId]
@@ -1236,6 +1239,14 @@ window.__ModuleLoader__.load({
             saveExpandedGroups(next)
             return next
           })
+          if (closing) {
+            setShowAll((current) => {
+              if (current[groupId] !== true) return current
+              const next = { ...current }
+              delete next[groupId]
+              return next
+            })
+          }
         }
 
         function toggleAllGroups() {
@@ -1246,6 +1257,8 @@ window.__ModuleLoader__.load({
           const next = { ...expandedByFilter, [filter]: scoped }
           saveExpandedGroups(next)
           setExpandedByFilter(next)
+          // 收起全部 closes every group, so every "查看全部" goes with it.
+          if (anyOpen) setShowAll({})
         }
 
         function toggleShowAll(groupId) {
