@@ -16,6 +16,7 @@
  * back to a cheaper source instead of leaving the request pending.
  */
 
+import { spawn } from 'node:child_process'
 import {
   appendFileSync,
   closeSync,
@@ -30,6 +31,7 @@ import {
   statSync,
   writeFileSync,
 } from 'node:fs'
+import { createRequire } from 'node:module'
 import { homedir } from 'node:os'
 import { basename, dirname, join, resolve, sep } from 'node:path'
 import { inflateRawSync, zstdCompressSync, zstdDecompressSync } from 'node:zlib'
@@ -71,6 +73,7 @@ const DELETE_PROGRESS_PATH = '/api/sessions-library/delete-progress'
 const EXPORT_PATH = '/api/sessions-library/export'
 const WORKSPACE_PREFLIGHT_PATH = '/api/sessions-library/workspace-preflight'
 const WORKSPACE_BROWSE_PATH = '/api/sessions-library/workspace-browse'
+const RESTART_HOST_PATH = '/api/sessions-library/restart-host'
 const IMPORT_LIST_PATH = '/api/sessions-library/import-list'
 const IMPORT_PREFLIGHT_PATH = '/api/sessions-library/import-preflight'
 const IMPORT_RUN_PATH = '/api/sessions-library/import-run'
@@ -4012,6 +4015,85 @@ async function flushPendingTrash(ctx) {
   writePendingTrash(merged)
 }
 
+// --- Host restart support -----------------------------------------------------
+
+// How long the detached helper waits before starting the application again:
+// long enough for this process to release the session files it holds.
+const RESTART_DELAY_MS = 2_500
+
+/**
+ * Restart the desktop application that hosts this plugin.
+ *
+ * Preferred path: Electron's own `app.relaunch()` + `app.quit()`, which reuses
+ * the exact command line. When the Host does not run inside Electron (or the
+ * electron module is unreachable), a detached helper process waits for this one
+ * to exit and then starts the same executable again.
+ *
+ * @returns {{ ok: boolean, mode: string, detail?: string }} what was scheduled.
+ */
+function scheduleHostRestart() {
+  let electronApp = null
+  try {
+    const requireFromHere = createRequire(import.meta.url)
+    electronApp = requireFromHere('electron').app ?? null
+  } catch {
+    electronApp = null
+  }
+  if (electronApp && typeof electronApp.relaunch === 'function' && typeof electronApp.quit === 'function') {
+    try {
+      electronApp.relaunch()
+      setTimeout(() => {
+        try {
+          electronApp.quit()
+        } catch {
+          process.exit(0)
+        }
+      }, 400)
+      trace('host', 'restart', 'mode=electron')
+      return { ok: true, mode: 'electron' }
+    } catch (error) {
+      trace('host', 'restart-fallback', describeError(error))
+    }
+  }
+  const exe = process.execPath
+  // Keep positional arguments only: Chromium/Electron switches belong to *this*
+  // process (--type=utility, --inspect, --remote-debugging-port …) and would
+  // start the new instance in the wrong role or on a colliding port.
+  const args = process.argv
+    .slice(1)
+    .filter((arg) => typeof arg === 'string' && arg !== '' && !arg.startsWith('-'))
+  const payload = JSON.stringify({ exe, args, cwd: process.cwd(), delay: RESTART_DELAY_MS })
+  const script = [
+    "const { spawn } = require('node:child_process')",
+    'const payload = JSON.parse(process.argv[1])',
+    'setTimeout(() => {',
+    '  const env = { ...process.env }',
+    '  delete env.ELECTRON_RUN_AS_NODE',
+    '  try {',
+    '    spawn(payload.exe, payload.args, { detached: true, stdio: "ignore", cwd: payload.cwd, env }).unref()',
+    '  } catch (error) {',
+    '    process.stderr.write(String(error))',
+    '  }',
+    '  process.exit(0)',
+    '}, payload.delay)',
+  ].join('\n')
+  try {
+    const helper = spawn(exe, ['-e', script, payload], {
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: true,
+      env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
+    })
+    helper.unref()
+    trace('host', 'restart', `mode=helper pid=${helper.pid ?? 'unknown'}`)
+    setTimeout(() => process.exit(0), 600)
+    return { ok: true, mode: 'helper' }
+  } catch (error) {
+    trace('host', 'restart-fail', describeError(error))
+    return { ok: false, mode: 'none', detail: describeError(error) }
+  }
+}
+
 /**
  * Activate the Host half.
  *
@@ -4035,6 +4117,19 @@ export function apply(ctx) {
         path: SNAPSHOT_PATH,
         label: 'snapshot',
         handler: async (request) => jsonResponse(await runSnapshot(ctx, request.signal)),
+      },
+      {
+        path: RESTART_HOST_PATH,
+        label: 'restart-host',
+        handler: async () => {
+          // Answer first: the process is about to go away.
+          const scheduled = { ok: true, mode: 'pending' }
+          setTimeout(() => {
+            const result = scheduleHostRestart()
+            trace('host', 'restart-result', JSON.stringify(result))
+          }, 500)
+          return jsonResponse(scheduled)
+        },
       },
       {
         path: DELETE_PREFLIGHT_PATH,

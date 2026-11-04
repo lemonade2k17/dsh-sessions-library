@@ -28,6 +28,7 @@ window.__ModuleLoader__.load({
     const IMPORT_RUN_PATH = 'api/sessions-library/import-run'
     const EXPORT_DIR_STORAGE_KEY = 'dsh-sessions-library:export-dir'
     const WORKSPACE_BROWSE_PATH = 'api/sessions-library/workspace-browse'
+    const RESTART_HOST_PATH = 'api/sessions-library/restart-host'
     // Per-request budgets. The Host does not roll back file work when the
     // browser aborts, so a request that is merely slow must be allowed to
     // finish: packaging an export, writing an import or moving a full delete
@@ -836,6 +837,9 @@ window.__ModuleLoader__.load({
         const [dialog, setDialog] = React.useState(null)
         const [trashSelected, setTrashSelected] = React.useState({})
         const [purgeDialog, setPurgeDialog] = React.useState(null)
+        // Restart confirmation for the bin: open sessions are only released when
+        // the Host restarts, so the bin offers that step directly.
+        const [restartDialog, setRestartDialog] = React.useState(null)
         const [logs, setLogs] = React.useState([])
         const [logsPhase, setLogsPhase] = React.useState('idle')
         const [logsError, setLogsError] = React.useState(null)
@@ -1484,6 +1488,27 @@ window.__ModuleLoader__.load({
             setLogsError(null)
           } catch (failure) {
             setLogsError(failure && failure.message ? failure.message : String(failure))
+          }
+        }
+
+        /**
+         * Ask the Host to restart, then explain that the window will go away.
+         *
+         * The request answers before the process exits, so the dialog can switch
+         * to a "restarting" state instead of showing a network error.
+         *
+         * @returns {Promise<void>} resolution after the request settled.
+         */
+        async function confirmRestart() {
+          setRestartDialog({ phase: 'busy', error: null })
+          try {
+            await postJson(RESTART_HOST_PATH, {})
+            setRestartDialog({ phase: 'done', error: null })
+          } catch (failure) {
+            setRestartDialog({
+              phase: 'confirm',
+              error: failure && failure.message ? failure.message : String(failure),
+            })
           }
         }
 
@@ -2909,6 +2934,63 @@ window.__ModuleLoader__.load({
         }
 
         /**
+         * Render the restart confirmation of the recycle bin.
+         *
+         * @returns {object} React element.
+         */
+        function renderRestartDialog() {
+          const phase = restartDialog && restartDialog.phase ? restartDialog.phase : 'confirm'
+          const busy = phase === 'busy'
+          const done = phase === 'done'
+          const error = restartDialog && restartDialog.error ? restartDialog.error : null
+          return h(
+            'div',
+            { className: 'sl-overlay', style: overlayStyle },
+            h(
+              'div',
+              { className: 'sl-dialog', style: dialogStyle, onClick: (event) => event.stopPropagation() },
+              h('h2', { style: dialogTitleStyle }, done ? '正在重启' : '重启 DeepSeek Harness'),
+              h(
+                'p',
+                { style: dialogHintStyle },
+                done
+                  ? '应用正在关闭，约 3 秒后会自动重新打开；窗口回来后，排队删除的会话已经被清理。'
+                  : '重启会关闭当前窗口并在约 3 秒后自动重新打开；正在进行的会话会被中断。',
+              ),
+              done
+                ? null
+                : h(
+                    'p',
+                    { style: dialogHintStyle },
+                    '打开中的会话占用着会话文件，必须重启才能移入回收站或永久删除；回收站里「重启后删除」的队列也会在启动时执行。',
+                  ),
+              error !== null ? h('div', { style: dialogBlockerStyle }, error) : null,
+              done
+                ? null
+                : h(
+                    'div',
+                    { style: dialogActionsStyle },
+                    h(
+                      'button',
+                      { className: 'sl-btn', style: actionButtonStyle, onClick: () => setRestartDialog(null) },
+                      '取消',
+                    ),
+                    h(
+                      'button',
+                      {
+                        className: 'sl-btn',
+                        style: actionButtonStyle,
+                        disabled: busy,
+                        onClick: confirmRestart,
+                      },
+                      busy ? '正在重启…' : '重启',
+                    ),
+                  ),
+            ),
+          )
+        }
+
+        /**
          * Render the confirmation for deleting the selected log rows.
          *
          * @returns {object} React element.
@@ -3971,6 +4053,21 @@ window.__ModuleLoader__.load({
                 '操作日志',
               )
             : null,
+          // Only the bin needs it: queued deletions and loaded sessions are
+          // released when the Host starts again.
+          view === 'trash'
+            ? h(
+                'button',
+                {
+                  key: 'restart',
+                  className: 'sl-ghost',
+                  title: '重启 DeepSeek Harness，让排队删除的会话立即清理',
+                  onClick: () => setRestartDialog({ phase: 'confirm', error: null }),
+                },
+                h(Icon, { name: 'refresh', size: 14 }),
+                '重启',
+              )
+            : null,
         )
 
         let body = null
@@ -4175,6 +4272,7 @@ window.__ModuleLoader__.load({
             : null,
           dialog !== null ? renderDialog() : null,
           purgeDialog !== null ? renderPurgeDialog() : null,
+          restartDialog !== null ? renderRestartDialog() : null,
           clearLogsDialog ? renderClearLogsDialog() : null,
           logsDeleteDialog !== null ? renderLogsDeleteDialog() : null,
           exportDialog !== null ? renderExportDialog() : null,
