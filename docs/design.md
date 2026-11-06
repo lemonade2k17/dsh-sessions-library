@@ -1,312 +1,259 @@
 # 会话库 / 会话迁移插件 设计文档
 
-- 版本：v0.1（草案）
-- 日期：2026-10-22
-- 状态：设计已确认，进入 Phase A 实现
+- 版本：v0.4.0
+- 日期：2026-11-06
+- 状态：已实现并作为基线发布（`v0.4.0`）
 - 工作目录：`C:\Users\ktypc\Desktop\dsh-sessions-migration`
+
+> 本文档描述**当前实现**，不是初始设计草案。早期草案里的 Phase A/B/C 划分、`previewLimit` 等配置项已被实际实现取代。
 
 ## 1. 目标
 
-一个 DSH（DeepSeek Harness，DeepSeek 的智能体运行宿主）插件，提供两块能力：
+一个 DSH（DeepSeek Harness）插件，围绕"会话"提供四块能力：
 
-1. **会话库页面**（侧边栏入口）：以工作区为主体，列出磁盘上全部会话；每个工作区默认展开显示前 5 条，可一键展开全部；支持"未归档 / 全部（含已归档）"筛选；点击会话行打开该会话。
-2. **会话导入（迁移）**：把 DSH 官方"下载会话日志"导出的 ZIP 导入本机，完成格式校验、路径重映射、附件还原。默认 dry-run，不覆盖已有会话，不删除源数据。
+1. **会话库页面**（侧边栏入口 + 主面板）：以工作区为主体列出磁盘上的全部会话，按组折叠、默认展示前 N 条、「查看全部」、搜索、`未归档 / 全部` 筛选、勾选后批量操作。
+2. **会话包导出**：把选中会话打成 ZIP（`manifest.json` + 原始日志字节），可选附带**工作区目录下的文件**，并用目录浏览器点击挑选要排除的目录/文件。
+3. **会话包导入（迁移）**：校验包、预览冲突、为源工作区选择目标工作区、选择工作区文件冲突策略，然后落盘并用官方服务把会话挂回工作区。
+4. **回收站与操作日志**：删除先进回收站（可恢复），永久删除需输入确认；所有动作写入操作日志页。
 
-### 非目标（后续版本）
+### 非目标
 
-- 同机搬迁（修改会话 cwd、移动会话到其他工作区）
 - 从 Claude Code / Codex 等第三方工具导入历史
-- 覆盖同名会话、删除源日志、"移动"语义
-- 改写 workspace 注册表把导入会话挂进工作区（v1 以"未分组"呈现）
+- 云端/远端仓库同步（讨论过方案，尚未实现）
+- 包口令加密（讨论过 AES-256-GCM + PBKDF2 方案，尚未实现）
+- 重启 DSH 本体（见 §8.3，插件层面不可行）
 
-## 2. 已核实的环境事实（2026-10-22，只读核查）
+## 2. 已核实的环境事实
 
 ### 2.1 会话日志
 
 - 根目录：`$DSH_HOME/sessions`（本机 `C:\Users\ktypc\.dsh\sessions`）
-- 布局：`--<规范化 cwd>--/<session-id>/session.v4.jsonl.zstd`，一个会话一个文件
-- 物理格式：多个独立 zstd（Zstandard，一种带校验的压缩算法）帧拼接；第一帧只含 header（日志头），之后每批追加一帧
-- header 字段：`type="session"`、`version`、`id`、`createdAt`、`cwd`、`isSeeded`、`delegationDepth`、`agentPreset`，可选 `parentSession`、`origin="subagent"`
-- 事件：`type/seq/time/data`，seq 从 0 连续、永不改写；派生事件带 `surfaceOp`
-- 历史格式：v0–v3 由持久化后端在读取时自动迁移到 v4，写入方无需关心
+- 布局：`--<规范化 cwd>--/<session-id>/session.v4.jsonl.zstd`
+- 物理格式：多个独立 zstd 帧拼接；第一帧只含 header，之后每批追加一帧。Node 的 zstd 同步 API 只解第一个帧，插件按帧循环解压。
+- header 字段：`type="session"`、`version`、`id`、`createdAt`、`cwd`，可选 `parentSession`、`origin="subagent"`、`agentPreset`
+- **同一会话目录可能同时存在多份格式日志**（`session.jsonl.zstd`、`session.v3.jsonl.zstd`、`session.v4.jsonl.zstd`…）。改写 cwd 时必须按 `v4 > v3 > 原始` 择优定位当前格式文件，并改写**全部**日志——只改第一个文件会让导入会话的 cwd 校验失败（0.4.0 修复）。
+- `projectKey(cwd)`：`/`、`\`、`:` 合并成单个 `-`；`[A-Za-z0-9._-]` 原样保留；其它字符写成 `~XXXX`；结果形如 `--C-Users-ktypc-Desktop-Misc--`。
 
 ### 2.2 工作区注册表
 
-- 文件：`$DSH_HOME/storages/workspace.json`（domain（数据域）`workspace` v2）
-- 结构：
-  - `global.workspaceIds`：工作区显示顺序
-  - `global.archivedSessionIds` / `global.pinnedSessionIds`：归档、置顶会话集合
-  - `global.defaultWorkspaceId`、`global.pendingMutation`（可选）
-  - `tables.workspaces[workspaceId]`：`{ path, title, sessionIds[], createdAt, updatedAt }`
-- 归属规则：会话在**创建时**按 cwd 附着到工作区；注册表启动时仅在"从未初始化"时做一次历史补登记，之后不会重扫
-- 路径唯一性以 `fs.realpath` 的规范路径为准
+- 文件：`$DSH_HOME/storages/workspace.json`
+- 结构：`global.workspaceIds`（顺序）、`global.archivedSessionIds` / `global.pinnedSessionIds`、`tables.workspaces[id] = { path, title, sessionIds[], createdAt, updatedAt }`
+- 路径唯一性以 `fs.realpath` 规范路径为准；注册表保存的 `path` 已是规范形式
+- 归属规则：会话在**创建时**按 cwd 附着；启动时不重扫
 
 ### 2.3 附件
 
 - 根目录：`$DSH_HOME/attachments/v1`
-- 图片：`objects/<sha256 前 2 位>/<sha256>`；会话里引用为 `sha256:<hash>`
-- 通用文件：规范对象 `file-objects/<prefix>/<digest>`，引用路径 `files/<prefix>/<digest>/<name>` 是指向规范对象的硬链接
-- `tmp/` 为写入暂存目录
-- 内容寻址：相同字节只存一份（去重）
+- 图片：`objects/<sha256 前两位>/<sha256>`，会话里引用为 `sha256:<hash>`
+- 通用文件：规范对象 `file-objects/<prefix>/<digest>`，`files/<prefix>/<digest>/<name>` 是指向它的硬链接
+- 内容寻址：相同字节只存一份；因此"恢复字节 = 引用自动命中"，导入时**不需要改写日志**
 
 ### 2.4 派生数据（可重建，不迁移）
 
-- 投影缓存：`$DSH_HOME/storages/session_projcache/`
-- 成本账本：`$DSH_HOME/storages/cost-meter/ledger.json`（第三方 dsh-cost-meter 维护）
-- 全文检索索引：`dsh-session-query-sqlite`，派生库，可重建
+投影缓存 `$DSH_HOME/storages/session_projcache/`、成本账本 `storages/cost-meter/ledger.json`、SQLite 检索索引。
 
-### 2.5 两个硬约束
+### 2.5 硬约束
 
-1. **持久化层没有删除 API**。官方文档明确 "Nothing deletes session files"。删除、移动、覆盖只能是文件级操作，路径校验与安全防护必须由插件自己承担。
-2. **会话标题写在日志里**（log-backed 标题折叠），所以标题随日志迁移；但**工作区归属、置顶、归档状态不在日志里**，跨机必然丢失，除非导入包额外携带清单。
+1. **持久化层没有删除 API**，删除/移动/覆盖都是文件级操作，路径校验与安全防护由插件承担。
+2. **标题在日志里**（log-backed），随日志迁移；**工作区归属、置顶、归档状态不在日志里**，跨机必然丢失，因此导入包需要自带清单，并在导入后用官方服务重新挂载。
+3. **打开中的会话占用会话文件**，删除要等 Host 重启（见 §8.2）。
 
-### 2.6 官方导出能力（本插件复用的基础）
+### 2.6 桌面外壳与 Host 的关系（决定"能不能重启"）
 
-- 包：`@deepseek-ai/dsh-session-log-export`
-- 入口：会话头部 `⋯` → "Download session log"，或 `/export` 命令
-- 产物：`dsh-session-<id>.zip`，包含根会话、子会话（`includeDescendants=true`）与附件
-- 归档内布局（按官方说明）：
-  - 每个逻辑日志：`session.jsonl`（v0）或 `session.vN.jsonl`，子会话在自己的目录下
-  - 图片：`media/<attachmentId>.<ext>`
-  - 通用文件：`files/<digest-prefix>/<digest>/<name>`
-- 限制：一个会话同时只允许一个进行中的下载；产物是浏览器下载，不落 Host 路径
-
-### 2.7 原生侧边栏的既有行为（本插件页面的参照）
-
-- 每个展开的工作区先显示前 5 条会话（watermark（水位）），每次 "Show more" +5，剩余 ≤5 时一次放完，"Show less" 复位
-- 子代理产生的会话默认隐藏
-- 无标题会话显示"未命名"
-- 置顶会话排在普通会话前；默认按"最后更新时间"倒序
-- 归档筛选：Hide archived（默认）/ All conversations / Archived only
-- 支持工作区树（按路径父子嵌套）与 Ungrouped（未分组）桶
+- Electron 外壳用 `spawn` 把 Host 起成**子进程**，并监听 `child.once('close')`：Host 一旦退出就判定为故障，弹出「应用无法启动或已意外停止」。
+- 外壳→Host 的控制消息只有 `shutdown`、`quit-inspection`、`update-tasks`；Host→外壳只有 `ready`、`platform-session`、`fatal`、`shutdown-complete` 与控制响应。**没有"请求重启"的消息类型**。
+- 因此插件**不能**重启 DSH；详见 §8.3。
 
 ## 3. 页面规格
 
 ### 3.1 入口与插槽
 
-- `sidebar.panellist`（侧边栏全局面板图标位，list 类型）注册一行：图标 + "会话库"
-- `main`（主面板，keyed 类型，按 sidebar 入口 id 选择）注册同 id 的页面
-- 点击侧边栏入口切换到该面板而不改变已选会话
+- `sidebar.panellist` 注册一行：图标 + 「会话库」
+- `main` 注册同 key 的页面
 
-### 3.2 布局
+### 3.2 布局（0.4.0）
 
 ```text
-┌ 会话库 ─────────────────────────────────────────────┐
-│ [搜索标题/工作区]  [筛选: 未归档 ▾]  [导入 ZIP]  [刷新] │
-├─────────────────────────────────────────────────────┤
-│ ▸ Misc                          39 个会话   10-21     │
-│ ▾ rtsp_learn                    16 个会话   10-08     │
-│    • SPI 收发异常排查                    10-08 14:22  │
-│    • DMA 描述符对齐问题                  10-07 09:13  │
-│    • （前 5 条）                                      │
-│    [ 查看全部 16 条 ▾ ]                               │
-│ ▸ dsh-sessions-migration        1 个会话    10-22     │
-│ ▸ (未分组)  imx6ull-dev3         7 个会话              │
-└─────────────────────────────────────────────────────┘
+┌ 会话库   [状态摘要]                          [刷新] [回收站] [操作日志] ┐
+│ [🔍 搜索标题或工作区            ✕]  [未归档|全部]      [展开/收起]      │
+├──────────────────────────────────────────────────────────────────────┤
+│ ▾ Misc  C:\Users\ktypc\Desktop\Misc                  37 个会话  1 天前 │
+│   ☐ 检查 dsh 最新版本                                       1 天前    │
+│   ☐ 安装 GitHub Skills 仓库                                 5 天前    │
+│   …（默认前 5 条）                                                    │
+│   [查看全部 37 条]                                                    │
+└──────────────────────────────────────────────────────────────────────┘
+      [ 移入回收站 ] [ 导出所选 ] [ 清除选择 ]   ← 毛玻璃浮动 dock
 ```
+
+- 正文限制在 1200 px 内容列居中
+- 分组是卡片（1 px 描边、14 px 圆角、3.5% 表面色）
+- 数据来源（`工作区 follow · 会话 persistence · 标题 batch`）固定在面板页脚，滚动区之外；会话库视图给页脚留 62 px 以避开 dock
 
 ### 3.3 交互
 
 | 动作 | 行为 |
 |---|---|
-| 点击分组头 | 展开/收起；首次展开显示前 5 条 |
-| 点击"查看全部 N 条" | 展开该组全部会话；再点"收起"恢复 5 条 |
-| 点击会话行 | 打开该会话（复用 `ctx.uiWorkspace.openSession`） |
-| 行尾勾选框 | 预留：多选用于后续批量迁移/导出 |
-| 搜索框 | 本地过滤标题与工作区名，不触发全文检索 |
-| 刷新按钮 | 重新拉取 Host 快照 |
-| 导入 ZIP | 打开导入向导（Phase C） |
+| 点击分组头 | 展开/收起；**收起时同时清掉该组的「查看全部」状态**，再展开回到前 5 条 |
+| 展开/收起（工具栏） | 全部展开；全部收起时清空所有组的查看全部状态 |
+| 点击会话行 | `ctx.uiWorkspace.openSession` 打开 |
+| 行尾勾选框 | 多选；组头复选框为三态（全选/半选/未选），只作用于当前显示的会话 |
+| 进入回收站 / 操作日志 | **清空会话库的勾选**（防止带着旧选中集合批量删除/导出） |
+| 搜索 | 本地过滤标题与工作区名 |
 
-### 3.4 筛选
+### 3.4 筛选与排序
 
-- `未归档`（默认）：不显示 `archivedSessionIds` 中的会话
-- `全部`：包含已归档会话（行置灰 + 归档标记）
-- 子代理会话：默认隐藏；`Config.showSubagentSessions = false` 时无论筛选如何都不显示
+- `未归档`（默认，排除 `archivedSessionIds`）/ `全部`：展开状态按视图分别记忆（localStorage）
+- 组内：置顶在前，其余按最后活动时间倒序；工作区按注册表顺序，未分组桶固定最后
 
-### 3.5 排序
-
-- 分组：置顶会话在前，其余按最后活动时间倒序
-- 工作区顺序：按注册表 `workspaceIds` 顺序；未分组桶固定排在最后
-
-### 3.6 边界情况
+### 3.5 边界情况
 
 | 情况 | 处理 |
 |---|---|
-| 会话 cwd 无对应工作区（工作区被删） | 归入"未分组"，组名取目录尾段 |
-| 工作区无可见会话 | 不显示该组（页面是会话浏览器） |
-| 两个工作区同名 | 组名后附路径尾段区分 |
-| cwd 目录已不存在 | 照常显示，行上标记"目录缺失" |
-| 子代理会话 | 默认隐藏（Config 开关） |
-| 超大工作区 | 只渲染 5 条，展开后才追加；不做虚拟滚动（v1） |
-| 会话文件损坏/格式不支持 | 该行标记"无法读取"，不阻塞整页 |
+| 会话 cwd 无对应工作区 | 归入未分组，组名取目录尾段 |
+| 工作区无可见会话 | 该组显示 0 条但仍可见（库页面是会话浏览器） |
+| cwd 目录已不存在 | 照常显示，行上标注 |
+| 会话文件损坏 | 该行标记无法读取，不阻塞整页 |
+| 超大工作区 | 只渲染前 5 条，展开后追加 |
 
-## 4. 数据流
+## 4. 数据流与 Host 路由
 
-### 4.1 Host 聚合（一次快照）
+### 4.1 快照聚合
 
-| 数据 | 来源 | 备注 |
-|---|---|---|
-| 全部已落盘会话 + header | `ctx.sessionPersistence.list()` | 覆盖持久化根下所有会话（含未归组、归档、子代理） |
-| 标题 | `ctx.sessionQuery.readTitleSnapshots(ids)` | 批量读取 |
-| 工作区名/路径/归属 | `ctx.workspaceRegistry.list()` | 分组主体 |
-| 置顶/归档集合 | workspace 注册表投影 | 决定可见性与标记 |
-| 最后活动时间 | 投影中的会话时间（无则用 header.createdAt） | 排序依据 |
+| 数据 | 来源 |
+|---|---|
+| 会话列表 + header | `ctx.sessionPersistence.list()` |
+| 标题 | `ctx.sessionQuery.readTitleSnapshots(ids)` 批量读取 |
+| 工作区名/路径/顺序 | `ctx.workspaceRegistry.list()` 或 `workspaceController.follow()` 基线 |
+| 归档 / 置顶集合 | 基线快照 |
+| 最后活动时间 | 控制器摘要，缺失时回退 header.createdAt |
 
-聚合结果：`SessionLibrarySnapshot`
+快照步骤各自有超时与降级路径，并写入 `$DSH_HOME/cache/sessions-library/debug.log`；客户端按需轮询 + 「页面之外发生点击/按键后去抖重读」保持同步。
 
-```ts
-interface SessionLibrarySnapshot {
-  workspaces: LibraryGroup[]   // 注册表顺序
-  ungrouped: LibraryGroup      // 未匹配到工作区的会话
-  counts: { total: number; archived: number; subagent: number }
-  fetchedAt: number
-}
+### 4.2 路由（全部为 `POST /api/sessions-library/*`）
 
-interface LibraryGroup {
-  kind: 'workspace' | 'ungrouped'
-  id: string            // workspaceId 或规范化目录
-  title: string         // 工作区 title 或目录尾段
-  path?: string
-  sessions: LibrarySession[]
-}
+| 路由 | 用途 |
+|---|---|
+| `snapshot` | 会话库快照 |
+| `delete-preflight` / `delete` / `delete-progress` | 删除预检、执行、进度轮询 |
+| `trash-list` / `trash-restore` / `trash-purge` | 回收站列表、恢复、永久删除 |
+| `logs` / `logs-clear` / `logs-delete` | 操作日志查询、清空、删除所选 |
+| `export` | 导出会话包 |
+| `workspace-preflight` | 统计所选会话所属工作区目录的文件数与体积 |
+| `workspace-browse` | 排除项的目录浏览器（单层最多 500 项、目录优先、锁定工作区根） |
+| `import-list` / `import-preflight` / `import-run` | 导入向导三步 |
 
-interface LibrarySession {
-  id: string
-  title?: string        // 无标题 → 前端显示"未命名"
-  lastActivity: number
-  pinned: boolean
-  archived: boolean
-  origin?: 'subagent'
-  cwd?: string
-  cwdMissing?: boolean
-}
-```
+## 5. 导出设计
 
-### 4.2 Remote 方法
-
-- `library.snapshot()` → `SessionLibrarySnapshot`
-- （Phase C）`migration.preflight(uploadId)` / `migration.apply(uploadId, decisions)`
-
-### 4.3 性能
-
-- 首次打开拉一次快照；标题批量读取；200 量级会话可接受
-- 展开全部为纯客户端行为，不追加请求
-- 手动刷新才重新拉取；v1 不做增量订阅
-
-## 5. 导入（迁移）设计
-
-### 5.1 输入与上传
-
-- 输入：官方导出的 `dsh-session-<id>.zip`
-- 上传：插件注册自己的 HTTP 路由接收 ZIP 流，落到 `$DSH_HOME/cache/session-migration/<uploadId>/`
-- 不在浏览器内解析 ZIP，不在客户端做文件系统操作
-
-### 5.2 预检（dry-run）
-
-输出 `MigrationPlan`：
-
-- 包内会话列表：id、标题、cwd、格式版本、isSeeded、parentSession
-- 父子完整性：子会话的父是否在包内
-- id 冲突：目标机已存在同 id 会话 → 标记"跳过"
-- cwd 映射建议：精确命中 → 前缀替换 → 保留原值
-- 附件清单：图片 / 文件、缺失项、总体积
-- 结论：可导入条数、跳过条数、阻塞错误
-
-### 5.3 路径映射
-
-1. 包内 cwd 在本机存在 → 直接用
-2. 用户设置前缀替换（如 `C:\Users\old\proj` → `D:\work\proj`）→ 用新路径
-3. 都不可用 → 保留原 cwd（落成未分组会话，仍可打开）
-4. 执行前必须展示"旧 → 新"对照
-
-### 5.4 落盘
-
-- 优先 `ctx.sessionPersistence.create(header)` → `handle.append(events)` → `flush()`，由官方编解码器负责 v4 编码与历史格式升级
-- **禁止手工拼接 zstd 帧**
-- header 仅改写 `cwd`；id、createdAt、isSeeded、agentPreset、parentSession 原样保留
-- 先解压校验、再统一落位；失败清理，不留半截会话
-
-### 5.5 附件还原
-
-- 图片：按 `sha256` 直接写 `attachments/v1/objects/<前 2 位>/<hash>`；**不走 `attachments.saveImage`**（会重新规范化、改字节，导致引用 id 漂移）
-- 文件：写 `file-objects/<prefix>/<digest>`，在 `files/<prefix>/<digest>/<名字>` 建硬链接（失败退化为复制）
-- 全部做 SHA-256 校验后才算完成
-
-### 5.6 幂等与冲突
-
-- 保留原会话 id
-- 目标机已存在同 id → 跳过并报告（重复导入同一包 = 全部跳过）
-- 活会话（本进程持有的写入锁）→ 拒绝
-
-### 5.7 安全
-
-- ZIP 条目路径穿越（zip slip）校验
-- 会话 id 字符白名单、cwd 规范化
-- 不执行包内任何内容、不改写无关文件
-- 导入完成后不自动唤醒 agent（仅落盘）
-
-### 5.8 报告
-
-- 成功 / 跳过 / 失败明细，可复制
-- 导入记录保存在插件自有存储，供页面回看
-
-## 6. 配置项（Config）
-
-| 字段 | 默认 | 含义 |
-|---|---|---|
-| `previewLimit` | `5` | 每个工作区默认展开显示的会话条数 |
-| `showSubagentSessions` | `false` | 是否显示子代理产生的会话 |
-| `defaultFilter` | `'unarchived'` | 默认筛选：`unarchived` / `all` |
-| `importMode` | `'dry-run'` | 导入默认行为：`dry-run` / `confirm` |
-| `cacheDir` | `$DSH_HOME/cache/session-migration` | 上传包与解压暂存目录 |
-
-## 7. 插件包结构
+### 5.1 包格式
 
 ```text
-dsh-sessions-migration/
-  package.json            # 包清单：dsh.bundle.patch、dsh.client、engines.dsh
-  cordis.patch.yml        # Loader 条目（insert 一行）
-  index.js                # Host 半：聚合服务、Remote、导入内核
-  client.js               # Client 半：会话库页面、导入向导
-  locale/en.json
-  locale/zh.json
-  icon.svg
-  README.md
-  docs/design.md          # 本文档
+manifest.json
+sessions/<sessionId>/<原始日志文件名>       # 逐字节复制
+workspaces/<workspaceId>/<相对路径>          # 可选：工作区附件
+attachments/<版本>/…                        # 仅旧版本导出包可能携带（导入侧兼容）
 ```
 
-## 8. 实施阶段与验收
+`manifest.json`：`format='dsh-sessions-library-export'`、`version=1`、`exportedAt`、`source.dshHome`、`workspaces[]`、`sessions[]`，可选 `workspaceFiles[]`（含每个文件的 `name`/`bytes`/`mtime`）与 `workspaceExcludePaths[]`。
 
-### Phase A：只读会话库页面
+### 5.2 工作区附件
 
-- Host 聚合 + Remote + 页面骨架（分组、展开 5 条、查看全部、筛选、打开会话、搜索）
-- 验收：侧边栏出现"会话库"；工作区分组正确；默认 5 条；查看全部生效；未归档/全部切换正确；点击行打开对应会话；子代理会话默认不出现
-- 不写任何会话文件
+- 勾选「包含工作区附件」后，按所选会话所属工作区统计并打包**工作区目录下的全部文件**
+- **没有内置排除**：`node_modules`、`.git`、`dist` 等一律不自动跳过，排除项完全由用户点选
+- 用户通过目录浏览器勾选目录（排除整棵子树）或单个文件；选择**只在本次导出有效**，取消或导出完成后清空
+- 上限：单工作区 200 MB / 5000 个文件；整包 512 MB。超出时预检与结果都会提示截断
 
-### Phase B：导入内核
+### 5.3 安全与边界
 
-- ZIP 解析、预检、路径映射、日志落盘、附件还原、报告
-- 验收：用一个真实导出包，预检列出全部会话与附件；导入后会话出现在"未分组"、可打开、可继续对话、图片/文件正常；重复导入全部跳过
+- 排除路径必须是绝对路径，含 `..` 的条目被丢弃，最多 500 条
+- 浏览器不能越过工作区根目录（Host 侧同样拒绝越界与前缀相似的兄弟目录）
+- 打包在内存中构建 ZIP，因此整包上限设为 512 MB
 
-### Phase C：导入 UI
+## 6. 导入设计
 
-- 页面顶栏"导入 ZIP"接入向导：上传 → 预检报告 → 路径映射 → 执行进度 → 结果
-- 验收：全流程无需命令行；失败可从报告定位
+### 6.1 流程
 
-## 9. 风险与待验证
+1. `import-list`：扫描目录列出候选 ZIP
+2. `import-preflight`：解析清单 → 逐会话判定冲突（`exists` / `archived` / `pending` / `missing`）、父会话完整性、逐工作区的会话数与**文件数与体积**
+3. 用户在预览里为每个源工作区选择目标工作区（默认：本机存在同路径则自动选中，否则「未分组」），并选择冲突策略
+4. `import-run`：落盘 → 改写日志头 cwd → 恢复附件 → 恢复工作区文件 → 把会话挂到目标工作区 → 记录操作日志
 
-| 风险 | 影响 | 验证方式 |
-|---|---|---|
-| ZIP 内日志是否为未压缩 JSONL、首行是否可直接改写 | 决定导入走 `append` 还是重新封装帧 | 用一份真实导出包解包核对 |
-| 包内行是"逻辑事件"还是"存储形态"（`sourceEventSeqs` 是否压缩成区间） | 决定是否需要转换层 | 同上 |
-| 导入会话在侧边栏的呈现（未分组是否可见） | 影响导入 UX | 导入到临时 DSH_HOME 观察 |
-| fork / isSeeded 会话父缺失 | 历史可能缺口 | 预检拒绝父缺失的种子会话 |
-| 大包（数十 MB 日志 + 附件） | 内存与耗时 | 流式解压 + 进度 + 可取消 |
-| 页面 slot 注册与 React 依赖 | 页面能否渲染 | Phase A 先验证 |
-| DSH 版本兼容 | 安装被拒 | `engines.dsh` 声明 + 安装时校验 |
+### 6.2 冲突策略（工作区文件）
 
-## 10. 变更记录
+| 策略 | 行为 |
+|---|---|
+| `skip`（默认） | 目标已存在的文件保留不动 |
+| `overwrite` | 用包内版本替换 |
+| `newer` | 按 manifest 记录的 `mtime` 与本地修改时间比较，仅包内更新时替换；旧包无时间记录按跳过 |
+| 同名目录 | 三种策略都计入失败，绝不删除目录 |
+
+### 6.3 未映射（未分组）的语义
+
+会话与文件是两条独立路径：
+
+- **会话**照常落盘到 `sessions/<源路径编码>/<id>/`，在库里显示为未分组；
+- **工作区文件一个都不写**（结果里该工作区标 `unmapped`，文件计入跳过），因为包里只有源机器的绝对路径，瞎猜落点会污染别的工作区；
+- 预览阶段会在「映射为未分组 + 该工作区带文件」时显示橙色提示，选定目标工作区后提示消失；
+- 补导技巧：重新导入同一包并选目标工作区——会话因 id 已存在被跳过，文件会正常写入。
+
+### 6.4 会话挂载的可见性竞态（0.4.0 修复）
+
+`workspace.attachSession(id)` 会通过持久化列表校验会话是否存在。导入刚写完文件时该列表可能落后一次刷新，调用抛错且异常曾被静默吞掉，会话永久停在未分组。现在的做法：
+
+1. 轮询持久化列表直到能看到新会话（最多 3 秒）再 attach；
+2. 失败后等 1.5 秒重试一次；
+3. 仍失败写 `[import] attach-fail` 日志，并作为警告出现在导入结果里。
+
+### 6.5 安全
+
+- ZIP 条目路径穿越校验；解压体积按**实际输出**计（上限 1.5 GB），条目数上限 20000
+- 会话 id 只接受单一路径段；manifest 与回收站清单都做校验
+- 改写 cwd 时只改日志头，历史事件帧字节不变
+- 导入后不自动唤醒 agent
+
+## 7. 回收站与删除
+
+### 7.1 数据位置
+
+| 路径 | 内容 |
+|---|---|
+| `$DSH_HOME/sessions-trash/<时间戳>-<会话id>/` | 回收站条目（`session/` + `manifest.json`） |
+| `$DSH_HOME/sessions-library/pending-trash.json` | 待重启整理的删除队列 |
+| `$DSH_HOME/sessions-library/audit.log` | 永久删除审计（只追加） |
+| `$DSH_HOME/sessions-library/operations.log` | 操作日志（JSONL，保留最近 1000 条，页面上限 500 条） |
+
+### 7.2 删除语义
+
+- 运行中的会话：硬阻止，不允许删除
+- 已加载但空闲：归档 + 排队（`pending:` 前缀，界面显示「待重启整理」），重启后由 Host 启动流程完成搬移
+- 已在队列中：只能「放弃永久删除」，不能恢复
+- 恢复：仅当删除前未归档时才取消归档（`wasArchived` 幂等记录）
+- 批量上限 100 条，超出会明确告知只处理前 100 条
+
+### 7.3 为什么不能由插件重启 DSH
+
+见 §2.6：外壳把 Host 的任何退出都判定为故障，且没有重启消息类型。插件里唯一"能跑通"的办法是从外部助手进程**强杀整个进程树再启动**，代价是可能丢失正在写入的会话内容，因此**未实现**（0.4.0 曾实现过一版，因触发崩溃对话框而回滚，见 §9）。
+
+## 8. 操作日志
+
+每条记录包含时间、动作（删除/恢复/永久删除/导出/导入/收养）、会话 id 与标题；页面支持搜索、排序、勾选删除与整表清空。写入使用临时文件 + `rename` 的原子写法。
+
+## 9. 版本历史
 
 | 日期 | 版本 | 变更 |
 |---|---|---|
-| 2026-10-22 | v0.1 | 初稿：确定会话库页面规格、导入范围与安全口径 |
+| 2026-10-22 | v0.1 | 初稿：会话库页面规格、导入范围与安全口径 |
+| 2026-10-30 | 0.3.0 | 首个基线：会话库、导入、回收站、操作日志 |
+| 2026-11-02 | 0.3.1 | 导出工作区附件 + 排除目录浏览器 + 导入冲突策略；修复导入 attach 竞态 |
+| 2026-11-06 | 0.4.0 | 界面整体重做；回收站按工作区分组；导入预览提前警告；一批数据归属与原子写修复；**回滚**"从回收站重启 DSH"功能（会触发外壳崩溃提示） |
+
+## 10. 已知限制与后续
+
+| 限制 | 说明 / 可能的下一步 |
+|---|---|
+| 云端/远端仓库同步 | Git 仓库方案 (`packages/*.zip` + `index.json`) 设计与工作量评估已完成，未实现 |
+| 包口令加密 | AES-256-GCM + PBKDF2 方案已讨论，未实现 |
+| 打开中的会话无法立即删除 | 受 §2.5 约束；只能等重启。插件可做的是提示，而不是自动化重启 |
+| ZIP 全内存构建 | 支持 GB 级包需要改流式写入 |
+| 无自动化测试套件 | 目前用临时 harness 验证，仓库内没有 `test/` |
+| 大工作区全量打包 | 去掉内置排除后由用户自行勾选；上限 200 MB / 5000 文件 |
