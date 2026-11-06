@@ -124,6 +124,12 @@ window.__ModuleLoader__.load({
     // Last successful snapshot: a re-opened panel renders it immediately and
     // refreshes in the background, so only the very first open waits.
     let cachedSnapshot = null
+    // Same idea for the recycle bin: reopening it renders the last listing at
+    // once and refreshes silently, so the loading placeholder stops flashing
+    // on every visit.
+    let cachedTrashEntries = null
+    // And for the operation log page, which had the identical placeholder flash.
+    let cachedLogEntries = null
     // Host boot identity this page already synchronized with.
     let knownBootAt = null
 
@@ -373,6 +379,18 @@ window.__ModuleLoader__.load({
       // The bin and the log use the same card shell for their flat lists.
       '.sl-list-card { border: 1px solid var(--sl-line); border-radius: var(--sl-radius-lg); background: var(--sl-surface); overflow: hidden; }',
       '.sl-list-card > *:last-child { border-bottom: none; }',
+      // The bin's list settles in the same way an empty state does, so a load
+      // never snaps a screenful of cards into place; a family that just left
+      // (restored or purged) fades where it stands before the re-read.
+      '.sl-trash-panel { animation: sl-empty-in 190ms cubic-bezier(0.23, 1, 0.32, 1) both; }',
+      '.sl-trash-family[data-removing="true"] { animation: sl-trash-out 150ms ease-out both; pointer-events: none; }',
+      // A workspace group whose last family left fades as a whole, so the card
+      // does not simply vanish and drop the groups below it mid-read.
+      '.sl-group[data-removing="true"] { animation: sl-trash-out 150ms ease-out both; pointer-events: none; }',
+      // A finished library load settles in instead of snapping a screenful of
+      // cards into place; the same curve as the empty state and the bin.
+      '.sl-settle { animation: sl-empty-in 190ms cubic-bezier(0.23, 1, 0.32, 1) both; }',
+      '@keyframes sl-trash-out { from { opacity: 1; transform: none; } to { opacity: 0; transform: translateY(-2px); } }',
       // The chevron is a drawn glyph, not a font character: it rotates in place
       // and keeps its optical centre on every platform.
       '.sl-chevron { flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px;'
@@ -400,6 +418,13 @@ window.__ModuleLoader__.load({
       '.sl-row[data-checked="true"]:hover { background: color-mix(in srgb, var(--sl-accent) 17%, transparent); }',
       '.sl-logrow { border-bottom: 1px solid color-mix(in srgb, currentColor 8%, transparent); transition: background-color 120ms ease; }',
       '.sl-logrow:hover { background: var(--sl-sheen); }',
+      // Log rows arrive and leave softly; an instant swap of a dense list reads
+      // as a flicker. Enter runs 150ms with a short capped stagger (set inline
+      // per row), exit is a quick fade so a deletion never looks stuck.
+      '.sl-logrow { animation: sl-log-in 150ms cubic-bezier(0.23, 1, 0.32, 1) both; }',
+      '.sl-logrow[data-removing="true"] { animation: sl-log-out 150ms ease-out both; pointer-events: none; }',
+      '@keyframes sl-log-in { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }',
+      '@keyframes sl-log-out { from { opacity: 1; transform: none; } to { opacity: 0; transform: translateY(-3px); } }',
       '.sl-badge { display: inline-flex; align-items: center; gap: 5px; flex: 0 0 auto; height: 18px; padding: 0 7px; border-radius: 999px;'
         + ' background: color-mix(in srgb, currentColor 7%, transparent); color: var(--sl-muted); font-size: 11px; font-weight: 500;'
         + ' line-height: 1; white-space: nowrap; }',
@@ -457,7 +482,12 @@ window.__ModuleLoader__.load({
       '@keyframes sl-dock-in { from { opacity: 0; transform: translate(-50%, 10px); } to { opacity: 1; transform: translate(-50%, 0); } }',
 
       // --- empty + loading --------------------------------------------------
-      '.sl-empty { display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 76px 20px; text-align: center; }',
+      // An empty state settles in instead of snapping onto a blank page: one
+      // quiet fade with a 6px rise. Kept on the container alone — staggering
+      // the children on top of it doubled the travel and read as fussy.
+      '.sl-empty { display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 76px 20px; text-align: center;'
+        + ' animation: sl-empty-in 190ms cubic-bezier(0.23, 1, 0.32, 1) both; }',
+      '@keyframes sl-empty-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }',
       '.sl-empty-icon { display: flex; align-items: center; justify-content: center; width: 44px; height: 44px; margin-bottom: 4px;'
         + ' border: 1px solid var(--sl-line); border-radius: 14px; background: var(--sl-surface); color: var(--sl-faint); }',
       '.sl-empty-title { font-size: 13.5px; font-weight: 600; }',
@@ -587,6 +617,10 @@ window.__ModuleLoader__.load({
       trash: ['M4 7h16', 'M9.5 7V4.8h5V7', 'M6.5 7l.9 12.2h9.2L17.5 7'],
       log: ['M4 6.5h16', 'M4 12h16', 'M4 17.5h10'],
       back: ['M15 5l-7 7 7 7'],
+      folder: [
+        // Workspace marker: the corner notch keeps it recognisable at 11px.
+        'M4 8.5v-2A1.5 1.5 0 0 1 5.5 5h4l2 2.5h7A1.5 1.5 0 0 1 20 9v7.5A1.5 1.5 0 0 1 18.5 18h-13A1.5 1.5 0 0 1 4 16.5z',
+      ],
       expand: [
         'M9 4H5.5A1.5 1.5 0 0 0 4 5.5V9',
         'M15 4h3.5A1.5 1.5 0 0 1 20 5.5V9',
@@ -613,7 +647,7 @@ window.__ModuleLoader__.load({
      * @returns {object} React element.
      */
     function Icon(props) {
-      const { name, size = 14 } = props
+      const { name, size = 14, strokeWidth = 1.85 } = props
       const paths = ICONS[name] || []
       return h(
         'svg',
@@ -623,7 +657,7 @@ window.__ModuleLoader__.load({
           height: size,
           fill: 'none',
           stroke: 'currentColor',
-          strokeWidth: 1.85,
+          strokeWidth,
           strokeLinecap: 'round',
           strokeLinejoin: 'round',
           'aria-hidden': true,
@@ -835,6 +869,16 @@ window.__ModuleLoader__.load({
         const [trashNotice, setTrashNotice] = React.useState(null)
         const [dialog, setDialog] = React.useState(null)
         const [trashSelected, setTrashSelected] = React.useState({})
+        // Workspace groups in the bin start collapsed: the header already
+        // carries families, sessions and size, so opening the bin gives a
+        // summary to drill into, and every visit starts that way again.
+        const [trashExpanded, setTrashExpanded] = React.useState({})
+        // Families that just left (restored or purged) and are fading out
+        // before the silent re-read swaps the list under them.
+        const [trashRemoving, setTrashRemoving] = React.useState({})
+        // Groups left with no family at all: they fade out together with their
+        // last family, so nothing in the list disappears without a beat.
+        const [trashRemovingGroups, setTrashRemovingGroups] = React.useState({})
         const [purgeDialog, setPurgeDialog] = React.useState(null)
         const [logs, setLogs] = React.useState([])
         const [logsPhase, setLogsPhase] = React.useState('idle')
@@ -843,6 +887,9 @@ window.__ModuleLoader__.load({
         // Log-page selection and its delete confirmation; ids come from the Host
         // so a trim of the history file cannot point at the wrong row.
         const [logsSelected, setLogsSelected] = React.useState({})
+        // Rows just deleted and fading out before the list is re-read: an
+        // instant swap made a deletion read as a flicker.
+        const [logsRemoving, setLogsRemoving] = React.useState({})
         const [logsDeleteDialog, setLogsDeleteDialog] = React.useState(null)
         const [exportDialog, setExportDialog] = React.useState(null)
         const [exportTarget, setExportTarget] = React.useState(loadExportDir)
@@ -1111,6 +1158,48 @@ window.__ModuleLoader__.load({
           return visible
         }, [trash, trashQuery, trashSort])
 
+        // The bin reads best the way the library does: one card per workspace,
+        // with the families the user deleted inside it. Buckets keep a fixed
+        // order — live workspaces in registry order, deleted workspaces, then
+        // the ungrouped and unrecorded tails — so a group never jumps around
+        // while the list refreshes.
+        const trashGroups = React.useMemo(() => {
+          const orderById = new Map()
+          const snapshotWorkspaces = snapshot && Array.isArray(snapshot.workspaces)
+            ? snapshot.workspaces
+            : []
+          snapshotWorkspaces.forEach((group, index) => {
+            if (group && typeof group.id === 'string') orderById.set(`workspace:${group.id}`, index)
+          })
+          const buckets = new Map()
+          for (const family of trashFamilies) {
+            const rootEntry = family.entries.find((entry) => entry.role === 'root') || family.entries[0]
+            const identity = readTrashWorkspaceKey(rootEntry)
+            if (!buckets.has(identity.key)) {
+              buckets.set(identity.key, { ...identity, families: [] })
+            }
+            buckets.get(identity.key).families.push(family)
+          }
+          const rankOf = (bucket) => {
+            if (bucket.kind === 'live') return 0
+            if (bucket.kind === 'gone') return 1
+            if (bucket.kind === 'ungrouped') return 2
+            return 3
+          }
+          const list = Array.from(buckets.values())
+          list.sort((left, right) => {
+            const rankDiff = rankOf(left) - rankOf(right)
+            if (rankDiff !== 0) return rankDiff
+            if (left.kind === 'live') {
+              const leftOrder = orderById.has(left.key) ? orderById.get(left.key) : Number.MAX_SAFE_INTEGER
+              const rightOrder = orderById.has(right.key) ? orderById.get(right.key) : Number.MAX_SAFE_INTEGER
+              if (leftOrder !== rightOrder) return leftOrder - rightOrder
+            }
+            return left.title.localeCompare(right.title, 'zh-Hans-CN')
+          })
+          return list
+        }, [trashFamilies, snapshot])
+
         // Operation-log rows after the query and the time order are applied.
         const visibleLogs = React.useMemo(() => {
           const lowered = logsQuery.trim().toLowerCase()
@@ -1155,6 +1244,10 @@ window.__ModuleLoader__.load({
         const selectedTrashCount = selectedTrashEntries.length
         const allTrashSelected = trashFamilies.length > 0
           && trashFamilies.every((family) => trashSelected[family.key] === true)
+        // No visible workspace group is expanded: the toolbar button flips to
+        // "全部展开" so one click opens the whole bin again.
+        const trashAllCollapsed = trashGroups.length > 0
+          && trashGroups.every((bucket) => trashExpanded[bucket.key] !== true)
 
         /** Select one session in the Conversation. */
         function openSession(sessionId) {
@@ -1383,6 +1476,7 @@ window.__ModuleLoader__.load({
           try {
             const payload = await postJson('api/sessions-library/trash-list', {})
             const entries = Array.isArray(payload.entries) ? payload.entries : []
+            cachedTrashEntries = entries
             setTrash(entries)
             setTrashSelected((current) => {
               const keys = new Set(entries.map((entry) => entry.familyRoot || entry.sessionId))
@@ -1412,7 +1506,19 @@ window.__ModuleLoader__.load({
           setTrashSelected({})
           setTrashQuery('')
           setTrashSort('newest')
-          refreshTrash()
+          setTrashExpanded({})
+          setTrashRemoving({})
+          setTrashRemovingGroups({})
+          // Warm start: a bin that already has a listing shows it instantly
+          // and corrects itself silently, instead of flashing the loading
+          // placeholder for a beat on every visit.
+          if (cachedTrashEntries !== null) {
+            setTrash(cachedTrashEntries)
+            setTrashPhase('ready')
+            refreshTrash({ silent: true })
+          } else {
+            refreshTrash()
+          }
         }
 
         function closeTrash() {
@@ -1440,6 +1546,7 @@ window.__ModuleLoader__.load({
           try {
             const payload = await postJson(LOGS_PATH, { limit: LOGS_LIMIT })
             const entries = Array.isArray(payload.entries) ? payload.entries : []
+            cachedLogEntries = entries
             setLogs(entries)
             // Keep the selection for rows that still exist: the visible-page poll
             // refreshes this list every 15s and must not silently drop what the
@@ -1475,14 +1582,25 @@ window.__ModuleLoader__.load({
           setLogsQuery('')
           setLogsSort('newest')
           setLogsSelected({})
+          setLogsRemoving({})
           setLogsDeleteDialog(null)
-          refreshLogs()
+          // Warm start, same as the bin: a page that already has a listing
+          // shows it immediately and corrects itself silently, so visiting the
+          // log no longer flashes the reading placeholder.
+          if (cachedLogEntries !== null) {
+            setLogs(cachedLogEntries)
+            setLogsPhase('ready')
+            refreshLogs({ silent: true })
+          } else {
+            refreshLogs()
+          }
         }
 
         function closeLogs() {
           setView('library')
           setLogsError(null)
           setLogsSelected({})
+          setLogsRemoving({})
           setLogsDeleteDialog(null)
           setReloadToken((token) => token + 1)
         }
@@ -1491,6 +1609,21 @@ window.__ModuleLoader__.load({
           setClearLogsDialog(false)
           try {
             await postJson(LOGS_CLEAR_PATH, {})
+            // Let the rows leave before the list empties: the records are
+            // already gone on disk, and an instant swap of a long list reads
+            // as a flicker.
+            const leaving = {}
+            for (const entry of logs) {
+              if (entry && typeof entry.id === 'string' && entry.id !== '') leaving[entry.id] = true
+            }
+            if (Object.keys(leaving).length > 0) {
+              setLogsRemoving(leaving)
+              await new Promise((resolve) => setTimeout(resolve, 160))
+            }
+            setLogsRemoving({})
+            // Keep the warm copy honest: the next visit must not flash the
+            // rows that were just cleared.
+            cachedLogEntries = []
             setLogs([])
             setLogsSelected({})
             setLogsPhase('ready')
@@ -2065,6 +2198,36 @@ window.__ModuleLoader__.load({
          * @param {string[]} entryNames pending entry names to un-queue.
          * @returns {Promise<void>} resolution after the recycle bin refreshed.
          */
+        /**
+         * Let restored or purged families fade before the list is re-read.
+         *
+         * The entries are already gone on the Host; keeping them on screen for
+         * one short beat stops the list from jumping while the pointer is still
+         * on the button that triggered the change.
+         *
+         * @param {string[]} entryNames names of the entries that are leaving.
+         * @returns {Promise<void>} resolution after the fade finished.
+         */
+        async function fadeOutTrashFamilies(entryNames) {
+          if (!Array.isArray(entryNames) || entryNames.length === 0) return
+          const names = new Set(entryNames)
+          const keys = {}
+          const groupKeys = {}
+          for (const bucket of trashGroups) {
+            const leaving = bucket.families.filter(
+              (family) => family.entries.some((entry) => entry && names.has(entry.entryName)),
+            )
+            if (leaving.length === 0) continue
+            for (const family of leaving) keys[family.key] = true
+            // A group whose every family is leaving fades as a whole.
+            if (leaving.length === bucket.families.length) groupKeys[bucket.key] = true
+          }
+          if (Object.keys(keys).length === 0) return
+          setTrashRemoving(keys)
+          if (Object.keys(groupKeys).length > 0) setTrashRemovingGroups(groupKeys)
+          await new Promise((resolve) => setTimeout(resolve, 160))
+        }
+
         async function cancelQueuedPurge(entryNames) {
           if (!Array.isArray(entryNames) || entryNames.length === 0) return
           setTrashError(null)
@@ -2078,7 +2241,7 @@ window.__ModuleLoader__.load({
             const failed = results.find((result) => result.status !== 'canceled')
             if (failed) {
               setTrashError(failed.reason || '取消失败')
-              await refreshTrash()
+              await refreshTrash({ silent: true })
               return
             }
             // Verify what really happened: a Host that predates the flag ignores
@@ -2092,7 +2255,9 @@ window.__ModuleLoader__.load({
             } else {
               setTrashNotice('已取消永久删除：会话仍在回收站（待重启整理），重启 DSH 后照常移入回收站，不会被删除。如需把会话找回来，现在会显示「恢复会话」按钮。')
             }
-            await refreshTrash()
+            // The entry stays in the bin here, so only the list refreshes: no
+            // fade, and a silent re-read keeps the view steady.
+            await refreshTrash({ silent: true })
           } catch (failure) {
             setTrashError(failure && failure.message ? failure.message : String(failure))
           }
@@ -2115,8 +2280,13 @@ window.__ModuleLoader__.load({
               // archive undone, a trashed one also needs the Client session list
               // to re-pull the row this plugin put back on disk.
               refreshNativeSessionList()
+              // The family leaves the bin: fade it out first, then let the
+              // silent re-read remove it for real.
+              await fadeOutTrashFamilies(entryNames)
             }
-            await refreshTrash()
+            await refreshTrash({ silent: true })
+            setTrashRemoving({})
+            setTrashRemovingGroups({})
             setReloadToken((token) => token + 1)
           } catch (failure) {
             setTrashError(failure && failure.message ? failure.message : String(failure))
@@ -2130,6 +2300,27 @@ window.__ModuleLoader__.load({
             else next[familyKey] = true
             return next
           })
+        }
+
+        function toggleTrashGroup(groupKey) {
+          setTrashExpanded((current) => {
+            const next = { ...current }
+            if (next[groupKey] === true) delete next[groupKey]
+            else next[groupKey] = true
+            return next
+          })
+        }
+
+        function toggleAllTrashGroups() {
+          // "全部展开" fills the map; "全部收起" empties it, which is also the
+          // state every fresh visit starts in.
+          if (trashAllCollapsed) {
+            const next = {}
+            for (const bucket of trashGroups) next[bucket.key] = true
+            setTrashExpanded(next)
+            return
+          }
+          setTrashExpanded({})
         }
 
         function toggleTrashSelectAll() {
@@ -2186,7 +2377,20 @@ window.__ModuleLoader__.load({
             await postJson(LOGS_DELETE_PATH, { ids })
             setLogsDeleteDialog(null)
             setLogsError(null)
-            await refreshLogs()
+            // Same soft exit as the bulk clear: mark the rows, let the fade
+            // finish, then re-read so the page and the Host agree.
+            const leaving = {}
+            for (const id of ids) leaving[id] = true
+            setLogsRemoving(leaving)
+            await new Promise((resolve) => setTimeout(resolve, 165))
+            setLogsRemoving({})
+            // Drop the faded rows now instead of leaving invisible ones in
+            // place while the re-read travels; the silent refresh below
+            // reconciles with whatever the Host actually removed, and never
+            // swaps the list for a loading placeholder mid-delete.
+            const removed = new Set(ids)
+            setLogs((current) => current.filter((entry) => !(entry && removed.has(entry.id))))
+            await refreshLogs({ silent: true })
           } catch (failure) {
             const message = failure && failure.message ? failure.message : String(failure)
             setLogsDeleteDialog((current) => (current
@@ -2220,7 +2424,15 @@ window.__ModuleLoader__.load({
             const results = Array.isArray(payload.results) ? payload.results : []
             setPurgeDialog((current) => ({ ...(current || {}), phase: 'done', results }))
             setTrashSelected({})
-            await refreshTrash()
+            // Only the fully purged entries leave the bin; queued ones stay
+            // listed as pending, so they must not fade.
+            const purgedNames = results
+              .filter((result) => result && result.status === 'purged' && typeof result.entryName === 'string')
+              .map((result) => result.entryName)
+            await fadeOutTrashFamilies(purgedNames)
+            await refreshTrash({ silent: true })
+            setTrashRemoving({})
+            setTrashRemovingGroups({})
           } catch (failure) {
             setPurgeDialog((current) => ({
               ...(current || {}),
@@ -2427,6 +2639,250 @@ window.__ModuleLoader__.load({
           )
         }
 
+        /**
+         * Render the origin-workspace badge for one trash entry.
+         *
+         * Hints were recorded the moment the family was trashed, so a workspace
+         * the user later removed can still be named; `gone` flags the case
+         * where the registry lost the id. Entries deleted by an older Host
+         * without hints fall back to an honest "未记录" answer.
+         *
+         * @param {object} entry trash entry carrying workspace hints.
+         * @returns {object} React element.
+         */
+        /**
+         * Extract the trailing segment of a filesystem path.
+         *
+         * @param {any} value raw path.
+         * @returns {string | null} last non-empty segment, or null when there is none.
+         */
+        function pathTailOf(value) {
+          if (typeof value !== 'string') return null
+          const segments = value.split(/[\\/]+/).filter((segment) => segment !== '')
+          return segments.length > 0 ? segments[segments.length - 1] : null
+        }
+
+        /**
+         * Classify one trash entry into the workspace bucket it belongs to.
+         *
+         * The key is stable for grouping: a live workspace id, a deleted
+         * workspace id (one bucket per deleted workspace), or one of the fixed
+         * buckets for sessions that were ungrouped when deleted or whose origin
+         * was never recorded. A Host that predates the hints sends no flag at
+         * all, and every entry then lands in the "unrecorded" bucket.
+         *
+         * @param {object} entry trash entry carrying workspace hints.
+         * @returns {{ key: string, kind: string, workspaceId: string, title: string, path: string | null }} bucket identity.
+         */
+        function readTrashWorkspaceKey(entry) {
+          const unrecorded = {
+            key: 'workspace:unrecorded',
+            kind: 'unrecorded',
+            workspaceId: '',
+            title: '原工作区未记录',
+            path: null,
+          }
+          if (!entry || typeof entry.workspacesRecorded !== 'boolean') return unrecorded
+          const hints = Array.isArray(entry.workspaces)
+            ? entry.workspaces.filter((hint) => hint && typeof hint === 'object')
+            : []
+          if (hints.length === 0) {
+            if (entry.workspacesRecorded === true) {
+              return {
+                key: 'workspace:ungrouped',
+                kind: 'ungrouped',
+                workspaceId: '',
+                title: '原工作区：未分组',
+                path: null,
+              }
+            }
+            return unrecorded
+          }
+          const first = hints[0]
+          const workspaceId = typeof first.workspaceId === 'string' ? first.workspaceId : ''
+          const name = typeof first.title === 'string' && first.title.trim() !== '' ? first.title : ''
+          const path = typeof first.path === 'string' && first.path !== '' ? first.path : null
+          if (first.gone === true) {
+            return {
+              key: `workspace-gone:${workspaceId}`,
+              kind: 'gone',
+              workspaceId,
+              title: name ? `已删工作区 · ${name}` : '已删工作区',
+              path,
+            }
+          }
+          return {
+            key: `workspace:${workspaceId}`,
+            kind: 'live',
+            workspaceId,
+            title: name || pathTailOf(path) || '工作区',
+            path,
+          }
+        }
+
+        function renderTrashWorkspaceBadge(entry) {
+          // A Host that predates the hints serves no workspace data at all:
+          // pretending to know would be worse than silence, and the annotation
+          // appears for real after DSH is restarted onto the new Host.
+          if (!entry || typeof entry.workspacesRecorded !== 'boolean') return null
+          const hints = Array.isArray(entry.workspaces)
+            ? entry.workspaces.filter((hint) => hint && typeof hint === 'object')
+            : []
+          const folderGlyph = h(Icon, { name: 'folder', size: 11, strokeWidth: 2 })
+          if (hints.length === 0) {
+            if (entry.workspacesRecorded === true) {
+              return h(
+                'span',
+                { style: trashWorkspaceBadgeStyle, title: '删除时该会话不属于任何工作区' },
+                folderGlyph,
+                '原工作区：未分组',
+              )
+            }
+            return h(
+              'span',
+              {
+                style: trashWorkspaceUnknownBadgeStyle,
+                title: '该条目由旧版本插件删除，未记录原工作区；如需确认可看会话的原始工作目录',
+              },
+              folderGlyph,
+              '原工作区未记录',
+            )
+          }
+          const first = hints[0]
+          const extra = hints.length > 1 ? ` +${hints.length - 1}` : ''
+          const name = typeof first.title === 'string' && first.title.trim() !== ''
+            ? first.title
+            : null
+          if (first.gone === true) {
+            // The registry lost the workspace. The main label never exposes the
+            // internal id; the id only rides in the tooltip as a diagnostic.
+            const label = name ? `原工作区已删除 · ${name}${extra}` : `原工作区已删除${extra}`
+            const tooltipParts = []
+            tooltipParts.push(name ? `原工作区「${name}」已从注册表删除` : '原工作区已从注册表删除')
+            if (typeof first.workspaceId === 'string' && first.workspaceId !== '') {
+              tooltipParts.push(`工作区标识 ${first.workspaceId}（内部诊断用）`)
+            }
+            tooltipParts.push('恢复该会话不会回到原工作区')
+            return h(
+              'span',
+              { style: trashWorkspaceGoneBadgeStyle, title: tooltipParts.join('；') },
+              folderGlyph,
+              label,
+            )
+          }
+          const fallbackName = name || pathTailOf(first.path) || '工作区'
+          return h(
+            'span',
+            { style: trashWorkspaceBadgeStyle, title: first.path || first.title || fallbackName },
+            folderGlyph,
+            `${fallbackName}${extra}`,
+          )
+        }
+
+        /**
+         * Render one recycle-bin family card.
+         *
+         * Inside a workspace group the card drops its own box: the group card
+         * already draws it, and stacking two bordered cards read heavy. Members
+         * only repeat a workspace badge when their origin differs from the
+         * bucket they are listed under — the group header already names it.
+         *
+         * @param {object} family one delete family.
+         * @param {object | null} bucket workspace bucket the family belongs to.
+         * @param {boolean} isFirst whether this is the first family in the group.
+         * @returns {object} React element.
+         */
+        function renderTrashFamily(family, bucket, isFirst) {
+          const rootEntry = family.entries.find((entry) => entry.role === 'root') || family.entries[0]
+          const canRestore = family.entries.every((entry) => entry.restoreAvailable === true)
+          const queuedNames = family.entries
+            .filter((entry) => entry.purge === true)
+            .map((entry) => entry.entryName)
+          const cardStyle = bucket
+            ? {
+                padding: '6px 8px 8px',
+                ...(isFirst ? {} : { borderTop: '1px solid color-mix(in srgb, currentColor 8%, transparent)' }),
+              }
+            : dialogFamilyStyle
+          return h(
+            'div',
+            {
+              key: family.key,
+              className: 'sl-trash-family',
+              'data-removing': trashRemoving[family.key] === true ? 'true' : 'false',
+              style: cardStyle,
+            },
+            h(
+              'div',
+              { style: dialogFamilyHeadStyle },
+              renderCheckbox(
+                trashSelected[family.key] === true ? 'all' : 'none',
+                () => toggleTrashFamily(family.key),
+                '选择该回收站条目',
+              ),
+              h(
+                'span',
+                { style: sessionTitleStyle },
+                rootEntry.title && rootEntry.title.trim() !== '' ? rootEntry.title : rootEntry.sessionId,
+              ),
+              h('span', { style: badgeStyle }, `${family.entries.length} 个会话`),
+              bucket ? null : renderTrashWorkspaceBadge(rootEntry),
+              h('span', { style: trashTimeStyle }, formatAbsolute(family.deletedAt)),
+              h('span', { style: trashMetaStyle }, `${(family.totalBytes / 1048576).toFixed(1)} MB`),
+              // A queued permanent delete offers exactly one action: abandon
+              // it and stay in the bin. Restoring is only offered once the
+              // entry is no longer queued for deletion.
+              queuedNames.length > 0
+                ? h(
+                    'button',
+                    {
+                      className: 'sl-btn',
+                      style: actionButtonStyle,
+                      onClick: () => cancelQueuedPurge(queuedNames),
+                    },
+                    '放弃永久删除（留在回收站）',
+                  )
+                : canRestore
+                  ? h(
+                      'button',
+                      {
+                        className: 'sl-btn',
+                        style: actionButtonStyle,
+                        onClick: () => restoreFamily(family.entries.map((entry) => entry.entryName)),
+                      },
+                      '恢复会话（回到会话库）',
+                    )
+                  : h('span', { style: badgeStyle }, '数据缺失'),
+            ),
+            family.entries.map((entry) => h(
+              'div',
+              { key: entry.entryName, style: dialogRowStyle },
+              h(
+                'span',
+                { style: badgeStyle },
+                entry.role === 'subagent' ? '子智能体/队友' : entry.role === 'fork' ? '分叉' : '会话',
+              ),
+              entry.pending === true
+                ? h('span', { style: badgeStyle }, entry.purge === true ? '待重启永久删除' : '待重启整理')
+                : null,
+              bucket && readTrashWorkspaceKey(entry).key === bucket.key
+                ? null
+                : renderTrashWorkspaceBadge(entry),
+              h(
+                'span',
+                { style: sessionTitleStyle },
+                entry.title && entry.title.trim() !== '' ? entry.title : entry.sessionId,
+              ),
+              // Members of one delete share the family timestamp; only a
+              // pending member (or a mixed family) carries its own.
+              entry.deletedAt !== family.deletedAt
+                ? h('span', { style: trashTimeStyle }, formatAbsolute(entry.deletedAt))
+                : null,
+              h('span', { style: trashMetaStyle }, `${(entry.sizeBytes / 1048576).toFixed(1)} MB`),
+            )),
+          )
+        }
+
         function renderTrash() {
           if (trashPhase === 'loading' || trashPhase === 'idle') {
             return renderPlaceholder('正在读取回收站…', null)
@@ -2446,86 +2902,66 @@ window.__ModuleLoader__.load({
             return renderPlaceholder('没有匹配的回收站条目', '换个搜索词，或清空筛选后再看')
           }
 
-          const families = trashFamilies
-
           return h(
             'div',
-            null,
+            { className: 'sl-trash-panel' },
             trashError !== null ? h('div', { className: 'sl-note', 'data-tone': 'warn' }, trashError) : null,
             trashNotice !== null ? h('div', { className: 'sl-note', 'data-tone': 'info' }, trashNotice) : null,
-            families.map((family) => {
-              const rootEntry = family.entries.find((entry) => entry.role === 'root') || family.entries[0]
-              const canRestore = family.entries.every((entry) => entry.restoreAvailable === true)
-              const queuedNames = family.entries
-                .filter((entry) => entry.purge === true)
-                .map((entry) => entry.entryName)
+            trashGroups.map((bucket) => {
+              // A search forces groups open: results must be visible the moment
+              // the query matches, while the manual expansion state is kept for
+              // when the query is cleared.
+              const searchActive = trashQuery.trim() !== ''
+              const collapsed = !searchActive && trashExpanded[bucket.key] !== true
+              const sessionCount = bucket.families.reduce((sum, family) => sum + family.entries.length, 0)
+              const bytes = bucket.families.reduce((sum, family) => sum + family.totalBytes, 0)
               return h(
-                'div',
-                { key: family.key, style: dialogFamilyStyle },
+                'section',
+                {
+                  key: bucket.key,
+                  className: 'sl-group',
+                  'data-removing': trashRemovingGroups[bucket.key] === true ? 'true' : 'false',
+                },
                 h(
                   'div',
-                  { style: dialogFamilyHeadStyle },
-                  renderCheckbox(
-                    trashSelected[family.key] === true ? 'all' : 'none',
-                    () => toggleTrashFamily(family.key),
-                    '选择该回收站条目',
+                  {
+                    className: 'sl-group-head',
+                    role: 'button',
+                    tabIndex: 0,
+                    'aria-expanded': collapsed ? 'false' : 'true',
+                    onClick: () => toggleTrashGroup(bucket.key),
+                    onKeyDown: (event) => {
+                      if (event.key !== 'Enter' && event.key !== ' ') return
+                      event.preventDefault()
+                      toggleTrashGroup(bucket.key)
+                    },
+                  },
+                  h(
+                    'span',
+                    { className: 'sl-chevron', 'data-open': collapsed ? 'false' : 'true' },
+                    h(Icon, { name: 'chevron', size: 16 }),
                   ),
                   h(
                     'span',
-                    { style: sessionTitleStyle },
-                    rootEntry.title && rootEntry.title.trim() !== '' ? rootEntry.title : rootEntry.sessionId,
+                    {
+                      className: 'sl-group-title',
+                      style: bucket.kind === 'gone' ? { color: 'var(--sl-warn, #f0b37e)' } : undefined,
+                    },
+                    bucket.title,
                   ),
-                  h('span', { style: badgeStyle }, `${family.entries.length} 个会话`),
-                  h('span', { style: trashTimeStyle }, formatAbsolute(family.deletedAt)),
-                  h('span', { style: trashMetaStyle }, `${(family.totalBytes / 1048576).toFixed(1)} MB`),
-                  // A queued permanent delete offers exactly one action: abandon
-                  // it and stay in the bin. Restoring is only offered once the
-                  // entry is no longer queued for deletion.
-                  queuedNames.length > 0
-                    ? h(
-                        'button',
-                        {
-                          className: 'sl-btn',
-                          style: actionButtonStyle,
-                          onClick: () => cancelQueuedPurge(queuedNames),
-                        },
-                        '放弃永久删除（留在回收站）',
-                      )
-                    : canRestore
-                      ? h(
-                          'button',
-                          {
-                            className: 'sl-btn',
-                            style: actionButtonStyle,
-                            onClick: () => restoreFamily(family.entries.map((entry) => entry.entryName)),
-                          },
-                          '恢复会话（回到会话库）',
-                        )
-                      : h('span', { style: badgeStyle }, '数据缺失'),
+                  bucket.path
+                    ? h('span', { className: 'sl-group-path', title: bucket.path }, bucket.path)
+                    : null,
+                  h('span', { className: 'sl-count' }, `${bucket.families.length} 个家族 · ${sessionCount} 个会话`),
+                  h('span', { style: trashMetaStyle }, `${(bytes / 1048576).toFixed(1)} MB`),
                 ),
-                family.entries.map((entry) => h(
-                  'div',
-                  { key: entry.entryName, style: dialogRowStyle },
-                  h(
-                    'span',
-                    { style: badgeStyle },
-                    entry.role === 'subagent' ? '子智能体/队友' : entry.role === 'fork' ? '分叉' : '会话',
-                  ),
-                  entry.pending === true
-                    ? h('span', { style: badgeStyle }, entry.purge === true ? '待重启永久删除' : '待重启整理')
-                    : null,
-                  h(
-                    'span',
-                    { style: sessionTitleStyle },
-                    entry.title && entry.title.trim() !== '' ? entry.title : entry.sessionId,
-                  ),
-                  // Members of one delete share the family timestamp; only a
-                  // pending member (or a mixed family) carries its own.
-                  entry.deletedAt !== family.deletedAt
-                    ? h('span', { style: trashTimeStyle }, formatAbsolute(entry.deletedAt))
-                    : null,
-                  h('span', { style: trashMetaStyle }, `${(entry.sizeBytes / 1048576).toFixed(1)} MB`),
-                )),
+                collapsed
+                  ? null
+                  : h(
+                      'div',
+                      { className: 'sl-group-body' },
+                      bucket.families.map((family, index) => renderTrashFamily(family, bucket, index === 0)),
+                    ),
               )
             }),
           )
@@ -2569,11 +3005,18 @@ window.__ModuleLoader__.load({
                   {
                     key: rowId !== '' ? rowId : `${entry && entry.at ? entry.at : ''}-${index}`,
                     className: 'sl-logrow',
+                    // A row that is being deleted fades out where it stands;
+                    // everything else enters with a short capped stagger so a
+                    // full page of history never waits on its own animation.
+                    'data-removing': rowId !== '' && logsRemoving[rowId] === true ? 'true' : 'false',
                     role: rowId !== '' ? 'button' : undefined,
                     tabIndex: rowId !== '' ? 0 : undefined,
-                    style: rowId !== ''
-                      ? { ...logsRowStyle, cursor: 'pointer' }
-                      : logsRowStyle,
+                    style: {
+                      ...(rowId !== '' ? { ...logsRowStyle, cursor: 'pointer' } : logsRowStyle),
+                      animationDelay: rowId !== '' && logsRemoving[rowId] === true
+                        ? '0ms'
+                        : `${Math.min(index, 8) * 24}ms`,
+                    },
                     onClick: rowId !== '' ? () => toggleLogSelection(rowId) : undefined,
                     onKeyDown: rowId !== ''
                       ? (event) => {
@@ -2812,6 +3255,7 @@ window.__ModuleLoader__.load({
                   rootEntry.title && rootEntry.title.trim() !== '' ? rootEntry.title : rootEntry.sessionId,
                 ),
                 h('span', { style: badgeStyle }, `${family.entries.length} 个会话`),
+                renderTrashWorkspaceBadge(rootEntry),
                 h('span', { style: trashMetaStyle }, `${(family.totalBytes / 1048576).toFixed(1)} MB`),
               ),
             )
@@ -3180,31 +3624,57 @@ window.__ModuleLoader__.load({
                       ? h(
                           'div',
                           { style: dialogListStyle },
-                          report.workspaces.map((workspace) => h(
-                            'div',
-                            { key: workspace.workspaceId, style: dialogRowStyle },
-                            h(
+                          report.workspaces.map((workspace) => {
+                            const fileCount = Number(workspace.workspaceFileCount) || 0
+                            const fileBytes = Number(workspace.workspaceFileBytes) || 0
+                            const mapped = (importDialog.mapping[workspace.workspaceId] || '') !== ''
+                            // Scoped on purpose: the note only appears when this
+                            // workspace really carries files and the sessions would land
+                            // in 未分组, which is the one case where the packaged files
+                            // are silently left inside the zip.
+                            const showUnmappedNote = fileCount > 0 && !mapped
+                            return h(
                               'div',
-                              { style: importMappingLabelStyle },
-                              h('div', null, workspace.title || workspace.path || workspace.workspaceId),
-                              h('div', { style: importPathHintStyle }, `${workspace.path || '（无路径）'} · ${workspace.sessionCount} 个会话`),
-                            ),
-                            h(
-                              'select',
-                              {
-                                className: 'sl-input',
-                                style: sortSelectStyle,
-                                value: importDialog.mapping[workspace.workspaceId] || '',
-                                onChange: (event) => setImportMapping(workspace.workspaceId, event.target.value),
-                              },
-                              h('option', { value: '' }, '未分组'),
-                              localWorkspaces.map((local) => h(
-                                'option',
-                                { key: local.workspaceId, value: local.workspaceId },
-                                local.title || local.path || local.workspaceId,
-                              )),
-                            ),
-                          )),
+                              { key: workspace.workspaceId },
+                              h(
+                                'div',
+                                { style: dialogRowStyle },
+                                h(
+                                  'div',
+                                  { style: importMappingLabelStyle },
+                                  h('div', null, workspace.title || workspace.path || workspace.workspaceId),
+                                  h(
+                                    'div',
+                                    { style: importPathHintStyle },
+                                    `${workspace.path || '（无路径）'} · ${workspace.sessionCount} 个会话`
+                                      + `${fileCount > 0 ? ` · ${fileCount} 个文件（${(fileBytes / 1048576).toFixed(2)} MB）` : ''}`,
+                                  ),
+                                ),
+                                h(
+                                  'select',
+                                  {
+                                    className: 'sl-input',
+                                    style: sortSelectStyle,
+                                    value: importDialog.mapping[workspace.workspaceId] || '',
+                                    onChange: (event) => setImportMapping(workspace.workspaceId, event.target.value),
+                                  },
+                                  h('option', { value: '' }, '未分组'),
+                                  localWorkspaces.map((local) => h(
+                                    'option',
+                                    { key: local.workspaceId, value: local.workspaceId },
+                                    local.title || local.path || local.workspaceId,
+                                  )),
+                                ),
+                              ),
+                              showUnmappedNote
+                                ? h(
+                                    'div',
+                                    { className: 'sl-note', 'data-tone': 'caution', style: importUnmappedNoteStyle },
+                                    `未选择目标工作区：这 ${fileCount} 个文件不会写入；把会话导入到任意目标工作区后才会解压到该目录。`,
+                                  )
+                                : null,
+                            )
+                          }),
                         )
                       : null,
                     report.workspaces.length > 0
@@ -3913,6 +4383,12 @@ window.__ModuleLoader__.load({
           ], setTrashSort),
           h(
             'button',
+            { className: 'sl-ghost', onClick: toggleAllTrashGroups },
+            h(Icon, { name: 'expand', size: 14 }),
+            trashAllCollapsed ? '全部展开' : '全部收起',
+          ),
+          h(
+            'button',
             { className: 'sl-ghost', onClick: toggleTrashSelectAll },
             allTrashSelected ? '取消全选' : '全选',
           ),
@@ -4024,6 +4500,16 @@ window.__ModuleLoader__.load({
           : ''
 
         const loading = view === 'library' && (phase === 'loading' || phase === 'idle')
+        // Which body is on screen. The same three answers the render picks
+        // between; used to decide when a fresh mount should settle in instead
+        // of snapping (a finished load, or an empty state turning into rows).
+        const bodyKind = view !== 'library'
+          ? view
+          : loading
+            ? 'loading'
+            : groups.length === 0
+              ? 'empty'
+              : 'list'
 
         return h(
           'div',
@@ -4081,7 +4567,15 @@ window.__ModuleLoader__.load({
               // Keyed by view: switching panels remounts this wrapper, so the
               // entrance animation plays exactly at the moment of the swap.
               { key: view, className: 'sl-panel sl-container' },
-              loading ? renderSkeleton() : body,
+              h(
+                'div',
+                // Keyed by body kind, so finishing a load (or an empty state
+                // turning into rows) mounts a fresh node that settles in rather
+                // than snapping. Updates inside one kind keep the same key and
+                // therefore stay instant.
+                { key: bodyKind, className: bodyKind === 'list' ? 'sl-settle' : undefined },
+                loading ? renderSkeleton() : body,
+              ),
             ),
           ),
           // Provenance line: pinned under the list as panel chrome. Inside the
@@ -4257,6 +4751,38 @@ window.__ModuleLoader__.load({
       fontSize: 11,
       lineHeight: 1,
       whiteSpace: 'nowrap',
+    }
+    // Trash rows carry the origin workspace next to the title, so a purge
+    // decision can be judged against the workspace a session came from — even
+    // when that workspace is gone by now. The info tone plus a folder glyph
+    // keep the badge recognisable at a glance; warn tones mark the gone case.
+    const trashWorkspaceBadgeStyle = {
+      ...badgeStyle,
+      gap: 5,
+      maxWidth: 240,
+      overflow: 'hidden',
+      textOverflow: 'ellipsis',
+      color: 'var(--sl-info, #6aa9f0)',
+      background: 'color-mix(in srgb, var(--sl-info, #6aa9f0) 10%, transparent)',
+      fontWeight: 500,
+    }
+    const trashWorkspaceGoneBadgeStyle = {
+      ...trashWorkspaceBadgeStyle,
+      color: 'var(--sl-warn, #f0b37e)',
+      background: 'color-mix(in srgb, var(--sl-warn, #f0b37e) 16%, transparent)',
+      border: '1px solid color-mix(in srgb, var(--sl-warn, #f0b37e) 45%, transparent)',
+      lineHeight: '16px',
+      fontWeight: 600,
+    }
+    // Entries deleted before hints were recorded: the facts are simply missing,
+    // so the badge stays quiet instead of dressing ignorance up as a result.
+    const trashWorkspaceUnknownBadgeStyle = {
+      ...badgeStyle,
+      gap: 5,
+      maxWidth: 240,
+      overflow: 'hidden',
+      textOverflow: 'ellipsis',
+      opacity: 0.8,
     }
     // Layout only: the border, fill and glyph colour live in the stylesheet,
     // keyed off `aria-checked`, so hover is never blocked by an inline value.
@@ -4470,6 +4996,9 @@ window.__ModuleLoader__.load({
       textOverflow: 'ellipsis',
       whiteSpace: 'nowrap',
     }
+    // Sits under one workspace row in the import preview; .sl-note supplies the
+    // tinted box, this only tightens the spacing.
+    const importUnmappedNoteStyle = { margin: '0 0 8px', fontSize: 11.5 }
     // Workspace-file conflict policy block: a full-width select plus its hint.
     const importConflictBlockStyle = { marginTop: 14 }
     const importConflictSelectStyle = { width: '100%' }

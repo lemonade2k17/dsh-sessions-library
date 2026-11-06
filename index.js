@@ -2384,11 +2384,19 @@ async function inspectImport(ctx, rawPath) {
     const path = typeof workspace.path === 'string' ? workspace.path : ''
     const title = typeof workspace.title === 'string' ? workspace.title : ''
     const suggested = path !== '' ? localByPath.get(path.toLowerCase()) : undefined
+    // The Client warns per row when a workspace carries files but has no target:
+    // those files are never written, so the count has to travel with the row.
+    const members = byWorkspace.get(workspaceId) ?? []
     return {
       workspaceId,
       path,
       title,
       sessionCount: sessions.filter((session) => session.workspaceIds.includes(workspaceId)).length,
+      workspaceFileCount: members.length,
+      workspaceFileBytes: members.reduce(
+        (sum, member) => sum + (member && member.data ? member.data.length : 0),
+        0,
+      ),
       suggestedTargetId: suggested ?? null,
     }
   })
@@ -2885,6 +2893,114 @@ async function detachFromWorkspaces(registry, sessionId) {
 }
 
 /**
+ * Read the workspace registry as a plain array, swallowing service errors.
+ *
+ * @param {object | undefined} registry workspace registry service.
+ * @returns {Array<object>} listed workspaces with `{ id, title, path, sessionIds }`.
+ */
+function listWorkspacesSafe(registry) {
+  if (!registry || typeof registry.list !== 'function') return []
+  try {
+    const workspaces = registry.list()
+    return Array.isArray(workspaces) ? workspaces : []
+  } catch {
+    return []
+  }
+}
+
+/**
+ * Validate one recorded workspace hint read back from a manifest.
+ *
+ * The manifest is a plain file on disk: anything a user (or an older Host)
+ * wrote there is parsed, so a hint only counts when its shape is sane.
+ *
+ * @param {any} hint raw hint value.
+ * @returns {boolean} whether the hint is usable.
+ */
+function isWorkspaceHint(hint) {
+  return Boolean(hint && typeof hint === 'object'
+    && typeof hint.workspaceId === 'string' && hint.workspaceId !== '')
+}
+
+/**
+ * Build a `workspaceId → { title, path }` map from a registry listing.
+ *
+ * @param {Array<object>} workspaces workspace listing (see listWorkspacesSafe).
+ * @returns {Map<string, object>} id to label info.
+ */
+function buildWorkspaceIdInfoMap(workspaces) {
+  const map = new Map()
+  for (const item of Array.isArray(workspaces) ? workspaces : []) {
+    if (!item || typeof item.id === 'undefined') continue
+    map.set(String(item.id), {
+      title: typeof item.title === 'string' ? item.title : null,
+      path: typeof item.path === 'string' ? item.path : null,
+    })
+  }
+  return map
+}
+
+/**
+ * Collect the workspaces a session currently belongs to.
+ *
+ * Used moments before a delete detaches the session: membership read here is
+ * exactly "the origin workspace", so it travels into the trash manifest and
+ * survives even a later workspace removal.
+ *
+ * @param {Array<object>} workspaces workspace listing (see listWorkspacesSafe).
+ * @param {string} sessionId session id.
+ * @returns {Array<{ workspaceId: string, title: string | null, path: string | null, gone: boolean }>} hints.
+ */
+function currentWorkspaceHintsFromList(workspaces, sessionId) {
+  const hints = []
+  const wanted = String(sessionId)
+  for (const listed of Array.isArray(workspaces) ? workspaces : []) {
+    let contains = false
+    try {
+      contains = [...listed.sessionIds].map(String).includes(wanted)
+    } catch {
+      contains = false
+    }
+    if (!contains) continue
+    hints.push({
+      workspaceId: String(listed.id),
+      title: typeof listed.title === 'string' ? listed.title : null,
+      path: typeof listed.path === 'string' ? listed.path : null,
+      gone: false,
+    })
+  }
+  return hints
+}
+
+/**
+ * Resolve bare workspace ids into hints against a registry listing.
+ *
+ * The belt-and-braces path for deferred moves: when the snapshot taken before
+ * the detach is empty, the ids `detachFromWorkspaces` returned may still
+ * resolve agains the live registry. A miss is not an error — the hint simply
+ * carries `gone: true`.
+ *
+ * @param {Array<object>} workspaces workspace listing (see listWorkspacesSafe).
+ * @param {string[]} workspaceIds ids to resolve.
+ * @returns {Array<{ workspaceId: string, title: string | null, path: string | null, gone: boolean }>} hints.
+ */
+function listWorkspaceHintsFromList(workspaces, workspaceIds) {
+  const hints = []
+  if (!Array.isArray(workspaceIds) || workspaceIds.length === 0) return hints
+  const infoById = buildWorkspaceIdInfoMap(workspaces)
+  for (const workspaceId of workspaceIds) {
+    const info = infoById.get(String(workspaceId)) ?? null
+    hints.push({
+      workspaceId: String(workspaceId),
+      title: info ? info.title : null,
+      path: info ? info.path : null,
+      gone: info === null,
+    })
+  }
+  return hints
+}
+
+/**
  * Collect one deletion family.
  *
  * A family is the root plus every `origin: 'subagent'` descendant (subagent and
@@ -3136,6 +3252,17 @@ function readTrashEntries() {
         : (manifest && typeof manifest.id === 'string' ? manifest.id : name.replace(/^\d+-/, '')),
       memberCount: manifest && Array.isArray(manifest.memberIds) ? manifest.memberIds.length : 1,
       cwd: manifest && typeof manifest.cwd === 'string' ? manifest.cwd : null,
+      // Recorded origin workspaces (name, path and the id), or null when the
+      // entry was written before hints existed; the trash-list route decorates
+      // null entries from live registry data as a best effort.
+      workspaces: manifest && Array.isArray(manifest.workspaces)
+        ? manifest.workspaces.filter(isWorkspaceHint)
+        : null,
+      // Bare ids from older manifests: they may still resolve against the live
+      // registry, which keeps pre-0.3.2 entries readable too.
+      workspaceIds: manifest && Array.isArray(manifest.workspaceIds)
+        ? manifest.workspaceIds.map(String).filter((value) => value !== '')
+        : null,
       deletedAt: manifest && typeof manifest.deletedAt === 'number' ? manifest.deletedAt : (Number.isFinite(timestamp) ? timestamp : 0),
       sizeBytes: dirSize(entryDir),
       restoreAvailable: existsSync(sessionDir),
@@ -3156,6 +3283,13 @@ function readTrashEntries() {
       familyRoot: typeof record.familyRoot === 'string' ? record.familyRoot : id,
       memberCount: 1,
       cwd: typeof record.cwd === 'string' ? record.cwd : null,
+      // The defer record carries the hints captured at delete time; newer
+      // writePendingTrash always includes the field (an empty array means
+      // ungrouped), older records fall into the decorate fallbacks.
+      workspaces: Array.isArray(record.workspaces)
+        ? record.workspaces.filter(isWorkspaceHint)
+        : null,
+      workspaceIds: null,
       deletedAt: typeof record.requestedAt === 'number' ? record.requestedAt : Date.now(),
       sizeBytes: dir ? dirSize(dir) : 0,
       restoreAvailable: true,
@@ -3168,6 +3302,50 @@ function readTrashEntries() {
 
   entries.sort((left, right) => right.deletedAt - left.deletedAt)
   return entries
+}
+
+/**
+ * Attach origin-workspace hints to one trash entry for the Client.
+ *
+ * Hints recorded at delete time survive a later workspace removal, so they win
+ * whenever they exist; their labels are refreshed from the live registry when
+ * the workspace is still there (it may have been renamed). Entries from an
+ * older Host only carry bare ids, so those resolve against the live registry
+ * now, and when even that resolves to nothing the Client shows an
+ * "unrecorded" badge instead of a wrong name.
+ *
+ * @param {object} entry trash entry from the index.
+ * @param {Array<object>} workspaces live registry listing.
+ * @param {Map<string, object>} infoById id to `{ title, path }` for the same listing.
+ * @returns {object} entry with `workspaces` hints and a `workspacesRecorded` flag.
+ */
+function decorateTrashEntry(entry, workspaces, infoById) {
+  // `entry.workspaces` being an array (even empty) means a Host that records
+  // hints wrote this entry: an empty array is the "ungrouped" answer, not an
+  // absence of information.
+  const recorded = Array.isArray(entry.workspaces)
+  const enriched = { ...entry, workspacesRecorded: recorded }
+  const decorateLive = (hint) => {
+    const live = infoById.get(String(hint.workspaceId)) ?? null
+    return {
+      workspaceId: String(hint.workspaceId),
+      title: live !== null ? live.title : (typeof hint.title === 'string' ? hint.title : null),
+      path: live !== null ? live.path : (typeof hint.path === 'string' ? hint.path : null),
+      gone: live === null,
+    }
+  }
+  if (recorded) {
+    enriched.workspaces = entry.workspaces.filter(isWorkspaceHint).map(decorateLive)
+    return enriched
+  }
+  // Legacy entries: a pending session is still attached, so its current
+  // membership answers; moved entries fall back to the bare recorded ids.
+  let hints = currentWorkspaceHintsFromList(workspaces, entry.sessionId)
+  if (hints.length === 0 && Array.isArray(entry.workspaceIds)) {
+    hints = listWorkspaceHintsFromList(workspaces, entry.workspaceIds)
+  }
+  enriched.workspaces = hints
+  return enriched
 }
 
 /**
@@ -3196,6 +3374,10 @@ async function trashSessions(ctx, rawIds, signal, includeForks, progress = null)
   const pinned = new Set(baseline.baseline.pinnedSessionIds)
   const registry = ctx.get('workspaceRegistry')
   const pending = readPendingTrash()
+  // One registry read for the whole batch: the detach loop below mutates
+  // membership, and the pre-detach snapshot is exactly what the manifest
+  // records as the origin workspace.
+  const workspaceList = listWorkspacesSafe(registry)
   let pendingChanged = false
   const results = []
   const families = []
@@ -3250,6 +3432,9 @@ async function trashSessions(ctx, rawIds, signal, includeForks, progress = null)
           role: member.role,
           title: member.title,
           cwd: member.cwd ?? null,
+          // Origin workspace at defer time; the flush below writes it into the
+          // trash manifest, so the bin can still name it after removal.
+          workspaces: currentWorkspaceHintsFromList(workspaceList, member.id),
           // Record the archive state from before the delete: restore must undo
           // only the archive this delete applied to hide the session.
           wasArchived,
@@ -3277,7 +3462,14 @@ async function trashSessions(ctx, rawIds, signal, includeForks, progress = null)
         // a failure after the move still leaves a recoverable trash entry.
         renameSync(dir, join(entryDir, 'session'))
 
+        // Capture the origin workspace *before* the detach: this is the one
+        // moment the answer is still strict (membership intact), and the hint
+        // must survive later workspace removal, so title and path ride along.
+        const hintsWhileAttached = currentWorkspaceHintsFromList(workspaceList, member.id)
         const workspaceIds = await detachFromWorkspaces(registry, member.id)
+        const workspaceHints = hintsWhileAttached.length > 0
+          ? hintsWhileAttached
+          : listWorkspaceHintsFromList(workspaceList, workspaceIds)
         if (archived.has(member.id) && registry && typeof registry.unarchiveSession === 'function') {
           try {
             await registry.unarchiveSession(member.id)
@@ -3304,6 +3496,10 @@ async function trashSessions(ctx, rawIds, signal, includeForks, progress = null)
           projectDirName: basename(dirname(dir)),
           originalDir: dir,
           workspaceIds,
+          // Self-contained origin workspace: `workspaceIds` alone cannot be
+          // resolved once the workspace itself is removed from the registry,
+          // so the label travels with the entry.
+          workspaces: workspaceHints,
           archived: archived.has(member.id),
           pinned: pinned.has(member.id),
           sizeBytes: member.sizeBytes,
@@ -3899,6 +4095,9 @@ async function flushPendingTrash(ctx) {
   if (ids.length === 0) return
 
   const registry = ctx.get('workspaceRegistry')
+  // One listing for the whole flush; hints below only read it, the detach
+  // inside the loop is the only mutation.
+  const workspaceList = listWorkspacesSafe(registry)
   const remaining = {}
   for (const id of ids) {
     const record = items[id] && typeof items[id] === 'object' ? items[id] : {}
@@ -3954,7 +4153,22 @@ async function flushPendingTrash(ctx) {
       const entryDir = join(TRASH_ROOT, entryName)
       mkdirSync(entryDir, { recursive: true })
       renameSync(dir, join(entryDir, 'session'))
+      // Hint priority: the wipe record captured the origin membership at
+      // delete time, so it wins even when the workspace is gone by now; the
+      // attached membership and the bare ids only serve records written by an
+      // older Host. An array in the record is trusted even when empty —
+      // "empty" means the session was ungrouped already.
+      const recordedHints = Array.isArray(record.workspaces)
+        ? record.workspaces.filter(isWorkspaceHint)
+        : []
+      const trustRecordedHints = Array.isArray(record.workspaces)
+      const hintsWhileAttached = currentWorkspaceHintsFromList(workspaceList, id)
       const workspaceIds = await detachFromWorkspaces(registry, id)
+      const workspaceHints = trustRecordedHints
+        ? recordedHints
+        : (hintsWhileAttached.length > 0
+          ? hintsWhileAttached
+          : listWorkspaceHintsFromList(workspaceList, workspaceIds))
       // The delete archived the session so the Native sidebar hid it; drop that
       // residue now that the log is really gone.
       if (registry && typeof registry.unarchiveSession === 'function') {
@@ -3982,6 +4196,9 @@ async function flushPendingTrash(ctx) {
         projectDirName: basename(dirname(dir)),
         originalDir: dir,
         workspaceIds,
+        // Same self-contained origin workspace as the direct delete path; an
+        // empty array is meaningful (the session was ungrouped).
+        workspaces: workspaceHints,
         archived: false,
         pinned: false,
         sizeBytes: dirSize(join(entryDir, 'session')),
@@ -4133,7 +4350,13 @@ export function apply(ctx) {
       {
         path: TRASH_LIST_PATH,
         label: 'trash-list',
-        handler: async () => jsonResponse({ ok: true, entries: readTrashEntries() }),
+        handler: async () => {
+          const workspaces = listWorkspacesSafe(ctx.get('workspaceRegistry'))
+          const infoById = buildWorkspaceIdInfoMap(workspaces)
+          const entries = readTrashEntries()
+            .map((entry) => decorateTrashEntry(entry, workspaces, infoById))
+          return jsonResponse({ ok: true, entries })
+        },
       },
       {
         path: TRASH_RESTORE_PATH,
