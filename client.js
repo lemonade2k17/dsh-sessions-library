@@ -2792,6 +2792,23 @@ window.__ModuleLoader__.load({
          * @param {boolean} isFirst whether this is the first family in the group.
          * @returns {object} React element.
          */
+        /**
+         * Title shown for a bin row.
+         *
+         * A session gets its title from a `session/title` event in its own log. A
+         * session whose first turn never completed has no such event, so the trash
+         * manifest stores `title: null`; showing the raw `session-<uuid>` there is
+         * noise, and the library already falls back to 未命名. The id stays
+         * available as the tooltip.
+         *
+         * @param {object} entry trash entry.
+         * @returns {string} display title.
+         */
+        function trashTitleOf(entry) {
+          const title = entry && typeof entry.title === 'string' ? entry.title.trim() : ''
+          return title !== '' ? title : '未命名'
+        }
+
         function renderTrashFamily(family, bucket, isFirst) {
           const rootEntry = family.entries.find((entry) => entry.role === 'root') || family.entries[0]
           const canRestore = family.entries.every((entry) => entry.restoreAvailable === true)
@@ -2822,8 +2839,8 @@ window.__ModuleLoader__.load({
               ),
               h(
                 'span',
-                { style: sessionTitleStyle },
-                rootEntry.title && rootEntry.title.trim() !== '' ? rootEntry.title : rootEntry.sessionId,
+                { style: sessionTitleStyle, title: rootEntry.sessionId },
+                trashTitleOf(rootEntry),
               ),
               h('span', { style: badgeStyle }, `${family.entries.length} 个会话`),
               bucket ? null : renderTrashWorkspaceBadge(rootEntry),
@@ -2870,8 +2887,8 @@ window.__ModuleLoader__.load({
                 : renderTrashWorkspaceBadge(entry),
               h(
                 'span',
-                { style: sessionTitleStyle },
-                entry.title && entry.title.trim() !== '' ? entry.title : entry.sessionId,
+                { style: sessionTitleStyle, title: entry.sessionId },
+                trashTitleOf(entry),
               ),
               // Members of one delete share the family timestamp; only a
               // pending member (or a mixed family) carries its own.
@@ -3259,8 +3276,8 @@ window.__ModuleLoader__.load({
                 { style: dialogFamilyHeadStyle },
                 h(
                   'span',
-                  { style: sessionTitleStyle },
-                  rootEntry.title && rootEntry.title.trim() !== '' ? rootEntry.title : rootEntry.sessionId,
+                  { style: sessionTitleStyle, title: rootEntry.sessionId },
+                  trashTitleOf(rootEntry),
                 ),
                 h('span', { style: badgeStyle }, `${family.entries.length} 个会话`),
                 renderTrashWorkspaceBadge(rootEntry),
