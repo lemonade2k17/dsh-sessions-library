@@ -2949,9 +2949,17 @@ window.__ModuleLoader__.load({
                     },
                     bucket.title,
                   ),
-                  bucket.path
-                    ? h('span', { className: 'sl-group-path', title: bucket.path }, bucket.path)
-                    : null,
+                  // Keep the flexible path slot even when the bucket has no path
+                  // (a deleted workspace often has none): without it the count
+                  // pill and the size collapse against the title instead of
+                  // right-aligning like every other group.
+                  h(
+                    'span',
+                    bucket.path
+                      ? { className: 'sl-group-path', title: bucket.path }
+                      : { className: 'sl-group-path', 'aria-hidden': 'true' },
+                    bucket.path || '',
+                  ),
                   h('span', { className: 'sl-count' }, `${bucket.families.length} 个家族 · ${sessionCount} 个会话`),
                   h('span', { style: trashMetaStyle }, `${(bytes / 1048576).toFixed(1)} MB`),
                 ),
