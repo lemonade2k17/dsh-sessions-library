@@ -54,10 +54,10 @@ npm pack     # 在本仓库生成 dsh-sessions-library-<version>.tgz
 把生成的 `.tgz` 拷到目标机器，任选其一：
 
 - 用 DSH 插件管理安装该本地文件；
-- profile 的 `package.json` 写成 `"dsh-sessions-library": "file:D:/packages/dsh-sessions-library-0.4.0.tgz"`，然后在该 profile 目录执行 `pnpm install`；
+- profile 的 `package.json` 写成 `"dsh-sessions-library": "file:D:/packages/dsh-sessions-library-0.4.1.tgz"`，然后在该 profile 目录执行 `pnpm install`；
 - 若已发布到 npm 或私有源，直接按插件名安装。
 
-各基线的现成包在 `release/v<版本>/`（含 `SHA256SUMS`）：当前最新为 `release/v0.4.0/dsh-sessions-library-0.4.0.tgz`。
+各基线的现成包在 `release/v<版本>/`（含 `SHA256SUMS`）：当前最新为 `release/v0.4.1/dsh-sessions-library-0.4.1.tgz`。
 
 ### 安装完成后的自检
 
