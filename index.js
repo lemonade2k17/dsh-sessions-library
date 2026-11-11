@@ -58,6 +58,10 @@ const SESSIONS_ROOT = join(DSH_HOME, 'sessions')
 const TRASH_ROOT = join(DSH_HOME, 'sessions-trash')
 // Content-addressed attachment store; session logs reference its objects by hash.
 const ATTACHMENTS_ROOT = join(DSH_HOME, 'attachments')
+// Workspace registry storage (domain `workspace` v2). Read only as a fallback
+// when the controller stream is unavailable: it carries the archived/pinned
+// session sets that `workspaceRegistry.list()` does not expose.
+const WORKSPACE_STORAGE_FILE = join(DSH_HOME, 'storages', 'workspace.json')
 
 const DELETE_PREFLIGHT_PATH = '/api/sessions-library/delete-preflight'
 const DELETE_PATH = '/api/sessions-library/delete'
@@ -93,6 +97,16 @@ const WORKSPACE_BACKUP_MAX_FILES = 5000
 const IMPORT_ZIP_BYTES_LIMIT = 768 * 1024 * 1024
 const IMPORT_UNPACKED_BYTES_LIMIT = 1536 * 1024 * 1024
 const IMPORT_ENTRY_LIMIT = 20000
+// Decompressed members are held in memory until the import finishes. This cap is
+// about the Host process staying alive, not about the package being "too big":
+// exceeding it produces a clear error instead of an out-of-memory crash.
+const IMPORT_RESIDENT_BYTES_LIMIT = 384 * 1024 * 1024
+// Attaching a freshly written session waits for the store listing. A batch of
+// 100 sessions must not spend that wait 100 times, so every attach in one run
+// shares a budget that stays well under the Client request timeouts (180 s for
+// import, 90 s for trash restore).
+const ATTACH_BUDGET_IMPORT_MS = 60000
+const ATTACH_BUDGET_RESTORE_MS = 30000
 
 // Identifies one Host process. The Client compares it with the value it stored
 // last time: a different value means DSH restarted, so view state resets.
@@ -434,6 +448,41 @@ function normalizeBaseline(value) {
 }
 
 /**
+ * Read the archived/pinned session sets straight from the workspace storage.
+ *
+ * `workspaceRegistry.list()` exposes workspaces only, so the fallback baseline
+ * used to answer "nothing is archived or pinned". That is not just a display
+ * detail: the import conflict policy turns an archived local copy into an
+ * adoptable one, and the library filter hides archived sessions. The same
+ * storage file that backs the registry keeps both sets, so read them directly
+ * and degrade to empty sets only when the file is unreadable.
+ *
+ * @param {string} requestId trace label.
+ * @returns {{ archivedSessionIds: string[], pinnedSessionIds: string[] }} the sets.
+ */
+function readWorkspaceGlobalSets(requestId) {
+  const empty = { archivedSessionIds: [], pinnedSessionIds: [] }
+  try {
+    const raw = readFileSync(WORKSPACE_STORAGE_FILE, 'utf8')
+    const parsed = JSON.parse(raw)
+    const global = parsed && typeof parsed === 'object' && parsed.global && typeof parsed.global === 'object'
+      ? parsed.global
+      : null
+    if (global === null) {
+      trace(requestId, 'workspaces', 'storage:no-global')
+      return empty
+    }
+    const archived = Array.isArray(global.archivedSessionIds) ? global.archivedSessionIds.map(String) : []
+    const pinned = Array.isArray(global.pinnedSessionIds) ? global.pinnedSessionIds.map(String) : []
+    trace(requestId, 'workspaces', `storage:ok archived=${archived.length} pinned=${pinned.length}`)
+    return { archivedSessionIds: archived, pinnedSessionIds: pinned }
+  } catch (error) {
+    trace(requestId, 'workspaces', `storage:error ${describeError(error)}`)
+    return empty
+  }
+}
+
+/**
  * Read the workspace baseline: try the follow baseline with a bounded wait,
  * then fall back to the synchronous registry projection (which carries no
  * archive/pin sets).
@@ -482,11 +531,24 @@ async function readWorkspaceBaseline(ctx, requestId) {
       sessionIds: [...workspace.sessionIds].map(String),
     }))
     trace(requestId, 'workspaces', `registry:ok items=${items.length}`)
-    return { baseline: { items, archivedSessionIds: [], pinnedSessionIds: [] }, source: 'registry' }
+    // The registry lists workspaces only; the archived/pinned sets live in the
+    // same storage domain. Reading them here keeps the fallback honest — an
+    // empty set would show archived sessions as unarchived and make an import
+    // treat a local archived copy as a blocking duplicate instead of an adoptable
+    // one.
+    const sets = readWorkspaceGlobalSets(requestId)
+    return {
+      baseline: { items, archivedSessionIds: sets.archivedSessionIds, pinnedSessionIds: sets.pinnedSessionIds },
+      source: 'registry',
+    }
   }
 
   trace(requestId, 'workspaces', 'registry:unavailable')
-  return { baseline: { items: [], archivedSessionIds: [], pinnedSessionIds: [] }, source: 'none' }
+  const sets = readWorkspaceGlobalSets(requestId)
+  return {
+    baseline: { items: [], archivedSessionIds: sets.archivedSessionIds, pinnedSessionIds: sets.pinnedSessionIds },
+    source: 'none',
+  }
 }
 
 /**
@@ -1322,6 +1384,7 @@ function walkWorkspaceDirectory(rootPath, excludePaths = new Set()) {
   const files = []
   let totalBytes = 0
   let excludedPathsHit = 0
+  let skippedLinks = 0
   let truncated = false
   const stack = [{ dir: rootPath, rel: '' }]
   while (stack.length > 0) {
@@ -1340,6 +1403,14 @@ function walkWorkspaceDirectory(rootPath, excludePaths = new Set()) {
       const absolute = join(current.dir, child.name)
       const relative = current.rel === '' ? child.name : `${current.rel}/${child.name}`
       const picked = excludePaths.has(pathKey(absolute))
+      // A symbolic link or directory junction is neither a real file nor a real
+      // directory here: following it could pack data from outside the workspace,
+      // and a link cycle could never finish. Count them so the export can say
+      // what it left out instead of dropping them silently.
+      if (child.isSymbolicLink()) {
+        skippedLinks += 1
+        continue
+      }
       if (child.isDirectory()) {
         // A picked directory excludes everything inside it, because the walk
         // never descends: one entry removes a whole subtree.
@@ -1354,7 +1425,10 @@ function walkWorkspaceDirectory(rootPath, excludePaths = new Set()) {
         excludedPathsHit += 1
         continue
       }
-      if (!child.isFile()) continue
+      if (!child.isFile()) {
+        skippedLinks += 1
+        continue
+      }
       let bytes = 0
       let mtime = 0
       try {
@@ -1380,6 +1454,7 @@ function walkWorkspaceDirectory(rootPath, excludePaths = new Set()) {
     files,
     totalBytes,
     excludedPathsHit,
+    skippedLinks,
     truncated,
   }
 }
@@ -1420,6 +1495,7 @@ async function collectWorkspaceBackup(ctx, sessionIds, rawExcludePaths) {
         files: [],
         totalBytes: 0,
         excludedPathsHit: 0,
+        skippedLinks: 0,
         truncated: false,
         unavailable: true,
       })
@@ -1437,6 +1513,7 @@ async function collectWorkspaceBackup(ctx, sessionIds, rawExcludePaths) {
         files: [],
         totalBytes: 0,
         excludedPathsHit: 0,
+        skippedLinks: 0,
         truncated: false,
         unavailable: true,
       })
@@ -1447,6 +1524,9 @@ async function collectWorkspaceBackup(ctx, sessionIds, rawExcludePaths) {
   return {
     workspaces,
     unmatched: Math.max(0, wanted.size - matchedSessions.size),
+    // Links the walk refused to follow; the export reports them so a package
+    // that silently lacks a junction target is explainable.
+    skippedLinks: workspaces.reduce((sum, workspace) => sum + (workspace.skippedLinks ?? 0), 0),
     excludePaths,
   }
 }
@@ -1462,12 +1542,16 @@ async function collectWorkspaceBackup(ctx, sessionIds, rawExcludePaths) {
  * @param {object} ctx Cordis context.
  * @param {string} sessionId session id.
  * @param {number} [timeoutMs] how long to keep polling.
+ * @param {number} [batchDeadline] epoch ms shared by one batch; the wait never
+ *   outlives it, so a large batch cannot spend a per-session budget N times.
  * @returns {Promise<boolean>} whether the store reported the session.
  */
-async function waitForSessionVisibility(ctx, sessionId, timeoutMs = 3000) {
+async function waitForSessionVisibility(ctx, sessionId, timeoutMs = 3000, batchDeadline = Infinity) {
   const persistence = ctx.get('sessionPersistence')
   if (!persistence || typeof persistence.list !== 'function') return false
-  const deadline = Date.now() + timeoutMs
+  const budget = Math.min(timeoutMs, Math.max(0, batchDeadline - Date.now()))
+  if (budget <= 0) return false
+  const deadline = Date.now() + budget
   for (;;) {
     try {
       const snapshots = await persistence.list({})
@@ -1496,9 +1580,10 @@ async function waitForSessionVisibility(ctx, sessionId, timeoutMs = 3000) {
  * @param {object | undefined} registry workspace registry service.
  * @param {string} workspaceId target workspace id.
  * @param {string} sessionId session id.
+ * @param {number} [batchDeadline] epoch ms shared by one batch.
  * @returns {Promise<{ ok: boolean, error?: string }>} whether membership stuck.
  */
-async function attachWorkspaceSession(ctx, registry, workspaceId, sessionId) {
+async function attachWorkspaceSession(ctx, registry, workspaceId, sessionId, batchDeadline = Infinity) {
   const workspace = registry && typeof registry.get === 'function' ? registry.get(workspaceId) : undefined
   if (!workspace || typeof workspace.attachSession !== 'function') {
     return { ok: false, error: `工作区 ${workspaceId} 不可用` }
@@ -1509,7 +1594,7 @@ async function attachWorkspaceSession(ctx, registry, workspaceId, sessionId) {
       return { ok: true }
     } catch (error) {
       if (attempt === 0) {
-        await waitForSessionVisibility(ctx, sessionId, 1500)
+        await waitForSessionVisibility(ctx, sessionId, 1500, batchDeadline)
         continue
       }
       return { ok: false, error: describeError(error) }
@@ -1528,17 +1613,18 @@ async function attachWorkspaceSession(ctx, registry, workspaceId, sessionId) {
  * @param {object | undefined} registry workspace registry service.
  * @param {string} sessionId session id.
  * @param {string[]} workspaceIds target workspace ids.
+ * @param {number} [batchDeadline] epoch ms shared by one batch.
  * @returns {Promise<{ attached: string[], errors: string[] }>} results.
  */
-async function attachFreshSession(ctx, registry, sessionId, workspaceIds) {
+async function attachFreshSession(ctx, registry, sessionId, workspaceIds, batchDeadline = Infinity) {
   const attached = []
   const errors = []
   if (!registry || typeof registry.get !== 'function' || workspaceIds.length === 0) {
     return { attached, errors }
   }
-  await waitForSessionVisibility(ctx, sessionId)
+  await waitForSessionVisibility(ctx, sessionId, 3000, batchDeadline)
   for (const workspaceId of workspaceIds) {
-    const outcome = await attachWorkspaceSession(ctx, registry, workspaceId, sessionId)
+    const outcome = await attachWorkspaceSession(ctx, registry, workspaceId, sessionId, batchDeadline)
     if (outcome.ok) attached.push(workspaceId)
     else errors.push(outcome.error || `工作区 ${workspaceId} 不可用`)
   }
@@ -1597,7 +1683,7 @@ function restoreWorkspaceFiles(byWorkspace, mapping, registry, selection = {}) {
     let bytes = 0
     for (const member of members) {
       const target = resolve(join(root, ...member.segments))
-      if (!target.startsWith(root + sep)) {
+      if (!isInsideRoot(pathKey(target), pathKey(root))) {
         failed += 1
         continue
       }
@@ -1705,6 +1791,7 @@ function readZipEntries(buffer) {
   let cursor = centralOffset
   let unpacked = 0
   let unpackedActual = 0
+  let resident = 0
   for (let index = 0; index < count; index += 1) {
     if (buffer.readUInt32LE(cursor) !== 0x02014b50) throw new Error('ZIP 目录损坏')
     const method = buffer.readUInt16LE(cursor + 10)
@@ -1735,6 +1822,17 @@ function readZipEntries(buffer) {
     // deflate stream can expand far past it, so the real output is counted too.
     unpackedActual += data.length
     if (unpackedActual > IMPORT_UNPACKED_BYTES_LIMIT) throw new Error('包解压后体积超过上限')
+    // Every member stays in memory until the import finishes, so the archive and
+    // its decompressed members have to fit together. Without this cap a package
+    // inside the size limits could still exhaust the Host heap and kill DSH;
+    // failing with a readable message is the better outcome.
+    resident += data.length
+    if (resident > IMPORT_RESIDENT_BYTES_LIMIT) {
+      throw new Error(
+        `包内数据需要同时占用 ${Math.round(resident / (1024 * 1024))} MB 内存，超过上限 `
+        + `${Math.round(IMPORT_RESIDENT_BYTES_LIMIT / (1024 * 1024))} MB；请分多次导出后再导入`,
+      )
+    }
     entries.push({ name: entryName, data })
   }
   return entries
@@ -2459,7 +2557,7 @@ async function inspectImport(ctx, rawPath) {
  * @returns {Promise<object>} per-session result.
  */
 async function adoptLocalSession(options) {
-  const { ctx, id, title, role, localDir, targetWorkspaceIds, targetCwd, registry } = options
+  const { ctx, id, title, role, localDir, targetWorkspaceIds, targetCwd, registry, attachDeadline } = options
   const localCwd = readSessionHeaderCwd(localDir)
   const warnings = []
   let moved = false
@@ -2518,9 +2616,9 @@ async function adoptLocalSession(options) {
         }
         // The copy was just moved and rewritten, so the store listing lags the
         // same way it does after an import: wait before recording membership.
-        await waitForSessionVisibility(ctx, id)
+        await waitForSessionVisibility(ctx, id, 3000, attachDeadline ?? Infinity)
         for (const workspaceId of targetWorkspaceIds) {
-          const outcome = await attachWorkspaceSession(ctx, registry, workspaceId, id)
+          const outcome = await attachWorkspaceSession(ctx, registry, workspaceId, id, attachDeadline ?? Infinity)
           if (outcome.ok) attached.push(workspaceId)
           // Membership is best effort here, but never silent: the result
           // warning reaches the import dialog.
@@ -2587,6 +2685,10 @@ async function importPackage(ctx, rawPath, rawMapping, options = {}) {
   let failed = 0
   const baseline = await readWorkspaceBaseline(ctx, 'import-run')
   const archivedLocal = new Set(baseline.baseline.archivedSessionIds)
+  // One budget for the whole run: attaching a freshly written session waits for
+  // the store listing, and multiplying that wait by the batch size would outlive
+  // the Client request.
+  const attachDeadline = Date.now() + ATTACH_BUDGET_IMPORT_MS
 
   for (const session of manifest.sessions) {
     const id = session.id
@@ -2650,6 +2752,7 @@ async function importPackage(ctx, rawPath, rawMapping, options = {}) {
           // recorded cwd belongs to the source machine and may not exist here.
           targetCwd: mappedCwd,
           registry,
+          attachDeadline,
         })
         if (outcome.status === 'adopted') adopted += 1
         else failed += 1
@@ -2696,7 +2799,7 @@ async function importPackage(ctx, rawPath, rawMapping, options = {}) {
         }
       }
 
-      const attachOutcome = await attachFreshSession(ctx, registry, id, targetWorkspaceIds)
+      const attachOutcome = await attachFreshSession(ctx, registry, id, targetWorkspaceIds, attachDeadline)
       const attached = attachOutcome.attached
       // An imported session must never stay archived: an archived session is
       // hidden from the Native sidebar and from the library's default view, so
@@ -2819,10 +2922,9 @@ function sameFileContent(filePath, data) {
 function restorePackageAttachments(entries) {
   const counters = { restored: 0, skipped: 0, failed: 0, bytes: 0 }
   if (!Array.isArray(entries) || entries.length === 0) return counters
-  const root = resolve(ATTACHMENTS_ROOT)
   for (const entry of entries) {
     const target = resolve(join(ATTACHMENTS_ROOT, ...entry.segments))
-    if (!target.startsWith(root + sep)) {
+    if (!isInsideRoot(pathKey(target), pathKey(ATTACHMENTS_ROOT))) {
       counters.failed += 1
       continue
     }
@@ -3543,6 +3645,9 @@ async function restoreTrashEntries(ctx, rawNames, signal, options = {}) {
   const registry = ctx.get('workspaceRegistry')
   const cancelPurgeOnly = options.cancelPurgeOnly === true
   const results = []
+  // Attaching a restored session waits for the store listing; a batch shares one
+  // budget so 100 restores cannot outlive the Client request.
+  const attachDeadline = Date.now() + ATTACH_BUDGET_RESTORE_MS
 
   for (const rawName of Array.isArray(rawNames) ? rawNames : []) {
     if (typeof rawName === 'string' && rawName.startsWith('pending:')) {
@@ -3648,9 +3753,9 @@ async function restoreTrashEntries(ctx, rawNames, signal, options = {}) {
         ? manifest.workspaceIds.map(String).filter((id) => id !== '')
         : []
       if (targetWorkspaceIds.length > 0) {
-        await waitForSessionVisibility(ctx, manifest.id)
+        await waitForSessionVisibility(ctx, manifest.id, 3000, attachDeadline)
         for (const workspaceId of targetWorkspaceIds) {
-          const outcome = await attachWorkspaceSession(ctx, registry, workspaceId, manifest.id)
+          const outcome = await attachWorkspaceSession(ctx, registry, workspaceId, manifest.id, attachDeadline)
           if (outcome.ok) restoredWorkspaces.push(workspaceId)
           else {
             attachErrors.push(`${workspaceId}: ${outcome.error}`)
@@ -3878,8 +3983,10 @@ async function exportSessions(ctx, rawIds, signal, options = {}) {
     childrenByParent.get(parentId).push(childId)
   }
 
-  // Selected sessions plus their subagent/teammate descendants, so an exported
-  // family arrives intact.
+  // Selected sessions plus every child session, so an exported family arrives
+  // intact. Forks carry no `origin: 'subagent'` marker (the fork lineage lives
+  // outside the log header), so filtering on origin left them behind and a
+  // cross-machine import silently lost that branch of the family.
   const selected = []
   const seen = new Set()
   const queue = [...ids]
@@ -3890,8 +3997,7 @@ async function exportSessions(ctx, rawIds, signal, options = {}) {
     if (!byId.has(id)) continue
     selected.push(id)
     for (const childId of childrenByParent.get(id) ?? []) {
-      const child = byId.get(childId)
-      if (child && child.header.origin === 'subagent') queue.push(childId)
+      if (byId.has(childId)) queue.push(childId)
     }
   }
   if (selected.length === 0) throw new Error('勾选的会话在磁盘上不存在')
@@ -3966,11 +4072,15 @@ async function exportSessions(ctx, rawIds, signal, options = {}) {
   // caps keep one export from reading an unbounded tree.
   const workspaceFiles = []
   let workspaceFilesSkipped = 0
+  let workspaceLinksSkipped = 0
   let workspaceExcludePaths = []
   if (options.includeWorkspaceFiles === true) {
     const backup = await collectWorkspaceBackup(ctx, selected, options.excludePaths)
     workspaceExcludePaths = backup.excludePaths
     workspaceFilesSkipped += backup.unmatched
+    // Symbolic links and junctions inside a workspace are not followed; report
+    // them so a package is never silently missing their targets.
+    workspaceLinksSkipped += backup.skippedLinks ?? 0
     for (const workspace of backup.workspaces) {
       if (workspace.unavailable === true || workspace.files.length === 0) {
         workspaceFilesSkipped += 1
@@ -4009,7 +4119,7 @@ async function exportSessions(ctx, rawIds, signal, options = {}) {
       'workspace-files',
       `workspaces=${workspaceFiles.length} `
         + `files=${workspaceFiles.reduce((sum, item) => sum + item.fileCount, 0)}`
-        + ` skipped=${workspaceFilesSkipped}`,
+        + ` skipped=${workspaceFilesSkipped} links=${workspaceLinksSkipped}`,
     )
   }
 
@@ -4066,6 +4176,7 @@ async function exportSessions(ctx, rawIds, signal, options = {}) {
     workspaceFileCount: workspaceFiles.reduce((sum, item) => sum + item.fileCount, 0),
     workspaceFileBytes: workspaceFiles.reduce((sum, item) => sum + item.bytes, 0),
     workspaceFilesSkipped,
+    workspaceLinksSkipped,
     bytes: archive.length,
     missing: ids.filter((id) => !byId.has(id)).length,
     // The Host accepts a bounded batch; report it instead of letting the Client
@@ -4433,6 +4544,7 @@ export function apply(ctx) {
             bytes: workspace.totalBytes,
             truncated: workspace.truncated === true,
             excludedPathsHit: workspace.excludedPathsHit ?? 0,
+            skippedLinks: workspace.skippedLinks ?? 0,
             unavailable: workspace.unavailable === true,
           }))
           return jsonResponse({
@@ -4440,6 +4552,7 @@ export function apply(ctx) {
             totalFiles: workspaces.reduce((sum, item) => sum + item.fileCount, 0),
             totalBytes: workspaces.reduce((sum, item) => sum + item.bytes, 0),
             truncated: workspaces.some((item) => item.truncated === true),
+            skippedLinks: backup.skippedLinks ?? 0,
             unmatched: backup.unmatched,
             // Same batch bound the export applies; the Client warns when the
             // selection is larger, because the preview only covers the head.

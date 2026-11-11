@@ -920,6 +920,9 @@ window.__ModuleLoader__.load({
         // activity-triggered sync uses it to avoid re-reading data that is
         // already fresh.
         const lastSyncRef = React.useRef(0)
+        // Newest export preflight wins: two exclusion refreshes may resolve out of
+        // order, and a late response would overwrite the fresh counts.
+        const exportPreflightToken = React.useRef(0)
         // Root element, used to tell clicks inside this page from clicks in the
         // native sidebar or another panel.
         const rootRef = React.useRef(null)
@@ -1867,12 +1870,17 @@ window.__ModuleLoader__.load({
          * @returns {Promise<void>} resolution after the preview settled.
          */
         async function loadExportPreflight(ids, excludePaths) {
+          // Two quick refreshes can resolve out of order; only the newest request
+          // may write the dialog, otherwise stale counts overwrite fresh ones.
+          const token = ++exportPreflightToken.current
           const workspaceResult = await postJson(WORKSPACE_PREFLIGHT_PATH, {
             sessionIds: ids,
             excludePaths: Array.isArray(excludePaths) ? excludePaths : [],
           }, { timeoutMs: BATCH_TIMEOUT_MS }).catch(() => null)
           const workspaceInfo = {
             count: workspaceResult ? Number(workspaceResult.totalFiles) || 0 : 0,
+            // Links the walk refused to follow; the dialog says so when > 0.
+            links: workspaceResult ? Number(workspaceResult.skippedLinks) || 0 : 0,
             bytes: workspaceResult ? Number(workspaceResult.totalBytes) || 0 : 0,
             truncated: workspaceResult ? workspaceResult.truncated === true : false,
             // The Host caps one batch; echo it so the dialog can say the
@@ -1882,6 +1890,7 @@ window.__ModuleLoader__.load({
               ? workspaceResult.workspaces
               : [],
           }
+          if (token !== exportPreflightToken.current) return
           setExportDialog((current) => (current && current.phase === 'choose'
             ? {
                 ...current,
@@ -2088,6 +2097,7 @@ window.__ModuleLoader__.load({
               workspaceFileCount: Number(payload.workspaceFileCount) || 0,
               workspaceFileBytes: Number(payload.workspaceFileBytes) || 0,
               workspaceFilesSkipped: Number(payload.workspaceFilesSkipped) || 0,
+              workspaceLinksSkipped: Number(payload.workspaceLinksSkipped) || 0,
               bytes: Number(payload.bytes) || 0,
               limit: readBatchLimit(payload.limit),
               error: null,
@@ -3827,6 +3837,7 @@ window.__ModuleLoader__.load({
               ? '所选会话的工作区没有可备份的文件'
               : `包含工作区附件（工作区目录下的文件）：${workspaceFileCount} 个 · ${((Number(workspaceInfo.bytes) || 0) / 1048576).toFixed(2)} MB`
                 + `${workspaceInfo.truncated ? '（已达上限，部分文件未包含）' : ''}`
+                + `${Number(workspaceInfo.links) > 0 ? ` · 跳过 ${Number(workspaceInfo.links)} 个链接` : ''}`
           // Paths picked in the exclusion browser, and the workspace roots the
           // browser may start from.
           const exportExcludePaths = Array.isArray(exportDialog.excludePaths) ? exportDialog.excludePaths : []
@@ -4020,6 +4031,13 @@ window.__ModuleLoader__.load({
                           ? `工作区附件 ${exportDialog.workspaceFileCount} 个（${((Number(exportDialog.workspaceFileBytes) || 0) / 1048576).toFixed(2)} MB）也已打包。`
                           : ''),
                     ),
+                    Number(exportDialog.workspaceLinksSkipped) > 0
+                      ? h(
+                          'p',
+                          { style: dialogHintStyle },
+                          `工作区内有 ${Number(exportDialog.workspaceLinksSkipped) || 0} 个符号链接或目录联接未被包含（它们可能指向工作区之外）。`,
+                        )
+                      : null,
                     Number(exportDialog.workspaceFilesSkipped) > 0
                       ? h(
                           'p',
