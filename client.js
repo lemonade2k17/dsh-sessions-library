@@ -2074,15 +2074,24 @@ window.__ModuleLoader__.load({
           const ids = selectedVisibleIds()
           if (ids.length === 0) return
           const targetDir = exportTarget.trim()
+          // The checkbox only counts once the preview has counted files: before
+          // that, "included" would mean "all of them", which is exactly what the
+          // dialog has not shown yet.
+          const previewInfo = exportDialog !== null && exportDialog.workspaceInfo
+            && typeof exportDialog.workspaceInfo === 'object'
+            ? exportDialog.workspaceInfo
+            : null
+          const includeWorkspaceFiles = exportDialog !== null
+            && exportDialog.includeWorkspaceFiles === true
+            && previewInfo !== null
+            && (Number(previewInfo.count) || 0) > 0
           setExportDialog((current) => ({ ...(current || {}), phase: 'busy', error: null }))
           try {
             const payload = await postJson(EXPORT_PATH, {
               sessionIds: ids,
               ...(targetDir !== '' ? { targetDir } : {}),
               ...(createDir === true ? { createDir: true } : {}),
-              ...(exportDialog !== null && exportDialog.includeWorkspaceFiles === true
-                ? { includeWorkspaceFiles: true }
-                : {}),
+              ...(includeWorkspaceFiles ? { includeWorkspaceFiles: true } : {}),
               ...(exportDialog !== null ? {
                 excludePaths: Array.isArray(exportDialog.excludePaths) ? exportDialog.excludePaths : [],
               } : {}),
@@ -2199,16 +2208,6 @@ window.__ModuleLoader__.load({
         }
 
         /**
-         * Cancel a queued permanent delete without restoring the session.
-         *
-         * The session stays deleted: it keeps its pending record, remains hidden
-         * from both the library and the Native sidebar, and the next start moves
-         * it into the recycle bin as usual.
-         *
-         * @param {string[]} entryNames pending entry names to un-queue.
-         * @returns {Promise<void>} resolution after the recycle bin refreshed.
-         */
-        /**
          * Let restored or purged families fade before the list is re-read.
          *
          * The entries are already gone on the Host; keeping them on screen for
@@ -2238,6 +2237,16 @@ window.__ModuleLoader__.load({
           await new Promise((resolve) => setTimeout(resolve, 160))
         }
 
+        /**
+         * Cancel a queued permanent delete without restoring the session.
+         *
+         * The session stays deleted: it keeps its pending record, remains hidden
+         * from both the library and the Native sidebar, and the next start moves
+         * it into the recycle bin as usual.
+         *
+         * @param {string[]} entryNames pending entry names to un-queue.
+         * @returns {Promise<void>} resolution after the recycle bin refreshed.
+         */
         async function cancelQueuedPurge(entryNames) {
           if (!Array.isArray(entryNames) || entryNames.length === 0) return
           setTrashError(null)
@@ -2282,17 +2291,23 @@ window.__ModuleLoader__.load({
             })
             const results = Array.isArray(payload.results) ? payload.results : []
             const failed = results.find((result) => result.status !== 'restored')
+            const restoredNames = results
+              .filter((result) => result && result.status === 'restored' && typeof result.entryName === 'string')
+              .map((result) => result.entryName)
             if (failed) {
               setTrashError(failed.reason || '恢复失败')
             } else {
               setTrashNotice('已恢复。会话库立即可见；已请求原生侧边栏刷新，若未出现请刷新页面。')
+            }
+            if (restoredNames.length > 0) {
               // Both kinds must show up at once: a pending entry only needed its
               // archive undone, a trashed one also needs the Client session list
-              // to re-pull the row this plugin put back on disk.
+              // to re-pull the row this plugin put back on disk. A partial batch
+              // restores rows too, so this runs even when another entry failed.
               refreshNativeSessionList()
-              // The family leaves the bin: fade it out first, then let the
-              // silent re-read remove it for real.
-              await fadeOutTrashFamilies(entryNames)
+              // Only the restored families fade; ones that stayed in the bin must
+              // not blink out and reappear.
+              await fadeOutTrashFamilies(restoredNames)
             }
             await refreshTrash({ silent: true })
             setTrashRemoving({})
@@ -3855,7 +3870,14 @@ window.__ModuleLoader__.load({
             ))
             actions.push(h(
               'button',
-              { key: 'start', className: 'sl-btn', style: actionButtonStyle, onClick: () => beginExport(false) },
+              {
+                key: 'start',
+                className: 'sl-btn',
+                style: { ...actionButtonStyle, opacity: workspaceInfo === null ? 0.55 : 1 },
+                disabled: workspaceInfo === null,
+                title: workspaceInfo === null ? '正在统计工作区文件…' : undefined,
+                onClick: () => beginExport(false),
+              },
               '开始导出',
             ))
           } else if (failed) {
