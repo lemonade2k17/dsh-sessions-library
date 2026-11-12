@@ -97,6 +97,11 @@ const WORKSPACE_BACKUP_MAX_FILES = 5000
 const IMPORT_ZIP_BYTES_LIMIT = 768 * 1024 * 1024
 const IMPORT_UNPACKED_BYTES_LIMIT = 1536 * 1024 * 1024
 const IMPORT_ENTRY_LIMIT = 20000
+// A package carries one directory per session and the import writes and attaches
+// them one by one. Beyond the warning threshold the dialog says so; beyond the
+// hard cap the package is refused instead of running for hours.
+const IMPORT_SESSION_WARN = 300
+const IMPORT_SESSION_LIMIT = 2000
 // Decompressed members are held in memory until the import finishes. This cap is
 // about the Host process staying alive, not about the package being "too big":
 // exceeding it produces a clear error instead of an out-of-memory crash.
@@ -1874,6 +1879,9 @@ function loadImportPackage(rawPath) {
     ? manifest.sessions.filter((session) => session && typeof session.id === 'string' && session.id !== '')
     : []
   if (sessions.length === 0) throw new Error('包内没有可导入的会话')
+  if (sessions.length > IMPORT_SESSION_LIMIT) {
+    throw new Error(`包内有 ${sessions.length} 个会话，超过单次导入上限 ${IMPORT_SESSION_LIMIT} 个；请拆分导出后再导入`)
+  }
   return {
     zipPath,
     fileName: basename(zipPath),
@@ -2505,6 +2513,9 @@ async function inspectImport(ctx, rawPath) {
   if (missingParentCount > 0) warnings.push(`${missingParentCount} 个会话的父会话不在包内，导入后可能无法继续对话`)
   if (unknown.length > 0) warnings.push(`包内有 ${unknown.length} 个无法识别的文件，将被忽略`)
   if (unknownWorkspaceIds.length > 0) warnings.push(`${unknownWorkspaceIds.length} 个源工作区没有元数据，相关会话将放入未分组`)
+  if (sessions.length > IMPORT_SESSION_WARN) {
+    warnings.push(`包内有 ${sessions.length} 个会话，导入会逐个写入并挂载，预计需要数分钟；若只需其中一部分，建议拆分导出`)
+  }
   if (adoptable > 0) {
     warnings.push(`${adoptable} 个会话在本地已存在且处于归档状态：导入会取消归档，并尽量归入所选目标工作区`)
   }
@@ -3320,6 +3331,26 @@ async function buildDeletePreflight(ctx, ids, signal, includeForks) {
  *
  * @returns {Array<object>} trash entries, newest first.
  */
+// Entry directories are immutable once moved into the bin, so their size only
+// needs to be walked once. The bin re-lists every 15 s while visible and used to
+// re-walk every entry (and every session log inside it) on each pass.
+const trashSizeCache = new Map()
+
+/**
+ * Size of one bin entry, walked at most once per entry directory.
+ *
+ * @param {string} name entry directory name.
+ * @param {string} entryDir absolute directory.
+ * @returns {number} total bytes.
+ */
+function cachedTrashSize(name, entryDir) {
+  const cached = trashSizeCache.get(name)
+  if (cached !== undefined) return cached
+  const size = dirSize(entryDir)
+  trashSizeCache.set(name, size)
+  return size
+}
+
 function readTrashEntries() {
   // A missing trash root only means no entry was ever physically moved; queued
   // deferred deletions still belong in the list.
@@ -3366,11 +3397,16 @@ function readTrashEntries() {
         ? manifest.workspaceIds.map(String).filter((value) => value !== '')
         : null,
       deletedAt: manifest && typeof manifest.deletedAt === 'number' ? manifest.deletedAt : (Number.isFinite(timestamp) ? timestamp : 0),
-      sizeBytes: dirSize(entryDir),
+      sizeBytes: cachedTrashSize(name, entryDir),
       restoreAvailable: existsSync(sessionDir),
     })
   }
 
+  // Forget sizes of entries that no longer exist (purged or restored).
+  if (trashSizeCache.size > 0) {
+    const alive = new Set(names)
+    for (const key of trashSizeCache.keys()) if (!alive.has(key)) trashSizeCache.delete(key)
+  }
   // Deferred deletions are listed as pending entries so they appear in the
   // recycle bin immediately, before their log is moved on the next start.
   const pending = readPendingTrash()
@@ -4662,6 +4698,11 @@ export function apply(ctx) {
           `archived=${snapshot.counts.archived} sources=${JSON.stringify(snapshot.sources)}`,
       )
       writeSnapshotFile(snapshot)
+    }).catch((error) => {
+      // Without this a throw inside the callback would surface as an unhandled
+      // rejection, and Node terminates the process for those: the desktop shell
+      // would report a Host crash.
+      trace(requestId, 'end', `fail ${describeError(error)}`)
     })
   }, SELF_TEST_DELAY_MS)
   ctx.effect(() => () => clearTimeout(timer), 'sessions-library: self-test')
