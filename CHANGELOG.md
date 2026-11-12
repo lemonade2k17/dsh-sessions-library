@@ -219,7 +219,7 @@ bundle 行列表为空，重启后侧边栏不再出现「会话库」；这一�
 | 0.3.1 | `v0.3.1` | `ecdcddd` | 2026-11-02 | `release/v0.3.1/dsh-sessions-library-0.3.1.tgz`（80,663） | `1e66dbdc0dadc26decf2bc2dd374ad5ca4e8ab527766b914d965057d2a48a93f` |
 | 0.4.0 | `v0.4.0` | `6092fd5` | 2026-11-06 | `release/v0.4.0/dsh-sessions-library-0.4.0.tgz`（101,583） | `5a68800550873978881aa31196d0cb2a62a5ec9e2b15ae3d3ea061609ee1598f` |
 | 0.4.1 | `v0.4.1` | `c2377b8` | 2026-11-11 | `release/v0.4.1/dsh-sessions-library-0.4.1.tgz`（105,113） | `58d24b780ea55fcff68425de770e002a798ceb1ba522d1aec7982d17ff4d64ef` |
-| 0.4.2 | `v0.4.2` | （见标签指向） | 2026-11-12 | `release/v0.4.2/dsh-sessions-library-0.4.2.tgz`（105,880） | `cb6962c87a195902c49565af8e38c12bc6f3dc64eb5dbcc1539b275a96eb468f` |
+| 0.4.2 | `v0.4.2` | `4035df4` | 2026-11-12 | `release/v0.4.2/dsh-sessions-library-0.4.2.tgz`（105,880） | `cb6962c87a195902c49565af8e38c12bc6f3dc64eb5dbcc1539b275a96eb468f` |
 
 > 之后的提交（例如文档修订）不移动已发布的标签；需要新基线时再升版本、打标签、重打包并在此表追加一行。
 
