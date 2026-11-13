@@ -3663,7 +3663,7 @@ window.__ModuleLoader__.load({
                         + `${report.counts.adoptable > 0 ? `，其中已归档 ${report.counts.adoptable} 个` : ''}`
                         + `，冲突 ${report.counts.conflicts} 个）`
                         + `${Number(report.counts.workspaceFiles) > 0
-                          ? ` · 工作区附件 ${report.counts.workspaceFiles} 个（${((Number(report.counts.workspaceFileBytes) || 0) / 1048576).toFixed(2)} MB）`
+                          ? ` · 工作区文件 ${report.counts.workspaceFiles} 个（${((Number(report.counts.workspaceFileBytes) || 0) / 1048576).toFixed(2)} MB）`
                           : ''}`,
                     ),
                     report.attachments && Number(report.attachments.needed) > 0
@@ -3810,7 +3810,7 @@ window.__ModuleLoader__.load({
                           h(
                             'p',
                             { style: dialogHintStyle },
-                            '目标工作区已有同名文件时怎么办（只影响工作区附件，不影响会话本身）：',
+                            '目标工作区已有同名文件时怎么办（只影响工作区文件，不影响会话本身）：',
                           ),
                           h(
                             'select',
@@ -3859,7 +3859,7 @@ window.__ModuleLoader__.load({
                       ? h(
                           'p',
                           { style: dialogHintStyle },
-                          `工作区附件：新增 ${Number(outcome.workspaceFiles.restored) || 0} 个`
+                          `工作区文件：新增 ${Number(outcome.workspaceFiles.restored) || 0} 个`
                             + `${Number(outcome.workspaceFiles.overwritten) > 0 ? `，覆盖 ${outcome.workspaceFiles.overwritten} 个` : ''}`
                             + `${Number(outcome.workspaceFiles.skipped) > 0 ? `，跳过 ${outcome.workspaceFiles.skipped} 个` : ''}`
                             + `${Number(outcome.workspaceFiles.failed) > 0 ? `，失败 ${outcome.workspaceFiles.failed} 个` : ''}`
@@ -3945,7 +3945,7 @@ window.__ModuleLoader__.load({
             ? '正在统计工作区文件…'
             : workspaceFileCount === 0
               ? '所选会话的工作区没有可备份的文件'
-              : `包含工作区附件（工作区目录下的文件）：${workspaceFileCount} 个 · ${((Number(workspaceInfo.bytes) || 0) / 1048576).toFixed(2)} MB`
+              : `包含工作区文件（该会话工作区目录里的项目文件）：${workspaceFileCount} 个 · ${((Number(workspaceInfo.bytes) || 0) / 1048576).toFixed(2)} MB`
                 + `${workspaceInfo.truncated ? '（已达上限，部分文件未包含）' : ''}`
                 + `${Number(workspaceInfo.links) > 0 ? ` · 跳过 ${Number(workspaceInfo.links)} 个链接` : ''}`
           // Chat attachments counted by the same preflight request.
@@ -4063,7 +4063,7 @@ window.__ModuleLoader__.load({
                             ? { ...current, includeWorkspaceFiles: current.includeWorkspaceFiles !== true }
                             : current))
                         },
-                        '包含工作区附件',
+                        '包含工作区文件',
                       ),
                       h('span', { style: exportOptionLabelStyle }, workspaceLabel),
                     ),
@@ -4172,7 +4172,7 @@ window.__ModuleLoader__.load({
                       `已导出 ${exportDialog.sessionCount} 个会话（${(bytes / 1048576).toFixed(2)} MB），`
                         + `包内包含 ${exportDialog.workspaceCount} 个工作区的信息（ID、路径、标题）。`
                         + (Number(exportDialog.workspaceFileCount) > 0
-                          ? `工作区附件 ${exportDialog.workspaceFileCount} 个（${((Number(exportDialog.workspaceFileBytes) || 0) / 1048576).toFixed(2)} MB）也已打包。`
+                          ? `工作区文件 ${exportDialog.workspaceFileCount} 个（${((Number(exportDialog.workspaceFileBytes) || 0) / 1048576).toFixed(2)} MB）也已打包。`
                           : ''),
                     ),
                     Number(exportDialog.attachmentCount) > 0
@@ -4218,7 +4218,7 @@ window.__ModuleLoader__.load({
                           `本次只导出了前 ${batchLimit.accepted} 个会话（单次上限 ${batchLimit.max} 个）；其余 ${batchLimit.requested - batchLimit.accepted} 个未包含在这个包里，请再导一次。`,
                         )
                       : null,
-                    h('p', { style: dialogHintStyle }, '会话日志按原存储格式逐字节复制；对方可用本插件的「导入会话」还原，会话附件会写回本机附件库，工作区附件会写回所选工作区目录。'),
+                    h('p', { style: dialogHintStyle }, '会话日志按原存储格式逐字节复制；对方可用本插件的「导入会话」还原，会话附件会写回本机附件库，工作区文件会写回所选工作区目录。'),
                   )
                 : null,
               actions.length > 0

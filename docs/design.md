@@ -150,15 +150,15 @@
 ```text
 manifest.json
 sessions/<sessionId>/<原始日志文件名>       # 逐字节复制
-workspaces/<workspaceId>/<相对路径>          # 可选：工作区附件
-attachments/<版本>/…                        # 仅旧版本导出包可能携带（导入侧兼容）
+workspaces/<workspaceId>/<相对路径>          # 可选：工作区文件（工作区目录里的项目文件）
+attachments/v1/objects|files/…               # 0.5.0 起：会话附件对象，按哈希原样携带
 ```
 
-`manifest.json`：`format='dsh-sessions-library-export'`、`version=1`、`exportedAt`、`source.dshHome`、`workspaces[]`、`sessions[]`，可选 `workspaceFiles[]`（含每个文件的 `name`/`bytes`/`mtime`）与 `workspaceExcludePaths[]`。
+`manifest.json`：`format='dsh-sessions-library-export'`、`version=1`、`exportedAt`、`source.dshHome`、`workspaces[]`、`sessions[]`，可选 `workspaceFiles[]`（含每个文件的 `name`/`bytes`/`mtime`）与 `workspaceExcludePaths[]`，可选 `attachments[]`（`attachmentId`/`kind`/`name`/`mediaType`/`bytes`）与 `attachmentsMissing[]`（导出时本机就没有对象的引用）。
 
-### 5.2 工作区附件
+### 5.2 工作区文件
 
-- 勾选「包含工作区附件」后，按所选会话所属工作区统计并打包**工作区目录下的全部文件**
+- 勾选「包含工作区文件」后，按所选会话所属工作区统计并打包**工作区目录下的全部文件**（早期版本称「工作区附件」）
 - **没有内置排除**：`node_modules`、`.git`、`dist` 等一律不自动跳过，排除项完全由用户点选
 - 用户通过目录浏览器勾选目录（排除整棵子树）或单个文件；选择**只在本次导出有效**，取消或导出完成后清空
 - 上限：单工作区 200 MB / 5000 个文件；整包 512 MB。超出时预检与结果都会提示截断
