@@ -19,6 +19,7 @@
 import {
   appendFileSync,
   closeSync,
+  copyFileSync,
   existsSync,
   mkdirSync,
   openSync,
@@ -58,6 +59,15 @@ const SESSIONS_ROOT = join(DSH_HOME, 'sessions')
 const TRASH_ROOT = join(DSH_HOME, 'sessions-trash')
 // Content-addressed attachment store; session logs reference its objects by hash.
 const ATTACHMENTS_ROOT = join(DSH_HOME, 'attachments')
+// Attachment layout version 1. Images are stored as a bare object named by the
+// digest; files keep a canonical object plus a name-carrying alias that the
+// read path resolves, so a package must restore the alias to stay readable.
+const ATTACHMENTS_V1 = join(ATTACHMENTS_ROOT, 'v1')
+const ATTACHMENT_IMAGE_DIR = join(ATTACHMENTS_V1, 'objects')
+const ATTACHMENT_FILE_DIR = join(ATTACHMENTS_V1, 'file-objects')
+const ATTACHMENT_ALIAS_DIR = join(ATTACHMENTS_V1, 'files')
+// One attachment id is `sha256:<64 hex>`; the digest doubles as the object name.
+const ATTACHMENT_ID_PATTERN = /^sha256:([a-f0-9]{64})$/
 // Workspace registry storage (domain `workspace` v2). Read only as a fallback
 // when the controller stream is unavailable: it carries the archived/pinned
 // session sets that `workspaceRegistry.list()` does not expose.
@@ -2079,6 +2089,452 @@ function findSessionLogFile(sessionDir) {
   return undefined
 }
 
+// --- Attachment packages -----------------------------------------------------
+//
+// A session log stores only `attachmentId: sha256:<digest>` plus display
+// metadata; the bytes live in the content-addressed store. Exporting the
+// objects a package's sessions reference is therefore enough for an import to
+// resolve the same history, and it needs no log rewrite on either side.
+
+/**
+ * Extract the digest from one stored attachment id.
+ *
+ * @param {unknown} raw attachment id or any value found in a log.
+ * @returns {string | null} the 64 hex digest, or null when the value is not an id.
+ */
+function attachmentDigest(raw) {
+  if (typeof raw !== 'string') return null
+  const match = ATTACHMENT_ID_PATTERN.exec(raw.trim())
+  return match ? match[1] : null
+}
+
+/**
+ * Decode a stored session log into its concatenated JSONL text.
+ *
+ * Session logs are appended one zstd frame at a time, so a one-shot decode only
+ * returns the header frame and would hide every attachment reference.
+ *
+ * @param {Buffer} buffer log bytes.
+ * @returns {string | null} decoded text, or null when nothing can be decoded.
+ */
+function decodeSessionLogText(buffer) {
+  if (!Buffer.isBuffer(buffer) || buffer.length === 0) return null
+  const chunks = []
+  let offset = 0
+  let decodedFrames = 0
+  while (offset < buffer.length) {
+    let length = 0
+    try {
+      length = firstZstdFrameLength(buffer.subarray(offset))
+    } catch {
+      break
+    }
+    if (length <= 0 || offset + length > buffer.length) break
+    try {
+      chunks.push(zstdDecompressSync(buffer.subarray(offset, offset + length)))
+    } catch {
+      break
+    }
+    offset += length
+    decodedFrames += 1
+  }
+  // An unknown layout is still readable as plain JSONL; never hide its refs.
+  if (decodedFrames === 0) return buffer.toString('utf8')
+  return Buffer.concat(chunks).toString('utf8')
+}
+
+/**
+ * Collect every attachment one stored log references.
+ *
+ * A reference is any object carrying an `attachmentId`. History entries expose
+ * them as `content[].attachment` and the spliced inbox copies as
+ * `inserted[].content[].attachment`, so the walk stays schema-agnostic instead
+ * of missing the second shape.
+ *
+ * @param {Buffer} buffer log bytes.
+ * @param {Map<string, object>} into accumulated references keyed by digest.
+ * @returns {number} references found in this log.
+ */
+function collectLogAttachments(buffer, into) {
+  const text = decodeSessionLogText(buffer)
+  if (text === null) return 0
+  let found = 0
+  for (const line of text.split('\n')) {
+    if (line.indexOf('attachmentId') < 0) continue
+    let event = null
+    try {
+      event = JSON.parse(line)
+    } catch {
+      continue
+    }
+    const stack = [event]
+    while (stack.length > 0) {
+      const node = stack.pop()
+      if (node === null || typeof node !== 'object') continue
+      if (Array.isArray(node)) {
+        for (const item of node) stack.push(item)
+        continue
+      }
+      if (typeof node.attachmentId === 'string') {
+        const hash = attachmentDigest(node.attachmentId)
+        if (hash !== null) {
+          found += 1
+          const known = into.get(hash)
+          if (known === undefined) {
+            into.set(hash, {
+              hash,
+              name: typeof node.name === 'string' ? node.name : null,
+              mediaType: typeof node.mediaType === 'string' ? node.mediaType : null,
+              bytes: Number.isFinite(node.bytes) ? node.bytes : null,
+            })
+          } else if (known.name === null && typeof node.name === 'string') {
+            known.name = node.name
+          }
+        }
+      }
+      for (const value of Object.values(node)) stack.push(value)
+    }
+  }
+  return found
+}
+
+/**
+ * Whether DSH itself could read one referenced attachment from this store.
+ *
+ * Export only needs the bytes somewhere, but the read path is narrower: images
+ * resolve `objects/<shard>/<digest>`, while files resolve the name-carrying
+ * `files/<shard>/<digest>/<name>` alias — a canonical `file-objects` object
+ * without that alias carries the bytes yet stays unreadable.
+ *
+ * @param {{ hash: string, name: string | null }} ref reference metadata.
+ * @returns {boolean} whether the reference resolves on the read path.
+ */
+function isAttachmentReadable(ref) {
+  const shard = ref.hash.slice(0, 2)
+  if (existsSync(join(ATTACHMENT_IMAGE_DIR, shard, ref.hash))) return true
+  const aliasDir = join(ATTACHMENT_ALIAS_DIR, shard, ref.hash)
+  if (typeof ref.name === 'string' && ref.name !== '') {
+    return existsSync(join(aliasDir, ref.name))
+  }
+  try {
+    return readdirSync(aliasDir, { withFileTypes: true }).some((child) => child.isFile())
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Resolve one referenced attachment to the local file holding its bytes.
+ *
+ * @param {{ hash: string, name: string | null }} ref reference metadata.
+ * @returns {{ kind: string, path: string, segments: string[] } | null} matching store file.
+ */
+function resolveLocalAttachment(ref) {
+  const shard = ref.hash.slice(0, 2)
+  const imagePath = join(ATTACHMENT_IMAGE_DIR, shard, ref.hash)
+  if (existsSync(imagePath)) {
+    return { kind: 'image', path: imagePath, segments: ['v1', 'objects', shard, ref.hash] }
+  }
+  const aliasDir = join(ATTACHMENT_ALIAS_DIR, shard, ref.hash)
+  const names = []
+  if (typeof ref.name === 'string' && ref.name !== '') names.push(ref.name)
+  let listing = null
+  try {
+    listing = readdirSync(aliasDir, { withFileTypes: true }).filter((child) => child.isFile())
+  } catch {
+    listing = null
+  }
+  if (listing !== null) {
+    for (const child of listing) if (!names.includes(child.name)) names.push(child.name)
+  }
+  for (const name of names) {
+    const candidate = join(aliasDir, name)
+    if (existsSync(candidate)) {
+      return { kind: 'file', path: candidate, segments: ['v1', 'files', shard, ref.hash, name] }
+    }
+  }
+  // A canonical object without its alias still holds the bytes. Pack it under
+  // its alias path so an importer restores a reference the read path resolves.
+  const objectPath = join(ATTACHMENT_FILE_DIR, shard, ref.hash)
+  if (existsSync(objectPath)) {
+    const name = typeof ref.name === 'string' && ref.name !== '' ? ref.name : 'file'
+    return { kind: 'file', path: objectPath, segments: ['v1', 'files', shard, ref.hash, name] }
+  }
+  return null
+}
+
+/**
+ * Build the archive members that carry a set of referenced attachments.
+ *
+ * Members use the store's own layout below `attachments/`, which the importer
+ * writes back verbatim; members are de-duplicated by digest because one object
+ * can back several references.
+ *
+ * @param {Map<string, object>} refs references keyed by digest.
+ * @param {number} budget remaining archive byte budget.
+ * @returns {{ members: Array<{ name: string, data: Buffer }>, packed: object[], missing: object[], bytes: number }} packing result.
+ */
+function buildAttachmentMembers(refs, budget) {
+  const members = []
+  const packed = []
+  const missing = []
+  const skipped = []
+  const seenNames = new Set()
+  let bytes = 0
+  for (const ref of refs.values()) {
+    const local = resolveLocalAttachment(ref)
+    if (local === null) {
+      missing.push(ref)
+      continue
+    }
+    let data = null
+    try {
+      data = readFileSync(local.path)
+    } catch {
+      missing.push(ref)
+      continue
+    }
+    // An object that exists but does not fit the archive budget is skipped, not
+    // missing: reporting it as missing would tell the receiver to expect a
+    // degraded reference when the bytes are actually on this machine.
+    if (data.length > budget - bytes) {
+      skipped.push(ref)
+      continue
+    }
+    const name = `attachments/${local.segments.join('/')}`
+    if (!seenNames.has(name)) {
+      seenNames.add(name)
+      members.push({ name, data })
+      bytes += data.length
+    }
+    packed.push({
+      attachmentId: `sha256:${ref.hash}`,
+      kind: local.kind,
+      name: ref.name,
+      mediaType: ref.mediaType,
+      bytes: data.length,
+    })
+  }
+  return { members, packed, missing, skipped, bytes }
+}
+
+/**
+ * Collect every attachment the package's session logs reference.
+ *
+ * @param {Map<string, Array<{ segments: string[], data: Buffer }>>} bySession package session files.
+ * @returns {Map<string, object>} references keyed by digest.
+ */
+function collectPackageAttachmentRefs(bySession) {
+  const refs = new Map()
+  for (const files of bySession.values()) {
+    for (const file of files) {
+      const name = file.segments[file.segments.length - 1] ?? ''
+      if (!name.endsWith('.jsonl.zstd')) continue
+      collectLogAttachments(file.data, refs)
+    }
+  }
+  return refs
+}
+
+/**
+ * Inspect which attachments a package provides and which its sessions need.
+ *
+ * @param {Map<string, Array<{ segments: string[], data: Buffer }>>} bySession package session files.
+ * @param {Array<{ segments: string[], data: Buffer }>} attachmentEntries package attachment members.
+ * @returns {{ needed: number, packaged: number, local: number, missing: number, missingBytes: number, refs: Map<string, object>, missingRefs: object[] }} report.
+ */
+function analyzePackageAttachments(bySession, attachmentEntries) {
+  // A `file-objects` member alone is not enough: the read path resolves the
+  // `files/<shard>/<digest>/<name>` alias, so both shapes are tracked apart.
+  const aliasMembers = new Set()
+  const objectMembers = new Set()
+  for (const entry of attachmentEntries) {
+    const segments = entry.segments
+    if (segments.length >= 5 && segments[1] === 'files') aliasMembers.add(segments[3])
+    else if (segments.length >= 4 && segments[1] === 'file-objects') objectMembers.add(segments[3])
+    else if (segments.length >= 4 && segments[1] === 'objects') aliasMembers.add(segments[3])
+  }
+  const refs = collectPackageAttachmentRefs(bySession)
+  const missingRefs = []
+  let packaged = 0
+  let local = 0
+  for (const ref of refs.values()) {
+    if (aliasMembers.has(ref.hash)) {
+      packaged += 1
+      continue
+    }
+    if (isAttachmentReadable(ref)) {
+      local += 1
+      continue
+    }
+    // Bytes may ride along as a canonical object only; an importer can rebuild
+    // the alias from it, so it counts as packaged rather than missing.
+    if (objectMembers.has(ref.hash)) {
+      packaged += 1
+      continue
+    }
+    missingRefs.push(ref)
+  }
+  return {
+    needed: refs.size,
+    packaged,
+    local,
+    missing: missingRefs.length,
+    missingBytes: missingRefs.reduce((sum, ref) => sum + (Number(ref.bytes) || 0), 0),
+    refs,
+    missingRefs,
+  }
+}
+
+/**
+ * Count the chat attachments a set of sessions would carry in an export.
+ *
+ * Reads only the session logs, so the export dialog can show the number before
+ * the walk touches a single workspace file.
+ *
+ * @param {string[]} sessionIds selected session ids.
+ * @returns {{ total: number, available: number, bytes: number, missing: number }} preview counters.
+ */
+function previewSessionAttachments(sessionIds) {
+  const refs = new Map()
+  for (const id of sessionIds) {
+    const dir = findSessionDir(id)
+    if (dir === undefined) continue
+    for (const logPath of listSessionLogFiles(dir)) {
+      let data = null
+      try {
+        data = readFileSync(logPath)
+      } catch {
+        data = null
+      }
+      if (data !== null) collectLogAttachments(data, refs)
+    }
+  }
+  let bytes = 0
+  let missing = 0
+  let available = 0
+  for (const ref of refs.values()) {
+    const local = resolveLocalAttachment(ref)
+    if (local === null) {
+      missing += 1
+      continue
+    }
+    try {
+      bytes += statSync(local.path).size
+      available += 1
+    } catch {
+      missing += 1
+    }
+  }
+  return { total: refs.size, available, bytes, missing }
+}
+
+/**
+ * Replace references to attachments whose bytes no package can provide.
+ *
+ * A missing object aborts every later turn of the session, so an imported
+ * history keeps pluralism by degrading those content items into a plain text
+ * note. Only the affected events are rewritten; every other frame is preserved
+ * byte for byte.
+ *
+ * @param {unknown} value JSON value to walk.
+ * @param {Set<string>} missing digests no package or local store can provide.
+ * @param {{ dropped: number }} state running counter.
+ * @returns {unknown} the value with unavailable attachment items replaced.
+ */
+function scrubMissingAttachments(value, missing, state) {
+  if (Array.isArray(value)) return value.map((item) => scrubMissingAttachments(item, missing, state))
+  if (value === null || typeof value !== 'object') return value
+  const attachment = value.attachment
+  if (attachment !== null && typeof attachment === 'object') {
+    const hash = attachmentDigest(attachment.attachmentId)
+    if (hash !== null && missing.has(hash)) {
+      state.dropped += 1
+      const label = typeof attachment.name === 'string' && attachment.name !== ''
+        ? attachment.name
+        : (typeof attachment.mediaType === 'string' ? attachment.mediaType : '附件')
+      return { type: 'text', text: `[附件不可用：${label}（sha256:${hash.slice(0, 12)}…）]` }
+    }
+  }
+  const next = {}
+  for (const [key, item] of Object.entries(value)) next[key] = scrubMissingAttachments(item, missing, state)
+  return next
+}
+
+/**
+ * Rewrite every frame that references an unavailable attachment.
+ *
+ * @param {Buffer} buffer stored log bytes.
+ * @param {Set<string>} missing digests to degrade.
+ * @returns {{ data: Buffer, dropped: number, frames: number, changed: boolean, aborted: boolean }} rewrite result.
+ */
+function rewriteLogDroppingAttachments(buffer, missing) {
+  if (!Buffer.isBuffer(buffer) || buffer.length === 0 || missing.size === 0) {
+    return { data: buffer, dropped: 0, frames: 0, changed: false, aborted: false }
+  }
+  const frames = []
+  const state = { dropped: 0 }
+  let offset = 0
+  let changed = false
+  let touched = 0
+  while (offset < buffer.length) {
+    let length = 0
+    try {
+      length = firstZstdFrameLength(buffer.subarray(offset))
+    } catch {
+      return { data: buffer, dropped: 0, frames: 0, changed: false, aborted: true }
+    }
+    if (length <= 0 || offset + length > buffer.length) {
+      return { data: buffer, dropped: 0, frames: 0, changed: false, aborted: true }
+    }
+    const frameBytes = buffer.subarray(offset, offset + length)
+    let text = null
+    try {
+      text = zstdDecompressSync(frameBytes).toString('utf8')
+    } catch {
+      return { data: buffer, dropped: 0, frames: 0, changed: false, aborted: true }
+    }
+    offset += length
+    if (text.indexOf('attachmentId') < 0) {
+      frames.push(frameBytes)
+      continue
+    }
+    const lines = text.split('\n')
+    const nextLines = []
+    let frameChanged = false
+    for (const line of lines) {
+      if (line.indexOf('attachmentId') < 0) {
+        nextLines.push(line)
+        continue
+      }
+      let event = null
+      try {
+        event = JSON.parse(line)
+      } catch {
+        nextLines.push(line)
+        continue
+      }
+      const before = state.dropped
+      const scrubbed = scrubMissingAttachments(event, missing, state)
+      if (state.dropped === before) {
+        nextLines.push(line)
+        continue
+      }
+      nextLines.push(JSON.stringify(scrubbed))
+      frameChanged = true
+    }
+    if (!frameChanged) {
+      frames.push(frameBytes)
+      continue
+    }
+    frames.push(zstdCompressSync(Buffer.from(nextLines.join('\n'), 'utf8')))
+    changed = true
+    touched += 1
+  }
+  if (!changed) return { data: buffer, dropped: 0, frames: 0, changed: false, aborted: false }
+  return { data: Buffer.concat(frames), dropped: state.dropped, frames: touched, changed: true, aborted: false }
+}
+
 /**
  * Rewrite the recorded cwd in every stored log of one session.
  *
@@ -2520,6 +2976,17 @@ async function inspectImport(ctx, rawPath) {
     warnings.push(`${adoptable} 个会话在本地已存在且处于归档状态：导入会取消归档，并尽量归入所选目标工作区`)
   }
 
+  // What the packaged history needs versus what the package and this store can
+  // supply. A package without attachment objects still imports, but its images
+  // are unusable, so the number is reported before anything is written.
+  const attachmentAnalysis = analyzePackageAttachments(bySession, attachments)
+  if (attachmentAnalysis.missing > 0) {
+    warnings.push(
+      `${attachmentAnalysis.missing} 个附件在本机与包内都缺失：导入时这些引用会降级为文字占位`
+        + `（约 ${(attachmentAnalysis.missingBytes / 1048576).toFixed(2)} MB）`,
+    )
+  }
+
   return {
     path: pkg.zipPath,
     fileName: pkg.fileName,
@@ -2532,6 +2999,19 @@ async function inspectImport(ctx, rawPath) {
     localWorkspaces,
     unknownEntries: unknown.slice(0, 20),
     warnings,
+    attachments: {
+      needed: attachmentAnalysis.needed,
+      packaged: attachmentAnalysis.packaged,
+      local: attachmentAnalysis.local,
+      missing: attachmentAnalysis.missing,
+      missingBytes: attachmentAnalysis.missingBytes,
+      missingRefs: attachmentAnalysis.missingRefs.slice(0, 50).map((ref) => ({
+        attachmentId: `sha256:${ref.hash}`,
+        name: ref.name,
+        mediaType: ref.mediaType,
+        bytes: ref.bytes,
+      })),
+    },
     counts: {
       sessions: sessions.length,
       conflicts,
@@ -2671,6 +3151,27 @@ async function importPackage(ctx, rawPath, rawMapping, options = {}) {
   const pkg = loadImportPackage(rawPath)
   const { manifest, entries } = pkg
   const { bySession, attachments, byWorkspace } = indexPackageEntries(entries)
+  // Attachment objects are written before any session, because availability has
+  // to be re-read from disk: a restore that failed halfway would otherwise be
+  // reported as "provided" and leave an imported history that cannot run a turn.
+  // Whatever is still unresolvable afterwards is degraded per event, and the
+  // rest of the history stays byte-identical.
+  const degradeMissing = options.degradeMissingAttachments !== false
+  const attachmentRefs = collectPackageAttachmentRefs(bySession)
+  const restoredAttachments = restorePackageAttachments(attachments, attachmentRefs)
+  const missingAttachmentHashes = new Set()
+  for (const ref of attachmentRefs.values()) {
+    if (!isAttachmentReadable(ref)) missingAttachmentHashes.add(ref.hash)
+  }
+  const importWarnings = []
+  if (restoredAttachments.failed > 0) {
+    importWarnings.push(
+      `${restoredAttachments.failed} 个附件对象写回失败：对应引用按缺失处理`
+        + `${degradeMissing ? '，已降级为文字占位' : '，会话可能仍无法继续对话'}`,
+    )
+  }
+  let degradedRefs = 0
+  let degradedFiles = 0
   const mapping = rawMapping && typeof rawMapping === 'object' && !Array.isArray(rawMapping)
     ? rawMapping
     : {}
@@ -2796,7 +3297,19 @@ async function importPackage(ctx, rawPath, rawMapping, options = {}) {
         const target = resolve(join(sessionDir, ...file.segments))
         if (!target.startsWith(rootResolved + sep)) throw new Error('包内文件路径越界')
         mkdirSync(dirname(target), { recursive: true })
-        writeFileSync(target, file.data)
+        let data = file.data
+        if (degradeMissing && missingAttachmentHashes.size > 0) {
+          const leaf = file.segments[file.segments.length - 1] ?? ''
+          if (leaf.endsWith('.jsonl.zstd')) {
+            const outcome = rewriteLogDroppingAttachments(data, missingAttachmentHashes)
+            if (outcome.changed) {
+              data = outcome.data
+              degradedRefs += outcome.dropped
+              degradedFiles += 1
+            }
+          }
+        }
+        writeFileSync(target, data)
       }
       if (rewrite) {
         const rewriteOutcome = rewriteSessionCwdEverywhere(sessionDir, targetCwd)
@@ -2853,11 +3366,9 @@ async function importPackage(ctx, rawPath, rawMapping, options = {}) {
     }
   }
 
-  // Attachment objects are content addressed, so restoring the original bytes
-  // makes the session history resolve them again without touching the log. They
-  // are restored even when every session was skipped: the local copy may already
-  // be missing its attachments.
-  const restoredAttachments = restorePackageAttachments(attachments)
+  // Attachment objects were already written above, before the first session, so
+  // the availability set used for degradation reflects the real store.
+
   // Workspace files go into the mapped local workspace directory. The conflict
   // policy comes from the import dialog; `newer` compares against the packaged
   // modification times recorded in the manifest.
@@ -2884,7 +3395,9 @@ async function importPackage(ctx, rawPath, rawMapping, options = {}) {
     'import',
     'end',
     `imported=${imported} adopted=${adopted} skipped=${skipped} failed=${failed} `
-      + `attachments=${restoredAttachments.restored} workspaceFiles=${restoredWorkspaceFiles.restored} `
+      + `attachments=${restoredAttachments.restored} missing=${missingAttachmentHashes.size} `
+      + `degraded=${degradedRefs}/${degradedFiles} `
+      + `workspaceFiles=${restoredWorkspaceFiles.restored} `
       + `overwritten=${restoredWorkspaceFiles.overwritten} conflictMode=${conflictMode}`,
   )
   return {
@@ -2893,7 +3406,16 @@ async function importPackage(ctx, rawPath, rawMapping, options = {}) {
     adopted,
     skipped,
     failed,
-    attachments: restoredAttachments,
+    // `restored/skipped/failed` describe the object write; `needed/missing` and
+    // `degraded` describe the history that was fixed up around those objects.
+    attachments: {
+      ...restoredAttachments,
+      needed: attachmentRefs.size,
+      missing: missingAttachmentHashes.size,
+      degraded: degradedRefs,
+      degradedFiles,
+    },
+    warnings: importWarnings,
     workspaceFiles: restoredWorkspaceFiles,
     fileName: pkg.fileName,
   }
@@ -2930,33 +3452,56 @@ function sameFileContent(filePath, data) {
  * @param {Array<{ segments: string[], data: Buffer }>} entries attachment members.
  * @returns {{ restored: number, skipped: number, failed: number, bytes: number }} counters.
  */
-function restorePackageAttachments(entries) {
+function restorePackageAttachments(entries, refs = null) {
   const counters = { restored: 0, skipped: 0, failed: 0, bytes: 0 }
-  if (!Array.isArray(entries) || entries.length === 0) return counters
-  for (const entry of entries) {
-    const target = resolve(join(ATTACHMENTS_ROOT, ...entry.segments))
-    if (!isInsideRoot(pathKey(target), pathKey(ATTACHMENTS_ROOT))) {
-      counters.failed += 1
-      continue
-    }
-    try {
-      let existing = 0
-      try {
-        existing = statSync(target).size
-      } catch {
-        existing = -1
-      }
-      if (existing === entry.data.length
-        && (entry.data.length > ATTACHMENT_VERIFY_BYTES || sameFileContent(target, entry.data))) {
-        counters.skipped += 1
+  if (Array.isArray(entries) && entries.length > 0) {
+    for (const entry of entries) {
+      const target = resolve(join(ATTACHMENTS_ROOT, ...entry.segments))
+      if (!isInsideRoot(pathKey(target), pathKey(ATTACHMENTS_ROOT))) {
+        counters.failed += 1
         continue
       }
-      mkdirSync(dirname(target), { recursive: true })
-      writeFileSync(target, entry.data)
-      counters.restored += 1
-      counters.bytes += entry.data.length
-    } catch {
-      counters.failed += 1
+      try {
+        let existing = 0
+        try {
+          existing = statSync(target).size
+        } catch {
+          existing = -1
+        }
+        if (existing === entry.data.length
+          && (entry.data.length > ATTACHMENT_VERIFY_BYTES || sameFileContent(target, entry.data))) {
+          counters.skipped += 1
+          continue
+        }
+        mkdirSync(dirname(target), { recursive: true })
+        writeFileSync(target, entry.data)
+        counters.restored += 1
+        counters.bytes += entry.data.length
+      } catch {
+        counters.failed += 1
+      }
+    }
+  }
+  // A package may carry only the canonical `file-objects` object, while the read
+  // path resolves the name-carrying `files/<shard>/<digest>/<name>` alias. Build
+  // that alias from the reference metadata so such a package stays readable.
+  if (refs instanceof Map) {
+    for (const ref of refs.values()) {
+      if (isAttachmentReadable(ref)) continue
+      const shard = ref.hash.slice(0, 2)
+      const objectPath = join(ATTACHMENT_FILE_DIR, shard, ref.hash)
+      if (!existsSync(objectPath)) continue
+      const name = typeof ref.name === 'string' && ref.name !== '' ? ref.name : 'file'
+      const aliasPath = join(ATTACHMENT_ALIAS_DIR, shard, ref.hash, name)
+      try {
+        mkdirSync(dirname(aliasPath), { recursive: true })
+        const size = statSync(objectPath).size
+        copyFileSync(objectPath, aliasPath)
+        counters.restored += 1
+        counters.bytes += size
+      } catch {
+        counters.failed += 1
+      }
     }
   }
   return counters
@@ -4097,6 +4642,34 @@ async function exportSessions(ctx, rawIds, signal, options = {}) {
   }
   if (sessions.length === 0) throw new Error('没有可写入导出包的会话文件')
 
+  // Chat attachments ride along as the store's own objects: a session log keeps
+  // only their hashes, so restoring the bytes is the whole migration. Exporters
+  // that packed `workspaces/` alone produced packages whose imported sessions
+  // could not run a single turn once an image object was missing.
+  const attachmentRefs = new Map()
+  if (options.includeAttachments !== false) {
+    for (const entry of entries) {
+      if (!entry.name.endsWith('.jsonl.zstd')) continue
+      collectLogAttachments(entry.data, attachmentRefs)
+    }
+  }
+  const attachmentPack = options.includeAttachments !== false
+    ? buildAttachmentMembers(attachmentRefs, EXPORT_MAX_BYTES - totalBytes)
+    : { members: [], packed: [], missing: [], skipped: [], bytes: 0 }
+  for (const member of attachmentPack.members) {
+    entries.push(member)
+    totalBytes += member.data.length
+  }
+  if (options.includeAttachments !== false) {
+    trace(
+      'export',
+      'attachments',
+      `refs=${attachmentRefs.size} packed=${attachmentPack.packed.length} `
+        + `missing=${attachmentPack.missing.length} skipped=${attachmentPack.skipped.length} `
+        + `bytes=${attachmentPack.bytes}`,
+    )
+  }
+
   const workspaces = []
   for (const workspaceId of [...new Set(sessions.flatMap((session) => session.workspaceIds))]) {
     const item = workspaceById.get(workspaceId)
@@ -4168,6 +4741,24 @@ async function exportSessions(ctx, rawIds, signal, options = {}) {
     // the target sessions root and reads workspace membership from here.
     workspaces,
     sessions,
+    // Content-addressed attachment objects carried below `attachments/`. The
+    // listing names what the bytes are so a receiver can report them instead of
+    // silently importing a history that cannot render its own images.
+    ...(attachmentPack.packed.length > 0 || attachmentPack.missing.length > 0
+      ? {
+          attachments: attachmentPack.packed,
+          ...(attachmentPack.missing.length > 0
+            ? {
+                attachmentsMissing: attachmentPack.missing.map((ref) => ({
+                  attachmentId: `sha256:${ref.hash}`,
+                  name: ref.name,
+                  mediaType: ref.mediaType,
+                  bytes: ref.bytes,
+                })),
+              }
+            : {}),
+        }
+      : {}),
     // Present only when the exporter asked for the workspace file backup; the
     // listing lets the importer report conflicts before writing anything.
     ...(workspaceFiles.length > 0 ? { workspaceFiles } : {}),
@@ -4213,6 +4804,10 @@ async function exportSessions(ctx, rawIds, signal, options = {}) {
     workspaceFileBytes: workspaceFiles.reduce((sum, item) => sum + item.bytes, 0),
     workspaceFilesSkipped,
     workspaceLinksSkipped,
+    attachmentCount: attachmentPack.packed.length,
+    attachmentBytes: attachmentPack.bytes,
+    attachmentMissing: attachmentPack.missing.length,
+    attachmentSkipped: attachmentPack.skipped.length,
     bytes: archive.length,
     missing: ids.filter((id) => !byId.has(id)).length,
     // The Host accepts a bounded batch; report it instead of letting the Client
@@ -4601,6 +5196,9 @@ export function apply(ctx) {
             // Host actually applied.
             excludePaths: backup.excludePaths,
             workspaces,
+            // Chat attachments travel with the package; report their number and
+            // size so the dialog can offer the switch before the export runs.
+            attachments: previewSessionAttachments(normalized.ids),
           })
         },
       },
@@ -4613,6 +5211,9 @@ export function apply(ctx) {
             targetDir: typeof body.targetDir === 'string' ? body.targetDir : undefined,
             createDir: body.createDir === true,
             includeWorkspaceFiles: body.includeWorkspaceFiles === true,
+            // Defaults to on: a package without its attachment objects produces
+            // a session that cannot run a turn on the receiving machine.
+            includeAttachments: body.includeAttachments !== false,
             excludePaths: body.excludePaths,
           })
           return jsonResponse({ ok: true, ...result })
@@ -4643,6 +5244,9 @@ export function apply(ctx) {
           const body = await readJsonBody(request)
           const outcome = await importPackage(ctx, body.path, body.mapping, {
             workspaceConflict: body.workspaceConflict,
+            // Defaults to on: an unusable reference makes the whole imported
+            // session fail every turn instead of just one message.
+            degradeMissingAttachments: body.degradeMissingAttachments !== false,
           })
           return jsonResponse({ ok: true, ...outcome })
         },

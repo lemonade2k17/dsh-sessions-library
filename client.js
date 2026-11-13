@@ -1687,6 +1687,9 @@ window.__ModuleLoader__.load({
             mapping: {},
             // Workspace-file conflict policy: skip | overwrite | newer.
             workspaceConflict: 'skip',
+            // Missing chat attachments are degraded to a text note by default:
+            // an unresolvable reference fails every later turn of the session.
+            degradeMissingAttachments: true,
             outcome: null,
             error: null,
           })
@@ -1803,7 +1806,12 @@ window.__ModuleLoader__.load({
             : 'skip'
           setImportDialog((current) => (current ? { ...current, phase: 'importing', error: null } : current))
           try {
-            const payload = await postJson(IMPORT_RUN_PATH, { path: zipPath, mapping, workspaceConflict }, {
+            const payload = await postJson(IMPORT_RUN_PATH, {
+              path: zipPath,
+              mapping,
+              workspaceConflict,
+              degradeMissingAttachments: importDialog.degradeMissingAttachments !== false,
+            }, {
               timeoutMs: LONG_REQUEST_TIMEOUT_MS,
             })
             setImportDialog((current) => (current
@@ -1820,6 +1828,7 @@ window.__ModuleLoader__.load({
                     // hide every workspace-file and attachment line.
                     workspaceFiles: payload.workspaceFiles || null,
                     attachments: payload.attachments || null,
+                    warnings: Array.isArray(payload.warnings) ? payload.warnings : [],
                   },
                 }
               : current))
@@ -1855,6 +1864,10 @@ window.__ModuleLoader__.load({
             // actually found files to include.
             workspaceInfo: null,
             includeWorkspaceFiles: true,
+            // Chat attachments counted by the same preflight; the switch only
+            // shows once the count is known.
+            attachmentInfo: null,
+            includeAttachments: true,
             // One-off selection: it lives only in this dialog instance, so every
             // new export starts with nothing excluded by hand.
             excludePaths: [],
@@ -1891,11 +1904,25 @@ window.__ModuleLoader__.load({
               : [],
           }
           if (token !== exportPreflightToken.current) return
+          const attachmentResult = workspaceResult && workspaceResult.attachments
+            && typeof workspaceResult.attachments === 'object'
+            ? workspaceResult.attachments
+            : null
+          const attachmentInfo = {
+            total: attachmentResult ? Number(attachmentResult.total) || 0 : 0,
+            available: attachmentResult ? Number(attachmentResult.available) || 0 : 0,
+            bytes: attachmentResult ? Number(attachmentResult.bytes) || 0 : 0,
+            missing: attachmentResult ? Number(attachmentResult.missing) || 0 : 0,
+          }
           setExportDialog((current) => (current && current.phase === 'choose'
             ? {
                 ...current,
                 workspaceInfo,
                 includeWorkspaceFiles: workspaceInfo.count > 0,
+                attachmentInfo,
+                // Default to on: a package without its attachment objects would
+                // hand the receiver a history that cannot run a single turn.
+                includeAttachments: attachmentInfo.total > 0,
               }
             : current))
         }
@@ -2085,6 +2112,9 @@ window.__ModuleLoader__.load({
             && exportDialog.includeWorkspaceFiles === true
             && previewInfo !== null
             && (Number(previewInfo.count) || 0) > 0
+          // The Host defaults the attachment switch to on, so only an explicit
+          // opt-out is transmitted.
+          const includeAttachments = exportDialog === null || exportDialog.includeAttachments !== false
           setExportDialog((current) => ({ ...(current || {}), phase: 'busy', error: null }))
           try {
             const payload = await postJson(EXPORT_PATH, {
@@ -2092,6 +2122,7 @@ window.__ModuleLoader__.load({
               ...(targetDir !== '' ? { targetDir } : {}),
               ...(createDir === true ? { createDir: true } : {}),
               ...(includeWorkspaceFiles ? { includeWorkspaceFiles: true } : {}),
+              ...(includeAttachments ? {} : { includeAttachments: false }),
               ...(exportDialog !== null ? {
                 excludePaths: Array.isArray(exportDialog.excludePaths) ? exportDialog.excludePaths : [],
               } : {}),
@@ -2107,6 +2138,10 @@ window.__ModuleLoader__.load({
               workspaceFileBytes: Number(payload.workspaceFileBytes) || 0,
               workspaceFilesSkipped: Number(payload.workspaceFilesSkipped) || 0,
               workspaceLinksSkipped: Number(payload.workspaceLinksSkipped) || 0,
+              attachmentCount: Number(payload.attachmentCount) || 0,
+              attachmentBytes: Number(payload.attachmentBytes) || 0,
+              attachmentMissing: Number(payload.attachmentMissing) || 0,
+              attachmentSkipped: Number(payload.attachmentSkipped) || 0,
               bytes: Number(payload.bytes) || 0,
               limit: readBatchLimit(payload.limit),
               error: null,
@@ -3631,6 +3666,46 @@ window.__ModuleLoader__.load({
                           ? ` · 工作区附件 ${report.counts.workspaceFiles} 个（${((Number(report.counts.workspaceFileBytes) || 0) / 1048576).toFixed(2)} MB）`
                           : ''}`,
                     ),
+                    report.attachments && Number(report.attachments.needed) > 0
+                      ? h(
+                          'p',
+                          { style: dialogHintStyle },
+                          `会话附件：需要 ${report.attachments.needed} 个`
+                            + ` · 包内提供 ${Number(report.attachments.packaged) || 0} 个`
+                            + ` · 本机已有 ${Number(report.attachments.local) || 0} 个`
+                            + `${Number(report.attachments.missing) > 0
+                              ? ` · 缺失 ${report.attachments.missing} 个（${((Number(report.attachments.missingBytes) || 0) / 1048576).toFixed(2)} MB）`
+                              : ''}`,
+                        )
+                      : null,
+                    report.attachments && Number(report.attachments.missing) > 0
+                      ? h(
+                          'div',
+                          { style: importConflictBlockStyle },
+                          h('div', { style: importSectionTitleStyle }, '缺失附件处理'),
+                          h(
+                            'div',
+                            { style: exportOptionRowStyle },
+                            renderCheckbox(
+                              importDialog.degradeMissingAttachments === false ? 'none' : 'all',
+                              () => setImportDialog((current) => (current
+                                ? {
+                                    ...current,
+                                    degradeMissingAttachments: current.degradeMissingAttachments === false,
+                                  }
+                                : current)),
+                              '导入时把这些引用降级为文字占位（推荐）',
+                            ),
+                            h(
+                              'span',
+                              { style: exportOptionLabelStyle },
+                              importDialog.degradeMissingAttachments === false
+                                ? '关闭后引用原样保留：只要历史里还有这些附件，该会话之后每一轮都会失败（ATTACHMENT_NOT_FOUND）。'
+                                : `缺失的 ${report.attachments.missing} 个附件会被替换为“[附件不可用：…]”文字，该会话可以继续对话。`,
+                            ),
+                          ),
+                        )
+                      : null,
                     ...(report.warnings || []).map((warning, index) => h(
                       'div',
                       { key: `warning-${index}`, className: 'sl-note', 'data-tone': 'caution' },
@@ -3791,6 +3866,26 @@ window.__ModuleLoader__.load({
                             + '；未选择目标工作区的文件不会被写入。',
                         )
                       : null,
+                    outcome.attachments
+                      && Number(outcome.attachments.restored) + Number(outcome.attachments.skipped)
+                        + Number(outcome.attachments.failed) > 0
+                      ? h(
+                          'p',
+                          { style: dialogHintStyle },
+                          `会话附件：写回 ${Number(outcome.attachments.restored) || 0} 个`
+                            + `${Number(outcome.attachments.skipped) > 0 ? `，已存在跳过 ${outcome.attachments.skipped} 个` : ''}`
+                            + `${Number(outcome.attachments.failed) > 0 ? `，失败 ${outcome.attachments.failed} 个` : ''}`
+                            + `${Number(outcome.attachments.degraded) > 0
+                              ? `；${outcome.attachments.degraded} 处缺失附件已降级为文字占位（涉及 ${Number(outcome.attachments.degradedFiles) || 0} 个日志文件）`
+                              : ''}`
+                            + '。',
+                        )
+                      : null,
+                    ...(Array.isArray(outcome.warnings) ? outcome.warnings : []).map((warning, index) => h(
+                      'div',
+                      { key: `import-warning-${index}`, className: 'sl-note', 'data-tone': 'caution' },
+                      warning,
+                    )),
                     outcome.results.some((result) => result.rewritten === true)
                       ? h(
                           'p',
@@ -3853,6 +3948,18 @@ window.__ModuleLoader__.load({
               : `包含工作区附件（工作区目录下的文件）：${workspaceFileCount} 个 · ${((Number(workspaceInfo.bytes) || 0) / 1048576).toFixed(2)} MB`
                 + `${workspaceInfo.truncated ? '（已达上限，部分文件未包含）' : ''}`
                 + `${Number(workspaceInfo.links) > 0 ? ` · 跳过 ${Number(workspaceInfo.links)} 个链接` : ''}`
+          // Chat attachments counted by the same preflight request.
+          const attachmentInfo = exportDialog.attachmentInfo || null
+          const attachmentTotal = attachmentInfo ? Number(attachmentInfo.total) || 0 : 0
+          const attachmentAvailable = attachmentInfo ? Number(attachmentInfo.available) || 0 : 0
+          const attachmentMissing = attachmentInfo ? Number(attachmentInfo.missing) || 0 : 0
+          const includeAttachments = exportDialog.includeAttachments === true && attachmentTotal > 0
+          const attachmentLabel = attachmentInfo === null
+            ? '正在统计会话附件…'
+            : attachmentTotal === 0
+              ? '所选会话没有引用聊天附件'
+              : `包含会话附件（对话里的图片与文件）：${attachmentAvailable} 个 · ${((Number(attachmentInfo.bytes) || 0) / 1048576).toFixed(2)} MB`
+                + `${attachmentMissing > 0 ? ` · 本机缺失 ${attachmentMissing} 个（无法打包）` : ''}`
           // Paths picked in the exclusion browser, and the workspace roots the
           // browser may start from.
           const exportExcludePaths = Array.isArray(exportDialog.excludePaths) ? exportDialog.excludePaths : []
@@ -3962,6 +4069,21 @@ window.__ModuleLoader__.load({
                     ),
                     h(
                       'div',
+                      { style: exportOptionRowStyle },
+                      renderCheckbox(
+                        includeAttachments ? 'all' : 'none',
+                        () => {
+                          if (attachmentTotal === 0) return
+                          setExportDialog((current) => (current
+                            ? { ...current, includeAttachments: current.includeAttachments !== true }
+                            : current))
+                        },
+                        '包含会话附件',
+                      ),
+                      h('span', { style: exportOptionLabelStyle }, attachmentLabel),
+                    ),
+                    h(
+                      'div',
                       { style: exportExcludeBlockStyle },
                       h(
                         'div',
@@ -4053,6 +4175,27 @@ window.__ModuleLoader__.load({
                           ? `工作区附件 ${exportDialog.workspaceFileCount} 个（${((Number(exportDialog.workspaceFileBytes) || 0) / 1048576).toFixed(2)} MB）也已打包。`
                           : ''),
                     ),
+                    Number(exportDialog.attachmentCount) > 0
+                      ? h(
+                          'p',
+                          { style: dialogHintStyle },
+                          `会话附件 ${exportDialog.attachmentCount} 个（${((Number(exportDialog.attachmentBytes) || 0) / 1048576).toFixed(2)} MB）已打包，对方导入时会自动写回本机附件库。`,
+                        )
+                      : null,
+                    Number(exportDialog.attachmentMissing) > 0
+                      ? h(
+                          'div',
+                          { className: 'sl-note', 'data-tone': 'caution' },
+                          `有 ${exportDialog.attachmentMissing} 个附件在本机找不到对象，未能打包；对方导入时这些引用会降级为文字占位。`,
+                        )
+                      : null,
+                    Number(exportDialog.attachmentSkipped) > 0
+                      ? h(
+                          'div',
+                          { className: 'sl-note', 'data-tone': 'caution' },
+                          `有 ${exportDialog.attachmentSkipped} 个附件因整包体积上限未能打包（本机有字节）：对方导入时这些引用会降级为文字占位；分批导出可完整带上。`,
+                        )
+                      : null,
                     Number(exportDialog.workspaceLinksSkipped) > 0
                       ? h(
                           'p',
@@ -4075,7 +4218,7 @@ window.__ModuleLoader__.load({
                           `本次只导出了前 ${batchLimit.accepted} 个会话（单次上限 ${batchLimit.max} 个）；其余 ${batchLimit.requested - batchLimit.accepted} 个未包含在这个包里，请再导一次。`,
                         )
                       : null,
-                    h('p', { style: dialogHintStyle }, '会话日志按原存储格式逐字节复制；对方可用本插件的「导入会话」还原，工作区附件会写回所选工作区目录。'),
+                    h('p', { style: dialogHintStyle }, '会话日志按原存储格式逐字节复制；对方可用本插件的「导入会话」还原，会话附件会写回本机附件库，工作区附件会写回所选工作区目录。'),
                   )
                 : null,
               actions.length > 0
