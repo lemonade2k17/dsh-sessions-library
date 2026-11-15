@@ -31,6 +31,7 @@ import {
   statSync,
   writeFileSync,
 } from 'node:fs'
+import { createHash } from 'node:crypto'
 import { homedir } from 'node:os'
 import { basename, dirname, join, resolve, sep } from 'node:path'
 import { inflateRawSync, zstdCompressSync, zstdDecompressSync } from 'node:zlib'
@@ -78,6 +79,9 @@ const DELETE_PATH = '/api/sessions-library/delete'
 const TRASH_LIST_PATH = '/api/sessions-library/trash-list'
 const TRASH_RESTORE_PATH = '/api/sessions-library/trash-restore'
 const TRASH_PURGE_PATH = '/api/sessions-library/trash-purge'
+// Read-only preview of what a permanent delete would clean up; the Client shows
+// it inside the purge confirmation dialog before anything is destroyed.
+const PURGE_PREFLIGHT_PATH = '/api/sessions-library/purge-preflight'
 const LOGS_PATH = '/api/sessions-library/logs'
 const LOGS_CLEAR_PATH = '/api/sessions-library/logs-clear'
 const LOGS_DELETE_PATH = '/api/sessions-library/logs-delete'
@@ -4400,6 +4404,277 @@ function appendAudit(record) {
   }
 }
 
+// --- Attachment cleanup on permanent delete --------------------------------
+//
+// A permanently deleted session takes its attachments with it, but only those no
+// other session still references: an attachment is addressed by content, so two
+// sessions can share one object and deleting a shared object would break the
+// survivor on its very next turn. Everything here is conservative — a failed or
+// unreadable scan keeps the objects instead of deleting them.
+
+/**
+ * Collect the attachments one stored session directory references.
+ *
+ * @param {string} sessionDir absolute session directory.
+ * @returns {Map<string, object>} references keyed by digest.
+ */
+function collectSessionAttachmentRefs(sessionDir) {
+  const refs = new Map()
+  for (const logPath of listSessionLogFiles(sessionDir)) {
+    let data = null
+    try {
+      data = readFileSync(logPath)
+    } catch {
+      data = null
+    }
+    if (data !== null) collectLogAttachments(data, refs)
+  }
+  return refs
+}
+
+/**
+ * Index which remaining session references each attachment.
+ *
+ * Scans the live store and the recycle bin: a trashed session can be restored,
+ * so it still counts as an owner. Roughly 2 s for 120 logs / 60 MB.
+ *
+ * @param {Set<string>} excludedIds session ids that are being deleted.
+ * @returns {Map<string, Set<string>>} owner session ids per digest.
+ */
+function buildAttachmentOwners(excludedIds) {
+  const owners = new Map()
+  const remember = (hash, id) => {
+    if (!owners.has(hash)) owners.set(hash, new Set())
+    owners.get(hash).add(id)
+  }
+  let projects = []
+  try {
+    projects = readdirSync(SESSIONS_ROOT, { withFileTypes: true })
+  } catch {
+    projects = []
+  }
+  for (const project of projects) {
+    if (!project.isDirectory()) continue
+    let sessions = []
+    try {
+      sessions = readdirSync(join(SESSIONS_ROOT, project.name), { withFileTypes: true })
+    } catch {
+      continue
+    }
+    for (const session of sessions) {
+      if (!session.isDirectory()) continue
+      const id = session.name
+      if (excludedIds.has(id)) continue
+      for (const hash of collectSessionAttachmentRefs(join(SESSIONS_ROOT, project.name, id)).keys()) {
+        remember(hash, id)
+      }
+    }
+  }
+  for (const entry of readTrashEntries()) {
+    const id = typeof entry.sessionId === 'string' && entry.sessionId !== ''
+      ? entry.sessionId
+      : entry.entryName
+    if (excludedIds.has(id)) continue
+    const sessionDir = join(TRASH_ROOT, entry.entryName, 'session')
+    if (!existsSync(sessionDir)) continue
+    for (const hash of collectSessionAttachmentRefs(sessionDir).keys()) remember(hash, id)
+  }
+  return owners
+}
+
+/**
+ * Delete one content-addressed attachment from every path that can hold it.
+ *
+ * The digest is verified against the bytes before a file leaves the disk, so a
+ * wrong shard, a foreign file or a damaged object is kept rather than silently
+ * destroyed.
+ *
+ * @param {string} hash attachment digest.
+ * @returns {{ deleted: number, bytes: number, failed: number }} deletion counters.
+ */
+function deleteAttachmentObject(hash) {
+  const shard = hash.slice(0, 2)
+  const counters = { deleted: 0, bytes: 0, failed: 0 }
+  const verified = (filePath) => {
+    let size = 0
+    try {
+      size = statSync(filePath).size
+    } catch {
+      return false
+    }
+    if (size > ATTACHMENT_VERIFY_BYTES) return true
+    try {
+      return createHash('sha256').update(readFileSync(filePath)).digest('hex') === hash
+    } catch {
+      return false
+    }
+  }
+  const targets = [
+    join(ATTACHMENT_IMAGE_DIR, shard, hash),
+    join(ATTACHMENT_FILE_DIR, shard, hash),
+  ]
+  // The canonical file object and the alias are hard links to the same bytes on
+  // this filesystem, so only one of them may contribute to the byte total.
+  let countedBytes = false
+  for (const target of targets) {
+    if (!existsSync(target)) continue
+    if (!verified(target)) {
+      counters.failed += 1
+      continue
+    }
+    try {
+      const size = statSync(target).size
+      rmSync(target, { force: true })
+      counters.deleted += 1
+      if (!countedBytes) {
+        counters.bytes += size
+        countedBytes = true
+      }
+    } catch {
+      counters.failed += 1
+    }
+  }
+  // The name-carrying alias lives in a directory per digest; its entries are
+  // hard links (or copies) of the canonical object.
+  const aliasDir = join(ATTACHMENT_ALIAS_DIR, shard, hash)
+  if (existsSync(aliasDir)) {
+    const resolved = resolve(aliasDir)
+    if (!isInsideRoot(pathKey(resolved), pathKey(ATTACHMENT_ALIAS_DIR))) {
+      counters.failed += 1
+      return counters
+    }
+    let aliasBytes = 0
+    let aliasOk = true
+    try {
+      for (const child of readdirSync(aliasDir, { withFileTypes: true })) {
+        if (!child.isFile()) continue
+        const childPath = join(aliasDir, child.name)
+        if (!verified(childPath)) {
+          aliasOk = false
+          break
+        }
+        aliasBytes += statSync(childPath).size
+      }
+    } catch {
+      aliasOk = false
+    }
+    if (!aliasOk) {
+      counters.failed += 1
+      return counters
+    }
+    try {
+      rmSync(aliasDir, { recursive: true, force: true })
+      counters.deleted += 1
+      if (!countedBytes) counters.bytes += aliasBytes
+    } catch {
+      counters.failed += 1
+    }
+  }
+  return counters
+}
+
+/**
+ * Decide which attachments a permanent delete may remove.
+ *
+ * @param {Array<{ sessionId: string, refs: Map<string, object> }>} sessions sessions being deleted.
+ * @returns {{ deletable: object[], shared: object[], referenced: number }} plan.
+ */
+function planAttachmentCleanup(sessions) {
+  const merged = new Map()
+  const ids = new Set()
+  for (const session of sessions) {
+    if (typeof session.sessionId === 'string' && session.sessionId !== '') ids.add(session.sessionId)
+    for (const [hash, meta] of session.refs) if (!merged.has(hash)) merged.set(hash, meta)
+  }
+  if (merged.size === 0) return { deletable: [], shared: [], referenced: 0 }
+  const owners = buildAttachmentOwners(ids)
+  const deletable = []
+  const shared = []
+  for (const [hash, meta] of merged) {
+    const others = owners.get(hash)
+    if (others !== undefined && others.size > 0) shared.push({ hash, meta, owners: [...others] })
+    else deletable.push({ hash, meta })
+  }
+  return { deletable, shared, referenced: merged.size }
+}
+
+/**
+ * Run one cleanup plan; shared attachments are reported, never removed.
+ *
+ * @param {{ deletable: object[], shared: object[], referenced: number }} plan cleanup plan.
+ * @returns {{ referenced: number, deleted: number, bytes: number, failed: number, keptShared: number, keptSharedBytes: number, missing: number }} counters.
+ */
+function runAttachmentCleanup(plan) {
+  const counters = {
+    referenced: plan.referenced,
+    deleted: 0,
+    bytes: 0,
+    failed: 0,
+    keptShared: 0,
+    keptSharedBytes: 0,
+    missing: 0,
+  }
+  for (const item of plan.deletable) {
+    const outcome = deleteAttachmentObject(item.hash)
+    counters.deleted += outcome.deleted
+    counters.bytes += outcome.bytes
+    counters.failed += outcome.failed
+    if (outcome.deleted === 0 && outcome.failed === 0) counters.missing += 1
+  }
+  for (const item of plan.shared) {
+    counters.keptShared += 1
+    counters.keptSharedBytes += Number(item.meta.bytes) || 0
+  }
+  return counters
+}
+
+/**
+ * Read-only preview of the attachment side of a permanent delete.
+ *
+ * @param {any} rawNames requested recycle-bin entry names.
+ * @returns {object} per-entry and total counters plus the shared references.
+ */
+function buildPurgeAttachmentReport(rawNames) {
+  const entries = readTrashEntries()
+  const byName = new Map(entries.map((entry) => [entry.entryName, entry]))
+  const requested = (Array.isArray(rawNames) ? rawNames : [])
+    .filter((name) => typeof name === 'string' && byName.has(name))
+  const sessions = requested.map((name) => {
+    const entry = byName.get(name)
+    const sessionDir = join(TRASH_ROOT, entry.entryName, 'session')
+    const refs = existsSync(sessionDir) ? collectSessionAttachmentRefs(sessionDir) : new Map()
+    return {
+      entryName: entry.entryName,
+      sessionId: typeof entry.sessionId === 'string' ? entry.sessionId : '',
+      refs,
+    }
+  })
+  const plan = planAttachmentCleanup(sessions)
+  const bytesOf = (items) => items.reduce((sum, item) => sum + (Number(item.meta.bytes) || 0), 0)
+  return {
+    totals: {
+      sessions: sessions.length,
+      referenced: plan.referenced,
+      deletable: plan.deletable.length,
+      deletableBytes: bytesOf(plan.deletable),
+      shared: plan.shared.length,
+      sharedBytes: bytesOf(plan.shared),
+    },
+    entries: sessions.map((session) => ({
+      entryName: session.entryName,
+      sessionId: session.sessionId,
+      refs: session.refs.size,
+    })),
+    sharedRefs: plan.shared.slice(0, 50).map((item) => ({
+      attachmentId: `sha256:${item.hash}`,
+      name: item.meta.name ?? null,
+      bytes: Number(item.meta.bytes) || 0,
+      owners: item.owners.slice(0, 10),
+      ownerCount: item.owners.length,
+    })),
+  }
+}
+
 /**
  * Permanently delete recycle-bin entries.
  *
@@ -4418,6 +4693,9 @@ async function purgeTrashEntries(rawNames) {
   const results = []
   const purged = []
   const queued = []
+  // References of every entry actually purged in this call, read before its
+  // directory is removed and used to plan the attachment cleanup afterwards.
+  const purgeSessions = []
 
   for (const rawName of Array.isArray(rawNames) ? rawNames : []) {
     if (typeof rawName === 'string' && rawName.startsWith('pending:')) {
@@ -4455,6 +4733,10 @@ async function purgeTrashEntries(rawNames) {
         results.push({ entryName: rawName, status: 'failed', reason: '条目路径非法' })
         continue
       }
+      // Read the references before the directory disappears: the owner index is
+      // built afterwards, so a concurrently appended log cannot hide an owner.
+      const sessionDir = join(entryDir, 'session')
+      const refs = existsSync(sessionDir) ? collectSessionAttachmentRefs(sessionDir) : new Map()
       rmSync(entryDir, { recursive: true, force: true })
       appendOperation({
         action: 'purge',
@@ -4464,6 +4746,10 @@ async function purgeTrashEntries(rawNames) {
       })
       results.push({ entryName: rawName, sessionId: entry.sessionId, status: 'purged', sizeBytes: entry.sizeBytes })
       purged.push(entry)
+      purgeSessions.push({
+        sessionId: typeof entry.sessionId === 'string' ? entry.sessionId : '',
+        refs,
+      })
     } catch (error) {
       results.push({ entryName: rawName, status: 'failed', reason: describeError(error) })
     }
@@ -4471,7 +4757,11 @@ async function purgeTrashEntries(rawNames) {
 
   if (pendingChanged) writePendingTrash(pending)
 
+  let attachments = null
   if (purged.length > 0) {
+    // Only attachments no other session (or restorable bin entry) references are
+    // removed; the shared ones stay and are reported back to the caller.
+    attachments = runAttachmentCleanup(planAttachmentCleanup(purgeSessions))
     appendAudit({
       at: new Date().toISOString(),
       action: 'purge',
@@ -4482,14 +4772,19 @@ async function purgeTrashEntries(rawNames) {
         role: entry.role,
         sizeBytes: entry.sizeBytes,
       })),
+      attachments,
     })
   }
   trace(
     'purge',
     'end',
-    `purged=${purged.length} queued=${queued.length} failed=${results.length - purged.length - queued.length}`,
+    `purged=${purged.length} queued=${queued.length} failed=${results.length - purged.length - queued.length} `
+      + (attachments === null
+        ? 'attachments=none'
+        : `attachments deleted=${attachments.deleted} keptShared=${attachments.keptShared} `
+          + `failed=${attachments.failed} bytes=${attachments.bytes}`),
   )
-  return results
+  return { results, attachments }
 }
 
 /**
@@ -4841,6 +5136,9 @@ async function flushPendingTrash(ctx) {
   // inside the loop is the only mutation.
   const workspaceList = listWorkspacesSafe(registry)
   const remaining = {}
+  // References of every session this flush destroys, read before its directory
+  // disappears and used for the shared-attachment check afterwards.
+  const purgeSessions = []
   for (const id of ids) {
     const record = items[id] && typeof items[id] === 'object' ? items[id] : {}
     try {
@@ -4852,6 +5150,7 @@ async function flushPendingTrash(ctx) {
       // A queued permanent delete destroys the log here instead of creating a
       // trash entry: no Agent is live yet, and the durable audit records it.
       if (record.purge === true) {
+        const refs = collectSessionAttachmentRefs(dir)
         const sizeBytes = dirSize(dir)
         rmSync(dir, { recursive: true, force: true })
         await detachFromWorkspaces(registry, id)
@@ -4888,6 +5187,7 @@ async function flushPendingTrash(ctx) {
           title: typeof record.title === 'string' ? record.title : null,
           role: typeof record.role === 'string' ? record.role : 'root',
         })
+        purgeSessions.push({ sessionId: id, refs })
         continue
       }
       const deletedAt = Date.now()
@@ -4958,6 +5258,22 @@ async function flushPendingTrash(ctx) {
       remaining[id] = record
       trace('trash', 'deferred-fail', `id=${id} ${describeError(error)}`)
     }
+  }
+  if (purgeSessions.length > 0) {
+    // Same rule as the interactive purge: shared attachments stay on disk.
+    const attachments = runAttachmentCleanup(planAttachmentCleanup(purgeSessions))
+    appendAudit({
+      at: new Date().toISOString(),
+      action: 'purge',
+      deferred: true,
+      attachments,
+    })
+    trace(
+      'trash',
+      'purge-attachments',
+      `deleted=${attachments.deleted} keptShared=${attachments.keptShared} `
+        + `failed=${attachments.failed} bytes=${attachments.bytes}`,
+    )
   }
   // Merge instead of replacing: a restore or a fresh delete can rewrite the
   // queue while this flush runs, and writing back only `remaining` would drop
@@ -5112,12 +5428,20 @@ export function apply(ctx) {
         },
       },
       {
+        path: PURGE_PREFLIGHT_PATH,
+        label: 'purge-preflight',
+        handler: async (request) => {
+          const body = await readJsonBody(request)
+          return jsonResponse({ ok: true, ...buildPurgeAttachmentReport(body.entryNames) })
+        },
+      },
+      {
         path: TRASH_PURGE_PATH,
         label: 'trash-purge',
         handler: async (request) => {
           const body = await readJsonBody(request)
-          const results = await purgeTrashEntries(body.entryNames)
-          return jsonResponse({ ok: true, results })
+          const outcome = await purgeTrashEntries(body.entryNames)
+          return jsonResponse({ ok: true, results: outcome.results, attachments: outcome.attachments })
         },
       },
       {

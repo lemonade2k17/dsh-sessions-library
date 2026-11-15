@@ -2461,13 +2461,42 @@ window.__ModuleLoader__.load({
 
         function openPurgeDialog() {
           if (selectedTrashEntries.length === 0) return
+          const families = selectedTrashFamilies
           setPurgeDialog({
             phase: 'confirm',
-            families: selectedTrashFamilies,
+            families,
             text: '',
             error: null,
             results: [],
+            // Attachment impact, filled by the read-only preflight below.
+            attachmentReport: null,
           })
+          const entryNames = families.flatMap((family) => family.entries.map((entry) => entry.entryName))
+          loadPurgeAttachmentPreflight(entryNames)
+        }
+
+        /**
+         * Count the attachments a permanent delete would remove or keep.
+         *
+         * Read-only: the Host still protects shared attachments while purging,
+         * so a failed preview only leaves the dialog without the numbers.
+         *
+         * @param {string[]} entryNames recycle-bin entry names being purged.
+         * @returns {Promise<void>} resolution after the preview settled.
+         */
+        async function loadPurgeAttachmentPreflight(entryNames) {
+          try {
+            const payload = await postJson('api/sessions-library/purge-preflight', { entryNames }, {
+              timeoutMs: BATCH_TIMEOUT_MS,
+            })
+            setPurgeDialog((current) => (current && current.phase === 'confirm'
+              ? { ...current, attachmentReport: payload }
+              : current))
+          } catch {
+            setPurgeDialog((current) => (current && current.phase === 'confirm'
+              ? { ...current, attachmentReport: { failed: true } }
+              : current))
+          }
         }
 
         async function confirmPurge() {
@@ -2482,7 +2511,12 @@ window.__ModuleLoader__.load({
               timeoutMs: BATCH_TIMEOUT_MS,
             })
             const results = Array.isArray(payload.results) ? payload.results : []
-            setPurgeDialog((current) => ({ ...(current || {}), phase: 'done', results }))
+            setPurgeDialog((current) => ({
+              ...(current || {}),
+              phase: 'done',
+              results,
+              attachments: payload.attachments || null,
+            }))
             setTrashSelected({})
             // Only the fully purged entries leave the bin; queued ones stay
             // listed as pending, so they must not fade.
@@ -3317,6 +3351,13 @@ window.__ModuleLoader__.load({
           )
           const totalBytes = families.reduce((sum, family) => sum + family.totalBytes, 0)
           const confirmText = purgeDialog.text || ''
+          // Attachment impact reported by the preflight (read-only) and the
+          // cleanup counters reported by the purge itself.
+          const attachmentReport = purgeDialog.attachmentReport || null
+          const attachmentTotals = attachmentReport && attachmentReport.totals
+            ? attachmentReport.totals
+            : null
+          const purgeAttachments = purgeDialog.attachments || null
           // A queued deletion is not irreversible yet: it runs at the next start
           // and the recycle bin can still cancel it before then.
           const doneParts = []
@@ -3358,8 +3399,37 @@ window.__ModuleLoader__.load({
                 { style: dialogHintStyle },
                 purgeDialog.phase === 'done'
                   ? doneSummary
-                  : `将永久删除 ${sessionCount} 个会话（${(totalBytes / 1048576).toFixed(1)} MB）。此操作不可恢复；附件与成本账本不会被清理。${pendingCount > 0 ? `其中 ${pendingCount} 个仍被应用打开，将在重启 DSH 后删除。` : ''}`,
+                  : `将永久删除 ${sessionCount} 个会话（${(totalBytes / 1048576).toFixed(1)} MB）。此操作不可恢复；成本账本不会被清理。`
+                    + (attachmentTotals
+                      ? `会话带的 ${attachmentTotals.referenced} 个附件中，`
+                        + `${attachmentTotals.deletable} 个没有其他会话使用，会一并删除（${(attachmentTotals.deletableBytes / 1048576).toFixed(2)} MB）`
+                        + `${attachmentTotals.shared > 0
+                          ? `；${attachmentTotals.shared} 个仍被其他会话使用，将保留（${(attachmentTotals.sharedBytes / 1048576).toFixed(2)} MB）`
+                          : ''}。`
+                      : attachmentReport && attachmentReport.failed === true
+                        ? '会话附件统计失败，永久删除时会按“有共用就保留”的规则再判断一次。'
+                        : '正在统计会话附件…')
+                    + `${pendingCount > 0 ? `其中 ${pendingCount} 个仍被应用打开，将在重启 DSH 后删除（附件在重启时同样先检查共用情况）。` : ''}`,
               ),
+              attachmentTotals && attachmentTotals.shared > 0 && purgeDialog.phase === 'confirm'
+                ? h(
+                    'div',
+                    { className: 'sl-note', 'data-tone': 'caution' },
+                    `${attachmentTotals.shared} 个附件还被其他会话引用，不会被删除，以免那些会话之后无法继续对话。`,
+                  )
+                : null,
+              purgeDialog.phase === 'done' && purgeAttachments
+                ? h(
+                    'p',
+                    { style: dialogHintStyle },
+                    `附件清理：删除 ${Number(purgeAttachments.deleted) || 0} 个`
+                      + `（${((Number(purgeAttachments.bytes) || 0) / 1048576).toFixed(2)} MB）`
+                      + `${Number(purgeAttachments.keptShared) > 0
+                        ? `；保留 ${purgeAttachments.keptShared} 个被其他会话使用的附件`
+                        : ''}`
+                      + `${Number(purgeAttachments.failed) > 0 ? `；${purgeAttachments.failed} 个未能删除` : ''}。`,
+                  )
+                : null,
               purgeDialog.phase === 'confirm' ? h('div', { style: dialogListStyle }, familyBlocks) : null,
               purgeDialog.error ? h('div', { className: 'sl-note', 'data-tone': 'blocker' }, `失败：${purgeDialog.error}`) : null,
               purgeDialog.phase === 'confirm'
