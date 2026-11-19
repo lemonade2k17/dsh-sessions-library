@@ -18,6 +18,7 @@
 
 import {
   appendFileSync,
+  chmodSync,
   closeSync,
   copyFileSync,
   existsSync,
@@ -4492,9 +4493,59 @@ function buildAttachmentOwners(excludedIds) {
  * @param {string} hash attachment digest.
  * @returns {{ deleted: number, bytes: number, failed: number }} deletion counters.
  */
+/**
+ * Clear the read-only bit DSH puts on every content-addressed attachment.
+ *
+ * The objects are immutable by design, so the store marks them read-only.
+ * Windows then refuses to unlink them, and the Host runs on Electron's Node
+ * (v24.21) where fs.rmSync reports that as EPERM instead of retrying the way a
+ * plain Node build does. chmod(0o666) clears the bit so the unlink can proceed;
+ * the content was already verified against its digest before this runs.
+ *
+ * @param {string} target file or directory.
+ * @returns {void}
+ */
+function clearReadOnly(target) {
+  try {
+    chmodSync(target, 0o666)
+  } catch {
+    // A missing path or an unchangeable directory is the caller's problem.
+  }
+}
+
+/**
+ * Remove one attachment path after clearing its read-only bit.
+ *
+ * @param {string} target file or directory.
+ * @param {boolean} [recursive] remove a directory tree.
+ * @returns {{ ok: boolean, code?: string }} outcome with the OS error code.
+ */
+function removeAttachmentPath(target, recursive = false) {
+  clearReadOnly(target)
+  try {
+    rmSync(target, { recursive: recursive === true, force: true })
+    return { ok: true }
+  } catch (first) {
+    // A scanner or the Host can re-apply the attribute between the chmod and
+    // the unlink; one retry covers that window without masking real failures.
+    clearReadOnly(target)
+    try {
+      rmSync(target, { recursive: recursive === true, force: true })
+      return { ok: true }
+    } catch (second) {
+      return { ok: false, code: (second && second.code) || (first && first.code) || 'unknown' }
+    }
+  }
+}
+
 function deleteAttachmentObject(hash) {
   const shard = hash.slice(0, 2)
-  const counters = { deleted: 0, bytes: 0, failed: 0 }
+  const counters = { deleted: 0, bytes: 0, failed: 0, errorCodes: {} }
+  const noteFailure = (code) => {
+    counters.failed += 1
+    const key = typeof code === 'string' && code !== '' ? code : 'unknown'
+    counters.errorCodes[key] = (counters.errorCodes[key] ?? 0) + 1
+  }
   const verified = (filePath) => {
     let size = 0
     try {
@@ -4519,19 +4570,25 @@ function deleteAttachmentObject(hash) {
   for (const target of targets) {
     if (!existsSync(target)) continue
     if (!verified(target)) {
-      counters.failed += 1
+      noteFailure('verify-failed')
       continue
     }
+    let size = 0
     try {
-      const size = statSync(target).size
-      rmSync(target, { force: true })
-      counters.deleted += 1
-      if (!countedBytes) {
-        counters.bytes += size
-        countedBytes = true
-      }
+      size = statSync(target).size
     } catch {
-      counters.failed += 1
+      noteFailure('stat-failed')
+      continue
+    }
+    const removal = removeAttachmentPath(target)
+    if (!removal.ok) {
+      noteFailure(removal.code)
+      continue
+    }
+    counters.deleted += 1
+    if (!countedBytes) {
+      counters.bytes += size
+      countedBytes = true
     }
   }
   // The name-carrying alias lives in a directory per digest; its entries are
@@ -4540,7 +4597,7 @@ function deleteAttachmentObject(hash) {
   if (existsSync(aliasDir)) {
     const resolved = resolve(aliasDir)
     if (!isInsideRoot(pathKey(resolved), pathKey(ATTACHMENT_ALIAS_DIR))) {
-      counters.failed += 1
+      noteFailure('alias-outside-root')
       return counters
     }
     let aliasBytes = 0
@@ -4559,16 +4616,25 @@ function deleteAttachmentObject(hash) {
       aliasOk = false
     }
     if (!aliasOk) {
-      counters.failed += 1
+      noteFailure('alias-verify-failed')
       return counters
     }
+    // Alias entries are hard links of the same read-only object, so each one
+    // has to lose the attribute before the directory can go.
     try {
-      rmSync(aliasDir, { recursive: true, force: true })
-      counters.deleted += 1
-      if (!countedBytes) counters.bytes += aliasBytes
+      for (const child of readdirSync(aliasDir, { withFileTypes: true })) {
+        if (child.isFile()) clearReadOnly(join(aliasDir, child.name))
+      }
     } catch {
-      counters.failed += 1
+      // The removal below reports the real error.
     }
+    const aliasRemoval = removeAttachmentPath(aliasDir, true)
+    if (!aliasRemoval.ok) {
+      noteFailure(aliasRemoval.code)
+      return counters
+    }
+    counters.deleted += 1
+    if (!countedBytes) counters.bytes += aliasBytes
   }
   return counters
 }
@@ -4613,13 +4679,21 @@ function runAttachmentCleanup(plan) {
     keptShared: 0,
     keptSharedBytes: 0,
     missing: 0,
+    // Why a removal failed, so a retry can be diagnosed instead of guessed.
+    errorCodes: {},
   }
   for (const item of plan.deletable) {
     const outcome = deleteAttachmentObject(item.hash)
     counters.deleted += outcome.deleted
     counters.bytes += outcome.bytes
     counters.failed += outcome.failed
+    for (const [code, times] of Object.entries(outcome.errorCodes ?? {})) {
+      counters.errorCodes[code] = (counters.errorCodes[code] ?? 0) + times
+    }
     if (outcome.deleted === 0 && outcome.failed === 0) counters.missing += 1
+  }
+  if (counters.failed > 0) {
+    trace('purge', 'attach-fail', JSON.stringify(counters.errorCodes))
   }
   for (const item of plan.shared) {
     counters.keptShared += 1

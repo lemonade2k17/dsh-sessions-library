@@ -3427,7 +3427,15 @@ window.__ModuleLoader__.load({
                       + `${Number(purgeAttachments.keptShared) > 0
                         ? `；保留 ${purgeAttachments.keptShared} 个被其他会话使用的附件`
                         : ''}`
-                      + `${Number(purgeAttachments.failed) > 0 ? `；${purgeAttachments.failed} 个未能删除` : ''}。`,
+                      + `${Number(purgeAttachments.failed) > 0 ? `；${purgeAttachments.failed} 个未能删除` : ''}`
+                      + `${Number(purgeAttachments.missing) > 0
+                        ? `；${purgeAttachments.missing} 个对象在本机已不存在`
+                        : ''}`
+                      + `${Number(purgeAttachments.failed) > 0 && purgeAttachments.errorCodes
+                        ? `（失败原因：${Object.entries(purgeAttachments.errorCodes)
+                          .map(([code, times]) => `${code} × ${times}`)
+                          .join('、')}；文件仍在磁盘上，可稍后重试）`
+                        : ''}。`,
                   )
                 : null,
               purgeDialog.phase === 'confirm' ? h('div', { style: dialogListStyle }, familyBlocks) : null,
