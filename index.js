@@ -1706,23 +1706,6 @@ async function attachFreshSession(ctx, registry, sessionId, workspaceIds, batchD
 }
 
 /**
- * Restore one package's workspace files into the mapped local workspaces.
- *
- * The conflict policy is chosen in the import dialog:
- *   - `skip` (default) leaves every existing file untouched;
- *   - `overwrite` replaces files whose path already exists;
- *   - `newer` only replaces a file when the packaged copy is strictly newer,
- *     using the modification times the exporter recorded in the manifest.
- *
- * Unmapped workspaces are reported instead of guessing a destination.
- *
- * @param {Map<string, Array<{ segments: string[], data: Buffer }>>} byWorkspace members per source workspace id.
- * @param {object} mapping source workspace id to local workspace id.
- * @param {object | undefined} registry workspace registry service.
- * @param {{ mode?: string, mtimes?: Map<string, Map<string, number>> }} [selection] conflict policy and packaged mtimes.
- * @returns {{ restored: number, overwritten: number, skipped: number, failed: number, bytes: number, workspaces: Array<object> }} counters and per-workspace results.
- */
-/**
  * Whether a write below `root` would pass through a link.
  *
  * The lexical containment check cannot see a junction (a Windows directory
@@ -1758,6 +1741,23 @@ function crossesLink(root, target) {
   return false
 }
 
+/**
+ * Restore one package's workspace files into the mapped local workspaces.
+ *
+ * The conflict policy is chosen in the import dialog:
+ *   - `skip` (default) leaves every existing file untouched;
+ *   - `overwrite` replaces files whose path already exists;
+ *   - `newer` only replaces a file when the packaged copy is strictly newer,
+ *     using the modification times the exporter recorded in the manifest.
+ *
+ * Unmapped workspaces are reported instead of guessing a destination.
+ *
+ * @param {Map<string, Array<{ segments: string[], data: Buffer }>>} byWorkspace members per source workspace id.
+ * @param {object} mapping source workspace id to local workspace id.
+ * @param {object | undefined} registry workspace registry service.
+ * @param {{ mode?: string, mtimes?: Map<string, Map<string, number>> }} [selection] conflict policy and packaged mtimes.
+ * @returns {{ restored: number, overwritten: number, skipped: number, failed: number, bytes: number, workspaces: Array<object> }} counters and per-workspace results.
+ */
 function restoreWorkspaceFiles(byWorkspace, mapping, registry, selection = {}) {
   const counters = { restored: 0, overwritten: 0, skipped: 0, failed: 0, bytes: 0, workspaces: [] }
   if (!(byWorkspace instanceof Map) || byWorkspace.size === 0) return counters
@@ -4730,11 +4730,13 @@ function writeAttachmentIndexCache(sessions) {
  * Signature one session log set: a name/mtime/size list that changes on append.
  *
  * @param {string} sessionDir session directory.
- * @returns {string | null} signature, or null when the logs cannot be statted.
+ * @returns {string | null} signature, empty for "no log yet", or null when stat fails.
  */
 function sessionLogSignature(sessionDir) {
   const logs = listSessionLogFiles(sessionDir)
-  if (logs.length === 0) return null
+  // An empty string means "no log to cache"; null is reserved for a stat
+  // failure, which must mark the index incomplete instead.
+  if (logs.length === 0) return ''
   const parts = []
   try {
     for (const logPath of logs) {

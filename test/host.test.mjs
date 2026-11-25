@@ -260,6 +260,15 @@ check('queue changes merge instead of overwriting a concurrent update', () => {
   writePendingTrash({})
 })
 
+check('a session directory without a log does not degrade the index', () => {
+  // A brand new session has no log yet; it references nothing, so it must not
+  // flip the owner index to "incomplete" and block attachment cleanup forever.
+  mkdirSync(join(sessionsRoot, '--C-empty--', 'session-empty'), { recursive: true })
+  const health = { incomplete: 0, rootUnreadable: false }
+  buildAttachmentOwners(new Set(), health)
+  assert.equal(health.incomplete, 0)
+})
+
 check('a corrupt queue is preserved next to itself', () => {
   const queueFile = join(home, 'sessions-library', 'pending-trash.json')
   mkdirSync(join(home, 'sessions-library'), { recursive: true })
