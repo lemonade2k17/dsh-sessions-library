@@ -404,7 +404,7 @@ bundle 行列表为空，重启后侧边栏不再出现「会话库」；这一�
 | 0.7.1 | `v0.7.1` | `39f1369` | 2026-11-25 | `release/v0.7.1/dsh-sessions-library-0.7.1.tgz`（129,956） | `6db95876009d72d885b22e860d44d1a86e7cec510e236e7fdc940ad16c4fc0eb` |
 | 0.7.2 | `v0.7.2` | `440ed7c` | 2026-11-25 | `release/v0.7.2/dsh-sessions-library-0.7.2.tgz`（130,011） | `a85316acfcda20cae696be91bbfb0bb572443274bab8507e2c49ca370ed5b003` |
 | 0.7.3 | `v0.7.3` | `f68e73d` | 2026-11-25 | `release/v0.7.3/dsh-sessions-library-0.7.3.tgz`（133,661） | `c74fd478e6609af0e2ecb5728f1620bc0a51c6711e40dd17b811fdaf28e61378` |
-| 0.7.4 | `v0.7.4` | `d0ceedb` | 2026-11-25 | `release/v0.7.4/dsh-sessions-library-0.7.4.tgz`（133,763） | `3f3f84f2e73e3380b2010fab4f97644bb693ab952434b0a9d47ae7f7081d9e47` |
+| 0.7.4 | `v0.7.4` | `d0ceedb` | 2026-11-25 | `release/v0.7.4/dsh-sessions-library-0.7.4.tgz`（133,763） | `3f3f84f2e73e3380b2010fab4f97644bb693ab952434b0a9d47ae7f7081d9e47` |
 | 0.7.5 | `v0.7.5` | `228540b` | 2026-11-25 | `release/v0.7.5/dsh-sessions-library-0.7.5.tgz`（134,604） | `012e551dcc3dbde8d938571a62ec5288652c4d66f052062b8c0242bbced7aa63` |
 
 > 之后的提交（例如文档修订）不移动已发布的标签；需要新基线时再升版本、打标签、重打包并在此表追加一行。
