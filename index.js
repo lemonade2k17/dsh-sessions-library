@@ -22,6 +22,7 @@ import {
   closeSync,
   copyFileSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -1721,6 +1722,42 @@ async function attachFreshSession(ctx, registry, sessionId, workspaceIds, batchD
  * @param {{ mode?: string, mtimes?: Map<string, Map<string, number>> }} [selection] conflict policy and packaged mtimes.
  * @returns {{ restored: number, overwritten: number, skipped: number, failed: number, bytes: number, workspaces: Array<object> }} counters and per-workspace results.
  */
+/**
+ * Whether a write below `root` would pass through a link.
+ *
+ * The lexical containment check cannot see a junction (a Windows directory
+ * reparse point) or a POSIX symlink inside the workspace: the joined path
+ * stays "inside" while the bytes land elsewhere. Every existing ancestor of
+ * the target is therefore checked with lstat; the target itself may not exist
+ * yet.
+ *
+ * @param {string} root workspace root.
+ * @param {string} target resolved target path.
+ * @returns {boolean} true when an ancestor is a link.
+ */
+function crossesLink(root, target) {
+  const rootKey = pathKey(resolve(root))
+  let current = resolve(target)
+  const chain = []
+  while (pathKey(current) !== rootKey) {
+    chain.push(current)
+    const parent = dirname(current)
+    if (parent === current) return true
+    if (!pathKey(parent).startsWith(rootKey)) return true
+    current = parent
+  }
+  for (const candidate of chain) {
+    let stats = null
+    try {
+      stats = lstatSync(candidate)
+    } catch {
+      continue
+    }
+    if (stats.isSymbolicLink()) return true
+  }
+  return false
+}
+
 function restoreWorkspaceFiles(byWorkspace, mapping, registry, selection = {}) {
   const counters = { restored: 0, overwritten: 0, skipped: 0, failed: 0, bytes: 0, workspaces: [] }
   if (!(byWorkspace instanceof Map) || byWorkspace.size === 0) return counters
@@ -1753,8 +1790,9 @@ function restoreWorkspaceFiles(byWorkspace, mapping, registry, selection = {}) {
     let bytes = 0
     for (const member of members) {
       const target = resolve(join(root, ...member.segments))
-      if (!isInsideRoot(pathKey(target), pathKey(root))) {
+      if (!isInsideRoot(pathKey(target), pathKey(root)) || crossesLink(root, target)) {
         failed += 1
+        trace('import', 'workspace-link-skip', `path=${member.segments.join('/').slice(0, 80)}`)
         continue
       }
       try {
@@ -3565,13 +3603,18 @@ function restorePackageAttachments(entries, refs = null) {
       // bytes are verified before they may enter the content-addressed store.
       // The size shortcut used by the delete path is not applied here.
       const expected = expectedAttachmentDigest(entry.segments)
-      if (expected !== null) {
-        const actual = createHash('sha256').update(entry.data).digest('hex')
-        if (actual !== expected) {
-          counters.failed += 1
-          trace('import', 'attach-digest-mismatch', `path=${entry.segments.join('/').slice(0, 80)} expected=${expected.slice(0, 12)} actual=${actual.slice(0, 12)}`)
-          continue
-        }
+      if (expected === null) {
+        // A member this importer cannot name a digest for cannot be verified,
+        // so it is refused instead of written as-is.
+        counters.failed += 1
+        trace('import', 'attach-layout-unknown', `path=${entry.segments.join('/').slice(0, 80)}`)
+        continue
+      }
+      const actual = createHash('sha256').update(entry.data).digest('hex')
+      if (actual !== expected) {
+        counters.failed += 1
+        trace('import', 'attach-digest-mismatch', `path=${entry.segments.join('/').slice(0, 80)} expected=${expected.slice(0, 12)} actual=${actual.slice(0, 12)}`)
+        continue
       }
       try {
         if (existsSync(target) && sameFileContent(target, entry.data)) {
@@ -4449,11 +4492,17 @@ async function restoreTrashEntries(ctx, rawNames, signal, options = {}) {
         }
       } catch (error) {
         trace('restore', 'unarchive-fail', `id=${pendingId} ${describeError(error)}`)
+        // A kept purge intent would destroy the session the user just asked to
+        // restore on the next start, so the destructive flag is dropped first.
+        const { purge, purgeRequestedAt, ...keptRecord } = record
+        applyPendingTrashOps(new Map([[pendingId, keptRecord]]))
         results.push({ entryName: rawName, sessionId: pendingId, status: 'failed', reason: `取消归档失败：${describeError(error)}` })
         continue
       }
-      delete currentPending[pendingId]
-      if (writePendingTrash(currentPending) !== true) {
+      // Delete by id against the latest file: the un-archive await above may
+      // have let another window add a record, and writing this snapshot back
+      // would drop it.
+      if (applyPendingTrashOps(new Map([[pendingId, null]])) !== true) {
         // The archive was undone but the queue still lists the session. A kept
         // `purge: true` would destroy the restored session on the next start,
         // so the destructive intent is dropped even when the write only
@@ -4736,14 +4785,15 @@ function buildAttachmentOwners(excludedIds, health = null) {
       const sessionDir = join(SESSIONS_ROOT, project.name, id)
       const key = `${project.name}/${id}`
       const signature = sessionLogSignature(sessionDir)
-      if (signature === null) continue
-      const cached = previousCache[key]
+      const cached = signature !== null ? previousCache[key] : undefined
       if (cached && cached.signature === signature && Array.isArray(cached.digests)) {
         for (const hash of cached.digests) remember(hash, id)
         nextCache[key] = cached
         continue
       }
-      const local = { incomplete: 0 }
+      // A stat failure means the logs may have changed; scan them anyway and
+      // mark the index incomplete so cleanup stays conservative.
+      const local = { incomplete: signature === null ? 1 : 0 }
       const refs = collectSessionAttachmentRefs(sessionDir, local)
       if (health !== null && typeof health === 'object') health.incomplete = (health.incomplete ?? 0) + local.incomplete
       for (const hash of refs.keys()) remember(hash, id)
@@ -6146,5 +6196,7 @@ export const __test = process.env.DSH_SESSIONS_LIBRARY_TEST === '1'
       deleteAttachmentObject,
       buildAttachmentOwners,
       sweepPhantomTrashEntries,
+      restoreTrashEntries,
+      restoreWorkspaceFiles,
     }
   : null

@@ -7,7 +7,7 @@
  */
 
 import assert from 'node:assert/strict'
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, chmodSync, readdirSync, statSync, appendFileSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, chmodSync, readdirSync, statSync, appendFileSync, symlinkSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { zstdCompressSync } from 'node:zlib'
 import { join } from 'node:path'
@@ -36,6 +36,8 @@ const {
   planAttachmentCleanup,
   runAttachmentCleanup,
   buildAttachmentOwners,
+  restoreTrashEntries,
+  restoreWorkspaceFiles,
 } = __test
 
 // The whole suite must stay inside the temporary home.
@@ -315,6 +317,79 @@ check('flush leaves an entry that still holds its session alone', async () => {
   await flushPendingTrash({ get: () => undefined })
   assert.equal(existsSync(entryDir), true)
   writePendingTrash({})
+})
+
+
+// --- 0.7.1 additions --------------------------------------------------------
+check('workspace restore writes normally when no link is in the way', () => {
+  const workspaceRoot = join(home, 'workspace-ok')
+  mkdirSync(workspaceRoot, { recursive: true })
+  const outcome = restoreWorkspaceFiles(
+    new Map([['src', [{ segments: ['notes', 'a.txt'], data: Buffer.from('hello') }]]]),
+    { src: 'w1' },
+    { get: () => ({ path: workspaceRoot }) },
+    { mode: 'overwrite' },
+  )
+  assert.equal(outcome.failed, 0)
+  assert.equal(outcome.restored, 1)
+  assert.equal(readFileSync(join(workspaceRoot, 'notes', 'a.txt'), 'utf8'), 'hello')
+})
+
+check('workspace restore refuses to write through a junction or symlink', () => {
+  const outside = join(home, 'outside')
+  const workspaceRoot = join(home, 'workspace-linked')
+  mkdirSync(outside, { recursive: true })
+  mkdirSync(workspaceRoot, { recursive: true })
+  symlinkSync(outside, join(workspaceRoot, 'linked'), process.platform === 'win32' ? 'junction' : 'dir')
+  const outcome = restoreWorkspaceFiles(
+    new Map([['src', [{ segments: ['linked', 'evil.txt'], data: Buffer.from('payload') }]]]),
+    { src: 'w1' },
+    { get: () => ({ path: workspaceRoot }) },
+    { mode: 'overwrite' },
+  )
+  assert.equal(outcome.failed, 1)
+  assert.equal(existsSync(join(outside, 'evil.txt')), false)
+})
+
+check('restore of a queued session drops the queue record on success', async () => {
+  const id = 'session-queued-restore'
+  writePendingTrash({ [id]: { requestedAt: 1, familyRoot: id, role: 'root', workspaces: [], wasArchived: false } })
+  const registry = { unarchiveSession: async () => {} }
+  const results = await restoreTrashEntries({ get: (name) => (name === 'workspaceRegistry' ? registry : undefined) }, ['pending:' + id], undefined, {})
+  assert.equal(results[0].status, 'restored')
+  assert.equal(readPendingTrash()[id], undefined)
+})
+
+check('a failed un-archive keeps the record but drops the purge intent', async () => {
+  const id = 'session-queued-failed'
+  writePendingTrash({ [id]: { requestedAt: 1, familyRoot: id, role: 'root', purge: true, workspaces: [], wasArchived: false } })
+  const registry = { unarchiveSession: async () => { throw new Error('nope') } }
+  const results = await restoreTrashEntries({ get: (name) => (name === 'workspaceRegistry' ? registry : undefined) }, ['pending:' + id], undefined, {})
+  assert.equal(results[0].status, 'failed')
+  const kept = readPendingTrash()[id]
+  assert.ok(kept, 'the record must stay retryable')
+  assert.equal(kept.purge === true, false)
+  writePendingTrash({})
+})
+
+check('clearReadOnly preserves permission bits on POSIX', () => {
+  const file = join(home, 'chmod-probe.bin')
+  writeFileSync(file, Buffer.from('x'))
+  chmodSync(file, 0o444)
+  clearReadOnly(file)
+  const mode = statSync(file).mode & 0o777
+  if (process.platform === 'win32') {
+    assert.equal(mode, 0o666)
+  } else {
+    assert.equal(mode & 0o200, 0o200)
+    assert.equal(mode & 0o044, 0o044)
+  }
+})
+
+check('an attachment member without a verifiable layout is refused', () => {
+  const outcome = restorePackageAttachments([{ segments: ['v1', 'mystery', 'x'], data: Buffer.from('x') }], null)
+  assert.equal(outcome.failed, 1)
+  assert.equal(outcome.restored, 0)
 })
 
 // --- summary ----------------------------------------------------------------
