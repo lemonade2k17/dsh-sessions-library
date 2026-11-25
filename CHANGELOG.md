@@ -6,6 +6,23 @@
 
 （暂无）
 
+## [0.7.3] - 2026-11-25
+
+### 新增
+
+- **孤立附件清理**（0.7.0 起一直未包含的入口）：只读预检 `POST /api/sessions-library/orphans` 枚举 `attachments/v1` 的 `objects` / `file-objects` / `files` 三处对象，用会话与回收站的引用索引列出无引用摘要，并给出 `orphanCount` / `orphanBytes` / `verifiedCount` / `unverifiedCount` / `indexIncomplete`；清理 `POST /api/sessions-library/orphans-cleanup` 只接受 64 位小写摘要，**重新计算引用**（预检后被恢复的会话同样保护对象）、逐路径 SHA-256 校验（>8MB 也全量哈希），索引不完整时整体拒绝；删除复用 `deleteAttachmentObject` 并按 `action: "orphan-cleanup"` 写审计。
+- **客户端入口**：回收站工具栏新增「清理孤立附件」，第一次点击只读取预检并在面板显示数量/体积/已校验数量；确认清理为第二次点击，过程中按钮禁用、请求带令牌；结果展示删除数/字节/失败/统计后消失/被引用保留/未通过校验保留，随后自动刷新预检。索引不完整时面板只提示、不提供清理按钮。
+- **导出结果提示**：`attachmentScanIncomplete`（0.7.0 起 Host 已有字段）现在会在导出完成页提示“日志无法完整解码，附件引用可能未打包”。
+
+### 补强
+
+- 预检返回 `verifiedCount` / `unverifiedCount`，面板不再从截断后的候选列表推算。
+- 清理统计补齐“对象在枚举后消失”的 `missing` 计数；`>8MB` 对象在本入口按内容全量校验。
+
+### 测试
+
+- 回归 34 项（新增 7 项）：预检只列无引用对象、清理已校验对象、共享对象拒绝、未知摘要 `missing`、索引不完整整体拒绝、字节与摘要不符 `skippedUnverified` 且保留、预检后新增引用 `skippedShared` 且保留。命令行 Node v24.19 与 Electron v24.21 均通过。
+
 ## [0.7.2] - 2026-11-25
 
 ### 修复

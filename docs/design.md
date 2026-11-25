@@ -252,6 +252,8 @@ attachments/v1/objects|files/…               # 0.5.0 起：会话附件对象�
 | 2026-11-25 | 0.6.2 | 导入路径穿越、索引完整性、flush 顺序与加载守卫 |
 | 2026-11-25 | 0.7.0 | 队列合并写、幻影清扫、索引缓存、导入 SHA-256、客户端预检令牌；测试入库 |
 | 2026-11-25 | 0.7.1 | 工作区恢复 link 防护、恢复队列合并写、缓存回退、未知附件布局拒绝 |
+| 2026-11-25 | 0.7.2 | 索引完整性回归修复（无日志目录） |
+| 2026-11-25 | 0.7.3 | 孤儿附件清理：只读预检 + 重新计数 + 全量校验 + 审计 |
 
 ### 9.1 0.7.0 的行为约定
 
@@ -261,6 +263,7 @@ attachments/v1/objects|files/…               # 0.5.0 起：会话附件对象�
 - **附件索引**：解码必须逐帧完整（zstd 魔数开头但无法成帧即判不完整）；`buildAttachmentOwners` 的完整性标记传播到 `planAttachmentCleanup`，不完整时 `deletable` 为空、`keptUnverified` 计数，并写入审计、`debug.log` 与结果弹框。索引按 `名称+mtime+size` 缓存到 `cache/sessions-library/attachment-index.json`，不完整的扫描不缓存。
 - **导入校验**：`attachments/…` 成员写入前一律校验 SHA-256 与路径摘要一致；别名重建前校验规范对象本身；不合法名字（分隔符、盘符、控制字符、保留设备名）拒绝。
 - **审计形状**：会话级永久删除仍写 `action: "purge"`（含 `entries`）；延迟 flush 的附件汇总单独写 `action: "purge-attachments"`。
+- **孤儿附件**：预检只读，清理会重新计算会话与回收站引用、对每个候选路径做完整 SHA-256，索引不完整时整体拒绝；删除记 `action: "orphan-cleanup"`。
 - **测试**：`npm test` 运行 `test/host.test.mjs`，在临时 `DSH_HOME` 下覆盖上述路径，不触碰真实 `~/.dsh`。
 
 ## 10. 已知限制与后续

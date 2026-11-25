@@ -93,6 +93,10 @@ const TRASH_PURGE_PATH = '/api/sessions-library/trash-purge'
 // Read-only preview of what a permanent delete would clean up; the Client shows
 // it inside the purge confirmation dialog before anything is destroyed.
 const PURGE_PREFLIGHT_PATH = '/api/sessions-library/purge-preflight'
+// Orphan attachments: objects no stored session or restorable bin entry
+// references any more. The preflight is read-only; the cleanup re-checks.
+const ORPHANS_PATH = '/api/sessions-library/orphans'
+const ORPHANS_CLEANUP_PATH = '/api/sessions-library/orphans-cleanup'
 const LOGS_PATH = '/api/sessions-library/logs'
 const LOGS_CLEAR_PATH = '/api/sessions-library/logs-clear'
 const LOGS_DELETE_PATH = '/api/sessions-library/logs-delete'
@@ -5071,6 +5075,218 @@ function runAttachmentCleanup(plan) {
 }
 
 /**
+ * Enumerate every digest the attachment store holds, with its paths and size.
+ *
+ * @returns {Map<string, { bytes: number, paths: string[] }>} inventory keyed by digest.
+ */
+function enumerateAttachmentStore() {
+  const inventory = new Map()
+  const add = (hash, path, bytes) => {
+    if (!/^[a-f0-9]{64}$/.test(hash)) return
+    const known = inventory.get(hash) ?? { bytes: 0, paths: [] }
+    known.paths.push(path)
+    known.bytes = Math.max(known.bytes, bytes)
+    inventory.set(hash, known)
+  }
+  const flat = (dir) => {
+    let shards = []
+    try {
+      shards = readdirSync(dir, { withFileTypes: true }).filter((entry) => entry.isDirectory())
+    } catch {
+      return
+    }
+    for (const shard of shards) {
+      let files = []
+      try {
+        files = readdirSync(join(dir, shard.name), { withFileTypes: true }).filter((entry) => entry.isFile())
+      } catch {
+        continue
+      }
+      for (const file of files) {
+        const path = join(dir, shard.name, file.name)
+        try {
+          add(file.name, path, statSync(path).size)
+        } catch {
+          add(file.name, path, 0)
+        }
+      }
+    }
+  }
+  flat(ATTACHMENT_IMAGE_DIR)
+  flat(ATTACHMENT_FILE_DIR)
+  let shards = []
+  try {
+    shards = readdirSync(ATTACHMENT_ALIAS_DIR, { withFileTypes: true }).filter((entry) => entry.isDirectory())
+  } catch {
+    shards = []
+  }
+  for (const shard of shards) {
+    let digests = []
+    try {
+      digests = readdirSync(join(ATTACHMENT_ALIAS_DIR, shard.name), { withFileTypes: true })
+        .filter((entry) => entry.isDirectory())
+    } catch {
+      continue
+    }
+    for (const digest of digests) {
+      const dir = join(ATTACHMENT_ALIAS_DIR, shard.name, digest.name)
+      let files = []
+      try {
+        files = readdirSync(dir, { withFileTypes: true }).filter((entry) => entry.isFile())
+      } catch {
+        continue
+      }
+      for (const file of files) {
+        const path = join(dir, file.name)
+        try {
+          add(digest.name, path, statSync(path).size)
+        } catch {
+          add(digest.name, path, 0)
+        }
+      }
+    }
+  }
+  return inventory
+}
+
+/**
+ * Verify every stored path of one digest against its name.
+ *
+ * @param {string} hash digest.
+ * @param {string[]} paths stored paths.
+ * @returns {boolean} true when every existing path hashes to the digest.
+ */
+function verifyAttachmentDigest(hash, paths) {
+  for (const path of paths) {
+    let size = 0
+    try {
+      size = statSync(path).size
+    } catch {
+      return false
+    }
+    // This entry is destructive, so a large object is hashed in full too;
+    // the deletion path may skip hashing above the verification cap, but the
+    // cleanup must not claim "verified" for bytes it never read.
+    try {
+      if (createHash('sha256').update(readFileSync(path)).digest('hex') !== hash) return false
+    } catch {
+      return false
+    }
+  }
+  return true
+}
+
+/**
+ * Read-only orphan report: digests nothing references any more.
+ *
+ * @returns {object} inventory totals plus the verified candidate list.
+ */
+function buildOrphanReport() {
+  const health = { incomplete: 0, rootUnreadable: false }
+  const owners = buildAttachmentOwners(new Set(), health)
+  const inventory = enumerateAttachmentStore()
+  const indexIncomplete = health.incomplete > 0 || health.rootUnreadable === true
+  const candidates = []
+  let bytes = 0
+  let verifiedCount = 0
+  for (const [hash, info] of inventory) {
+    if (owners.has(hash)) continue
+    const verified = verifyAttachmentDigest(hash, info.paths)
+    if (verified) verifiedCount += 1
+    candidates.push({ hash, bytes: info.bytes, verified })
+    if (verified) bytes += info.bytes
+  }
+  candidates.sort((left, right) => right.bytes - left.bytes)
+  return {
+    total: inventory.size,
+    referenced: owners.size,
+    orphanCount: candidates.length,
+    orphanBytes: bytes,
+    // Candidates the preflight could hash successfully; the panel and the
+    // cleanup both use this count rather than re-deriving it from the slice.
+    verifiedCount,
+    unverifiedCount: candidates.length - verifiedCount,
+    indexIncomplete,
+    candidates: candidates.slice(0, 500),
+    truncated: candidates.length > 500,
+  }
+}
+
+/**
+ * Delete orphan attachments that are still unreferenced and verify.
+ *
+ * The caller only passes digests the preflight showed, but the reference
+ * index is recomputed here: a session may have been restored in between.
+ *
+ * @param {any} rawHashes digests requested by the Client.
+ * @returns {object} deletion counters.
+ */
+function cleanupOrphans(rawHashes) {
+  const requested = (Array.isArray(rawHashes) ? rawHashes : [])
+    .filter((hash) => typeof hash === 'string' && /^[a-f0-9]{64}$/.test(hash))
+  const wanted = [...new Set(requested)].slice(0, 500)
+  const counters = {
+    requested: wanted.length,
+    deleted: 0,
+    deletedPaths: 0,
+    bytes: 0,
+    failed: 0,
+    skippedShared: 0,
+    skippedUnverified: 0,
+    missing: 0,
+    indexIncomplete: false,
+    errorCodes: {},
+  }
+  if (wanted.length === 0) return counters
+  const health = { incomplete: 0, rootUnreadable: false }
+  const owners = buildAttachmentOwners(new Set(), health)
+  if (health.incomplete > 0 || health.rootUnreadable === true) {
+    counters.indexIncomplete = true
+    return counters
+  }
+  const inventory = enumerateAttachmentStore()
+  for (const hash of wanted) {
+    if (owners.has(hash)) {
+      counters.skippedShared += 1
+      continue
+    }
+    const info = inventory.get(hash)
+    if (!info) {
+      counters.missing += 1
+      continue
+    }
+    if (!verifyAttachmentDigest(hash, info.paths)) {
+      counters.skippedUnverified += 1
+      continue
+    }
+    const outcome = deleteAttachmentObject(hash)
+    if (outcome.deleted === 0 && outcome.failed === 0) {
+      counters.missing += 1
+      continue
+    }
+    counters.deleted += outcome.deleted
+    counters.deletedPaths += Number(outcome.deletedPaths) || 0
+    counters.bytes += outcome.bytes
+    counters.failed += outcome.failed
+    for (const [code, times] of Object.entries(outcome.errorCodes ?? {})) {
+      counters.errorCodes[code] = (counters.errorCodes[code] ?? 0) + times
+    }
+  }
+  appendAudit({
+    at: new Date().toISOString(),
+    action: 'orphan-cleanup',
+    requested: counters.requested,
+    deleted: counters.deleted,
+    bytes: counters.bytes,
+    failed: counters.failed,
+    skippedShared: counters.skippedShared,
+    skippedUnverified: counters.skippedUnverified,
+  })
+  trace('orphans', 'end', `requested=${counters.requested} deleted=${counters.deleted} failed=${counters.failed} bytes=${counters.bytes}`)
+  return counters
+}
+
+/**
  * Read-only preview of the attachment side of a permanent delete.
  *
  * @param {any} rawNames requested recycle-bin entry names.
@@ -5982,6 +6198,19 @@ export function apply(ctx) {
         },
       },
       {
+        path: ORPHANS_PATH,
+        label: 'orphans',
+        handler: async () => jsonResponse({ ok: true, ...buildOrphanReport() }),
+      },
+      {
+        path: ORPHANS_CLEANUP_PATH,
+        label: 'orphans-cleanup',
+        handler: async (request) => {
+          const body = await readJsonBody(request)
+          return jsonResponse({ ok: true, ...cleanupOrphans(body.hashes) })
+        },
+      },
+      {
         path: LOGS_PATH,
         label: 'logs',
         handler: async (request) => {
@@ -6200,5 +6429,7 @@ export const __test = process.env.DSH_SESSIONS_LIBRARY_TEST === '1'
       sweepPhantomTrashEntries,
       restoreTrashEntries,
       restoreWorkspaceFiles,
+      buildOrphanReport,
+      cleanupOrphans,
     }
   : null

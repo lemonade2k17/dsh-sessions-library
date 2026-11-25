@@ -38,6 +38,8 @@ const {
   buildAttachmentOwners,
   restoreTrashEntries,
   restoreWorkspaceFiles,
+  buildOrphanReport,
+  cleanupOrphans,
 } = __test
 
 // The whole suite must stay inside the temporary home.
@@ -221,6 +223,76 @@ check('a damaged survivor blocks every attachment deletion', () => {
   assert.equal(run.deleted, 0)
   assert.equal(existsSync(candidate.path), true)
   rmSync(damagedDir, { recursive: true, force: true })
+})
+
+// --- orphan attachment cleanup ---------------------------------------------
+check('orphan preflight lists only unreferenced objects', () => {
+  const orphan = writeObject(objectsDir, Buffer.from('orphan-preflight', 'utf8'))
+  const report = buildOrphanReport()
+  const hashes = report.candidates.map((candidate) => candidate.hash)
+  assert.equal(hashes.includes(orphan.hash), true)
+  assert.equal(hashes.includes(shared.hash), false, 'a referenced object must not be listed')
+  assert.equal(report.indexIncomplete, false)
+})
+
+check('orphan cleanup deletes a verified unreferenced object', () => {
+  const orphan = writeObject(objectsDir, Buffer.from('orphan-delete', 'utf8'))
+  const outcome = cleanupOrphans([orphan.hash])
+  assert.equal(outcome.deleted, 1)
+  assert.equal(outcome.deletedPaths, 1)
+  assert.equal(existsSync(orphan.path), false)
+})
+
+check('orphan cleanup refuses an object a session still references', () => {
+  const outcome = cleanupOrphans([shared.hash])
+  assert.equal(outcome.skippedShared, 1)
+  assert.equal(outcome.deleted, 0)
+  assert.equal(existsSync(shared.path), true)
+})
+
+check('orphan cleanup reports an unknown digest as missing', () => {
+  const outcome = cleanupOrphans(['f'.repeat(64)])
+  assert.equal(outcome.missing, 1)
+  assert.equal(outcome.deleted, 0)
+})
+
+check('orphan cleanup refuses everything while the index is incomplete', () => {
+  const dir = makeSession('session-orphan-damaged', logFrames('session-orphan-damaged', []))
+  const logPath = join(dir, 'session.v4.jsonl.zstd')
+  const full = readFileSync(logPath)
+  writeFileSync(logPath, full.subarray(0, full.length - 2))
+  const orphan = writeObject(objectsDir, Buffer.from('orphan-blocked', 'utf8'))
+  const outcome = cleanupOrphans([orphan.hash])
+  assert.equal(outcome.indexIncomplete, true)
+  assert.equal(outcome.deleted, 0)
+  assert.equal(existsSync(orphan.path), true)
+  rmSync(dir, { recursive: true, force: true })
+})
+
+check('orphan cleanup keeps an object whose bytes do not match its name', () => {
+  const bytes = Buffer.from('tampered-bytes', 'utf8')
+  const digest = sha256(bytes)
+  const shard = digest.slice(0, 2)
+  mkdirSync(join(objectsDir, shard), { recursive: true })
+  const path = join(objectsDir, shard, digest)
+  writeFileSync(path, Buffer.from('different-bytes', 'utf8'))
+  const outcome = cleanupOrphans([digest])
+  assert.equal(outcome.deleted, 0)
+  assert.equal(outcome.skippedUnverified, 1)
+  assert.equal(existsSync(path), true)
+})
+
+check('orphan cleanup re-checks references before deleting', () => {
+  const bytes = Buffer.from('late-reference', 'utf8')
+  const orphan = writeObject(objectsDir, bytes)
+  // The preflight saw an orphan; a session starts referencing it afterwards.
+  const ref = { hash: orphan.hash, name: 'late.png' }
+  makeSession('session-late-ref', logFrames('session-late-ref', [{ hash: orphan.hash, name: 'late.png', bytes: bytes.length }]))
+  const outcome = cleanupOrphans([orphan.hash])
+  assert.equal(outcome.skippedShared, 1)
+  assert.equal(outcome.deleted, 0)
+  assert.equal(existsSync(orphan.path), true)
+  rmSync(join(sessionsRoot, '--C-tmp-project--', 'session-late-ref'), { recursive: true, force: true })
 })
 
 // --- owner index cache ------------------------------------------------------

@@ -867,6 +867,12 @@ window.__ModuleLoader__.load({
         const [trashPhase, setTrashPhase] = React.useState('idle')
         const [trashError, setTrashError] = React.useState(null)
         const [trashNotice, setTrashNotice] = React.useState(null)
+        // Orphan attachments: a read-only preflight is shown first, and the
+        // destructive call only sends the digests it verified.
+        const [orphanReport, setOrphanReport] = React.useState(null)
+        const [orphanBusy, setOrphanBusy] = React.useState(false)
+        const [orphanError, setOrphanError] = React.useState(null)
+        const [orphanNotice, setOrphanNotice] = React.useState(null)
         const [dialog, setDialog] = React.useState(null)
         const [trashSelected, setTrashSelected] = React.useState({})
         // Workspace groups in the bin start collapsed: the header already
@@ -934,6 +940,9 @@ window.__ModuleLoader__.load({
         // just produced.
         const trashRequestRef = React.useRef(0)
         const logsRequestRef = React.useRef(0)
+        // Newest orphan preflight wins; a slow read must not overwrite a newer
+        // report or the notice the cleanup just wrote.
+        const orphanRequestRef = React.useRef(0)
         // Newest delete preflight wins. Closing the dialog or flipping the forks
         // switch starts another one, and the late answer of the old batch must
         // not pop the box back open over the user's cancel.
@@ -1557,11 +1566,93 @@ window.__ModuleLoader__.load({
           }
         }
 
+        /**
+         * Read the orphan-attachment report (read-only: nothing is deleted).
+         *
+         * @returns {Promise<void>} resolution after the state settled.
+         */
+        async function loadOrphanReport() {
+          const token = ++orphanRequestRef.current
+          const payload = await postJson('api/sessions-library/orphans', {}, { timeoutMs: BATCH_TIMEOUT_MS })
+          if (token !== orphanRequestRef.current) return
+          setOrphanReport(payload)
+        }
+
+        /**
+         * Open or close the orphan panel, loading the report on first open.
+         *
+         * @returns {Promise<void>} resolution after the state settled.
+         */
+        async function openOrphanReport() {
+          if (orphanBusy) return
+          if (orphanReport !== null) {
+            setOrphanReport(null)
+            setOrphanNotice(null)
+            setOrphanError(null)
+            return
+          }
+          setOrphanBusy(true)
+          setOrphanError(null)
+          setOrphanNotice(null)
+          try {
+            await loadOrphanReport()
+          } catch (failure) {
+            setOrphanError(failure && failure.message ? failure.message : String(failure))
+          } finally {
+            setOrphanBusy(false)
+          }
+        }
+
+        /**
+         * Delete the verified, still-unreferenced candidates and reload the report.
+         *
+         * The Host re-checks both conditions, so this only has to send the digests
+         * the panel showed as verified.
+         *
+         * @returns {Promise<void>} resolution after the state settled.
+         */
+        async function runOrphanCleanup() {
+          if (orphanBusy || orphanReport === null || orphanReport.indexIncomplete === true) return
+          const hashes = (Array.isArray(orphanReport.candidates) ? orphanReport.candidates : [])
+            .filter((candidate) => candidate && candidate.verified === true && typeof candidate.hash === 'string')
+            .map((candidate) => candidate.hash)
+          if (hashes.length === 0) return
+          setOrphanBusy(true)
+          setOrphanError(null)
+          try {
+            const payload = await postJson('api/sessions-library/orphans-cleanup', { hashes }, { timeoutMs: LONG_REQUEST_TIMEOUT_MS })
+            if (payload.indexIncomplete === true) {
+              // The Host re-checks the index; if it degraded meanwhile nothing was
+              // deleted, and the panel must say so instead of "deleted 0".
+              setOrphanNotice('附件索引此刻不完整，本次没有删除任何附件；请稍后重试。')
+              await loadOrphanReport()
+              return
+            }
+            const deleted = Number(payload.deleted) || 0
+            const bytes = Number(payload.bytes) || 0
+            const failed = Number(payload.failed) || 0
+            const missing = Number(payload.missing) || 0
+            const skippedShared = Number(payload.skippedShared) || 0
+            const skippedUnverified = Number(payload.skippedUnverified) || 0
+            setOrphanNotice(
+              `已删除 ${deleted} 个孤立附件（${(bytes / 1048576).toFixed(2)} MB）`
+                + `${failed > 0 ? `；${failed} 个删除失败` : ''}`
+                + `${missing > 0 ? `；${missing} 个在统计后已不存在` : ''}`
+                + `${skippedShared > 0 ? `；${skippedShared} 个已被其他会话引用，已保留` : ''}`
+                + `${skippedUnverified > 0 ? `；${skippedUnverified} 个未通过校验，已保留` : ''}。`,
+            )
+            await loadOrphanReport()
+          } catch (failure) {
+            setOrphanError(failure && failure.message ? failure.message : String(failure))
+          } finally {
+            setOrphanBusy(false)
+          }
+        }
+
         function closeTrash() {
           setView('library')
           setTrashNotice(null)
-          setTrashSelected({})
-          // Time spent in the bin may have changed the library (restores and
+          setTrashSelected({})          // Time spent in the bin may have changed the library (restores and
           // purges), so pull a fresh snapshot when the library comes back.
           setReloadToken((token) => token + 1)
         }
@@ -2248,6 +2339,9 @@ window.__ModuleLoader__.load({
               attachmentBytes: Number(payload.attachmentBytes) || 0,
               attachmentMissing: Number(payload.attachmentMissing) || 0,
               attachmentSkipped: Number(payload.attachmentSkipped) || 0,
+              // Logs the Host could not decode fully; their attachment references
+              // may be missing from the package, so the result must say so.
+              attachmentScanIncomplete: Number(payload.attachmentScanIncomplete) || 0,
               bytes: Number(payload.bytes) || 0,
               limit: readBatchLimit(payload.limit),
               error: null,
@@ -3188,6 +3282,42 @@ window.__ModuleLoader__.load({
             { className: 'sl-trash-panel' },
             trashError !== null ? h('div', { className: 'sl-note', 'data-tone': 'warn' }, trashError) : null,
             trashNotice !== null ? h('div', { className: 'sl-note', 'data-tone': 'info' }, trashNotice) : null,
+            orphanError !== null ? h('div', { className: 'sl-note', 'data-tone': 'warn' }, `孤立附件统计失败：${orphanError}`) : null,
+            orphanNotice !== null ? h('div', { className: 'sl-note', 'data-tone': 'info' }, orphanNotice) : null,
+            orphanReport !== null && orphanReport.indexIncomplete === true
+              ? h(
+                  'div',
+                  { className: 'sl-note', 'data-tone': 'caution' },
+                  '附件索引不完整（有会话日志无法完整读取），为避免误删，本次不能清理孤立附件；修复或删除损坏的会话后再试。',
+                )
+              : null,
+            orphanReport !== null && orphanReport.indexIncomplete !== true
+              ? h(
+                  'div',
+                  { className: 'sl-note', 'data-tone': 'info', style: { display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' } },
+                  h(
+                    'span',
+                    null,
+                    Number(orphanReport.orphanCount) > 0
+                      ? `发现 ${orphanReport.orphanCount} 个无引用附件（${(Number(orphanReport.orphanBytes) / 1048576).toFixed(2)} MB），`
+                        + `其中 ${(Array.isArray(orphanReport.candidates) ? orphanReport.candidates.filter((item) => item.verified === true).length : 0)} 个已通过校验，可清理。`
+                      : '没有发现无引用附件。',
+                  ),
+                  Number(orphanReport.orphanCount) > 0
+                    ? h(
+                        'button',
+                        {
+                          className: 'sl-btn',
+                          disabled: orphanBusy,
+                          style: { opacity: orphanBusy ? 0.55 : 1 },
+                          onClick: runOrphanCleanup,
+                        },
+                        orphanBusy ? '清理中…' : '确认清理',
+                      )
+                    : null,
+                  h('button', { className: 'sl-btn', onClick: openOrphanReport, disabled: orphanBusy }, '关闭'),
+                )
+              : null,
             trashGroups.map((bucket) => {
               // A search forces groups open: results must be visible the moment
               // the query matches, while the manual expansion state is kept for
@@ -4518,6 +4648,13 @@ window.__ModuleLoader__.load({
                           `有 ${exportDialog.attachmentMissing} 个附件在本机找不到对象，未能打包；对方导入时这些引用会降级为文字占位。`,
                         )
                       : null,
+                    Number(exportDialog.attachmentScanIncomplete) > 0
+                      ? h(
+                          'div',
+                          { className: 'sl-note', 'data-tone': 'caution' },
+                          `有 ${exportDialog.attachmentScanIncomplete} 份会话日志无法完整解码，其附件引用可能未被打包；建议先运行「清理孤立附件」检查索引后再导出。`,
+                        )
+                      : null,
                     Number(exportDialog.attachmentSkipped) > 0
                       ? h(
                           'div',
@@ -4932,6 +5069,18 @@ window.__ModuleLoader__.load({
             },
             h(Icon, { name: 'expand', size: 14 }),
             trashAllCollapsed ? '全部展开' : '全部收起',
+          ),
+          h(
+            'button',
+            {
+              className: 'sl-ghost',
+              // First click only reads a report; the panel then asks for a
+              // separate confirmation before anything is deleted.
+              disabled: orphanBusy,
+              style: orphanBusy ? { opacity: 0.55 } : undefined,
+              onClick: openOrphanReport,
+            },
+            orphanBusy ? '统计中…' : (orphanReport !== null ? '收起清理结果' : '清理孤立附件'),
           ),
           h(
             'button',
