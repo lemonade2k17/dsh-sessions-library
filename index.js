@@ -3564,14 +3564,13 @@ async function importPackage(ctx, rawPath, rawMapping, options = {}) {
 }
 
 
-/**
- * Size limit above which a restored attachment is trusted on its size alone.
- *
- * Attachment objects are content addressed, so an equal size is a strong hint;
- * small objects are still compared byte for byte because a corrupted object of
- * the same length would otherwise be kept forever.
- */
-const ATTACHMENT_VERIFY_BYTES = 8 * 1024 * 1024
+// Attachment objects can be large, so every full check streams the bytes in
+// bounded chunks instead of loading the file into memory.
+const ATTACHMENT_HASH_CHUNK = 1024 * 1024
+// One orphan preflight verifies at most this many candidates / bytes; the rest
+// stay deferred so a large library does not turn one click into a minute.
+const ORPHAN_VERIFY_LIMIT = 200
+const ORPHAN_VERIFY_BYTES_LIMIT = 512 * 1024 * 1024
 
 /**
  * Compare one on-disk file with the bytes a package carries.
@@ -3650,9 +3649,7 @@ function restorePackageAttachments(entries, refs = null) {
       // The canonical object may predate this import; never alias bytes that
       // no longer match the digest the name promises.
       try {
-        const size = statSync(objectPath).size
-        if (size <= ATTACHMENT_VERIFY_BYTES
-          && createHash('sha256').update(readFileSync(objectPath)).digest('hex') !== ref.hash) {
+        if (hashFileSha256(objectPath) !== ref.hash) {
           counters.failed += 1
           trace('import', 'attach-object-corrupt', `hash=${ref.hash.slice(0, 12)}`)
           continue
@@ -4900,15 +4897,8 @@ function deleteAttachmentObject(hash) {
     return counters
   }
   const verified = (filePath) => {
-    let size = 0
     try {
-      size = statSync(filePath).size
-    } catch {
-      return false
-    }
-    if (size > ATTACHMENT_VERIFY_BYTES) return true
-    try {
-      return createHash('sha256').update(readFileSync(filePath)).digest('hex') === hash
+      return hashFileSha256(filePath) === hash
     } catch {
       return false
     }
@@ -5150,6 +5140,34 @@ function enumerateAttachmentStore() {
 }
 
 /**
+ * SHA-256 of one file, read in bounded chunks.
+ *
+ * `readFileSync` on a multi-gigabyte attachment would hold the whole object in
+ * memory; the store is content addressed, so the hash has to be computed, but
+ * it does not have to be held.
+ *
+ * @param {string} filePath file to hash.
+ * @returns {string} lowercase hex digest.
+ */
+function hashFileSha256(filePath) {
+  const hash = createHash('sha256')
+  const fd = openSync(filePath, 'r')
+  try {
+    const buffer = Buffer.allocUnsafe(ATTACHMENT_HASH_CHUNK)
+    let position = 0
+    for (;;) {
+      const read = readSync(fd, buffer, 0, buffer.length, position)
+      if (read <= 0) break
+      hash.update(buffer.subarray(0, read))
+      position += read
+    }
+  } finally {
+    closeSync(fd)
+  }
+  return hash.digest('hex')
+}
+
+/**
  * Verify every stored path of one digest against its name.
  *
  * @param {string} hash digest.
@@ -5158,17 +5176,8 @@ function enumerateAttachmentStore() {
  */
 function verifyAttachmentDigest(hash, paths) {
   for (const path of paths) {
-    let size = 0
     try {
-      size = statSync(path).size
-    } catch {
-      return false
-    }
-    // This entry is destructive, so a large object is hashed in full too;
-    // the deletion path may skip hashing above the verification cap, but the
-    // cleanup must not claim "verified" for bytes it never read.
-    try {
-      if (createHash('sha256').update(readFileSync(path)).digest('hex') !== hash) return false
+      if (hashFileSha256(path) !== hash) return false
     } catch {
       return false
     }
@@ -5189,12 +5198,37 @@ function buildOrphanReport() {
   const candidates = []
   let bytes = 0
   let verifiedCount = 0
-  for (const [hash, info] of inventory) {
-    if (owners.has(hash)) continue
-    const verified = verifyAttachmentDigest(hash, info.paths)
-    if (verified) verifiedCount += 1
-    candidates.push({ hash, bytes: info.bytes, verified })
-    if (verified) bytes += info.bytes
+  let unverifiedCount = 0
+  let deferredCount = 0
+  let hashedBytes = 0
+  // Larger objects first: the first batch should reclaim the most space, and
+  // the deferred set stays deterministic between runs.
+  const orphans = [...inventory.entries()]
+    .filter(([hash]) => !owners.has(hash))
+    .map(([hash, info]) => ({ hash, bytes: info.bytes, paths: info.paths }))
+    .sort((left, right) => right.bytes - left.bytes)
+  for (const candidate of orphans) {
+    const attempts = verifiedCount + unverifiedCount
+    // Verification is the expensive half; the first batch is bounded so one
+    // click cannot hash an unbounded library. The byte budget only applies
+    // after the first attempt: a single object bigger than the whole budget
+    // would otherwise be deferred forever and never become deletable.
+    const overCount = attempts >= ORPHAN_VERIFY_LIMIT
+    const overBytes = attempts > 0 && hashedBytes + candidate.bytes > ORPHAN_VERIFY_BYTES_LIMIT
+    if (overCount || overBytes) {
+      deferredCount += 1
+      candidates.push({ hash: candidate.hash, bytes: candidate.bytes, verified: false, deferred: true })
+      continue
+    }
+    const verified = verifyAttachmentDigest(candidate.hash, candidate.paths)
+    hashedBytes += candidate.bytes
+    if (verified) {
+      verifiedCount += 1
+      bytes += candidate.bytes
+    } else {
+      unverifiedCount += 1
+    }
+    candidates.push({ hash: candidate.hash, bytes: candidate.bytes, verified })
   }
   candidates.sort((left, right) => right.bytes - left.bytes)
   return {
@@ -5205,7 +5239,10 @@ function buildOrphanReport() {
     // Candidates the preflight could hash successfully; the panel and the
     // cleanup both use this count rather than re-deriving it from the slice.
     verifiedCount,
-    unverifiedCount: candidates.length - verifiedCount,
+    unverifiedCount,
+    // Candidates this run deliberately did not hash; delete the verified batch
+    // and open the panel again to verify the next one.
+    deferredCount,
     indexIncomplete,
     candidates: candidates.slice(0, 500),
     truncated: candidates.length > 500,
@@ -5259,6 +5296,9 @@ function cleanupOrphans(rawHashes) {
       counters.skippedUnverified += 1
       continue
     }
+    // deleteAttachmentObject verifies the paths again before unlinking them:
+    // the preflight result is advisory, the delete path re-checks what it is
+    // about to remove (two reads on purpose, both streamed in small chunks).
     const outcome = deleteAttachmentObject(hash)
     if (outcome.deleted === 0 && outcome.failed === 0) {
       counters.missing += 1

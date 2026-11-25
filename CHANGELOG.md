@@ -2,7 +2,24 @@
 
 本文件记录 `dsh-sessions-library`（DSH 会话库插件）的版本变更。版本号遵循 `MAJOR.MINOR.PATCH`；每个基线版本在 git 中以附注标签 `v<版本>` 标记。
 
-## [0.7.4] - 2026-11-25
+## [未发布]
+
+（暂无）
+
+## [0.7.5] - 2026-11-25
+
+### 修复
+
+- **附件校验改为流式 SHA-256**：新增 `hashFileSha256`（1 MiB 分块 `readSync`），孤儿预检、永久删除的 `verified()`、导入别名重建前的对象校验都改用它；不再把整个附件读进内存，超大对象的 OOM 风险消失。
+- **删除路径不再对 >8MB 对象按大小放行**：`deleteAttachmentObject` 的校验现在对所有尺寸执行完整 SHA-256（分块读取），与“内容寻址、删除前校验”的承诺一致。
+- **孤儿预检加入校验预算**：每次最多校验 200 个候选 / 512 MiB，其余候选标记 `deferred` 并返回 `deferredCount`，避免孤儿很多时首次点击卡住数十秒；清理端仍对每个请求摘要独立全量校验，**不会删除未校验对象**。
+- **客户端面板**显示“本次未校验 N 个，清理后再次点击可继续”，并在候选全部未通过校验时不渲染确认按钮。
+- **超大单个孤儿不再永久 deferred**：字节预算只对第二个及以后的候选生效，第一个候选即使大于整轮预算也会被校验；候选先按体积降序，首批回收的字节最多、deferred 集合可复现。
+- **删除与导入别名不再按大小放行**：`ATTACHMENT_VERIFY_BYTES` 已无引用，常量与“大对象按大小信任”的注释一并删除；>8MB 对象现在也做完整流式 SHA-256（行为变化）。
+
+### 测试
+
+- 回归 38 项（新增 4 项）：2.5 MB 多分块对象校验并删除；>8MB 对象校验并删除；>8MB 篡改字节保留（`skippedUnverified`）；候选超过 200 时 `deferredCount >= 1` 且单次校验数不超过上限。命令行 Node v24.19 与 Electron v24.21 均通过。
 
 ### 修复
 
@@ -379,13 +396,13 @@ bundle 行列表为空，重启后侧边栏不再出现「会话库」；这一�
 | 0.5.0 | `v0.5.0` | `50f89a2` | 2026-11-16 | `release/v0.5.0/dsh-sessions-library-0.5.0.tgz`（114,586） | `3bda0c18db333b19f5c3f077ab8dfe6e1b159016f156e060d6397fd1183d5050` |
 | 0.5.1 | `v0.5.1` | `3a3a68d` | 2026-11-16 | `release/v0.5.1/dsh-sessions-library-0.5.1.tgz`（114,603） | `98af58083cac36118bafd1cea8b2cb5bdaf41a898a152ed9d75812efe2438ac8` |
 | 0.6.0 | `v0.6.0` | `c4324ac` | 2026-11-16 | `release/v0.6.0/dsh-sessions-library-0.6.0.tgz`（118,367） | `88bae7cfde23e983615a82557caea4ad1a97081f1e21d26adbdb3686b39b99a4` |
-| 0.6.1 | `v0.6.1` | `95fe73d` | 2026-11-19 |
-| 0.6.2 | `v0.6.2` | `dd8c509` | 2026-11-25 |
-| 0.7.0 | `v0.7.0` | `a5a58b4` | 2026-11-25 |
-| 0.7.1 | `v0.7.1` | `39f1369` | 2026-11-25 |
-| 0.7.2 | `v0.7.2` | `440ed7c` | 2026-11-25 |
-| 0.7.3 | `v0.7.3` | `f68e73d` | 2026-11-25 |
-| 0.7.4 | `v0.7.4` | `d0ceedb` | 2026-11-25 | `release/v0.7.4/dsh-sessions-library-0.7.4.tgz`（133,763） | `3f3f84f2e73e3380b2010fab4f97644bb693ab952434b0a9d47ae7f7081d9e47` | `release/v0.7.3/dsh-sessions-library-0.7.3.tgz`（133,661） | `c74fd478e6609af0e2ecb5728f1620bc0a51c6711e40dd17b811fdaf28e61378` | `release/v0.7.2/dsh-sessions-library-0.7.2.tgz`（130,011） | `a85316acfcda20cae696be91bbfb0bb572443274bab8507e2c49ca370ed5b003` | `release/v0.7.1/dsh-sessions-library-0.7.1.tgz`（129,956） | `6db95876009d72d885b22e860d44d1a86e7cec510e236e7fdc940ad16c4fc0eb` | `release/v0.7.0/dsh-sessions-library-0.7.0.tgz`（129,230） | `b6595dfe1ca60c0213fa8b7d2db2d15598d07596d7385ca39ecbc16d0a651e85` | `release/v0.6.2/dsh-sessions-library-0.6.2.tgz`（121,973） | `7aaf9b4441c01d563d2eaebef38673677ab77cfb584998f85f758f77738419f3` | `release/v0.6.1/dsh-sessions-library-0.6.1.tgz`（119,341） | `d6e40b033a2c727706acf11e5455d14757708132a57f3a2b785488ecc6b2d9d3` |
+| 0.6.1 | `v0.6.1` | `95fe73d` | 2026-11-19 | `release/v0.6.1/dsh-sessions-library-0.6.1.tgz`（119,341） | `d6e40b033a2c727706acf11e5455d14757708132a57f3a2b785488ecc6b2d9d3` |
+| 0.6.2 | `v0.6.2` | `dd8c509` | 2026-11-25 | `release/v0.6.2/dsh-sessions-library-0.6.2.tgz`（121,973） | `7aaf9b4441c01d563d2eaebef38673677ab77cfb584998f85f758f77738419f3` |
+| 0.7.0 | `v0.7.0` | `a5a58b4` | 2026-11-25 | `release/v0.7.0/dsh-sessions-library-0.7.0.tgz`（129,230） | `b6595dfe1ca60c0213fa8b7d2db2d15598d07596d7385ca39ecbc16d0a651e85` |
+| 0.7.1 | `v0.7.1` | `39f1369` | 2026-11-25 | `release/v0.7.1/dsh-sessions-library-0.7.1.tgz`（129,956） | `6db95876009d72d885b22e860d44d1a86e7cec510e236e7fdc940ad16c4fc0eb` |
+| 0.7.2 | `v0.7.2` | `440ed7c` | 2026-11-25 | `release/v0.7.2/dsh-sessions-library-0.7.2.tgz`（130,011） | `a85316acfcda20cae696be91bbfb0bb572443274bab8507e2c49ca370ed5b003` |
+| 0.7.3 | `v0.7.3` | `f68e73d` | 2026-11-25 | `release/v0.7.3/dsh-sessions-library-0.7.3.tgz`（133,661） | `c74fd478e6609af0e2ecb5728f1620bc0a51c6711e40dd17b811fdaf28e61378` |
+| 0.7.4 | `v0.7.4` | `d0ceedb` | 2026-11-25 | `release/v0.7.4/dsh-sessions-library-0.7.4.tgz`（133,763） | `3f3f84f2e73e3380b2010fab4f97644bb693ab952434b0a9d47ae7f7081d9e47` |
 
 > 之后的提交（例如文档修订）不移动已发布的标签；需要新基线时再升版本、打标签、重打包并在此表追加一行。
 

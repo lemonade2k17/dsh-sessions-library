@@ -3301,7 +3301,8 @@ window.__ModuleLoader__.load({
                     Number(orphanReport.orphanCount) > 0
                       ? `发现 ${orphanReport.orphanCount} 个无引用附件（${(Number(orphanReport.orphanBytes) / 1048576).toFixed(2)} MB），`
                         + `其中 ${Number(orphanReport.verifiedCount) || 0} 个已通过校验，可清理`
-                        + `${Number(orphanReport.unverifiedCount) > 0 ? `；${orphanReport.unverifiedCount} 个未通过校验，将保留` : ''}。`
+                        + `${Number(orphanReport.unverifiedCount) > 0 ? `；${orphanReport.unverifiedCount} 个未通过校验，将保留` : ''}`
+                        + `${Number(orphanReport.deferredCount) > 0 ? `；${orphanReport.deferredCount} 个本次未校验，清理后会自动校验下一批` : ''}。`
                       : '没有发现无引用附件。',
                   ),
                   Number(orphanReport.verifiedCount) > 0

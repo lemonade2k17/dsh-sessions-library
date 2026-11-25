@@ -295,6 +295,67 @@ check('orphan cleanup re-checks references before deleting', () => {
   rmSync(join(sessionsRoot, '--C-tmp-project--', 'session-late-ref'), { recursive: true, force: true })
 })
 
+check('streaming hash handles a multi-chunk object', () => {
+  const bytes = Buffer.allocUnsafe(2.5 * 1024 * 1024)
+  for (let index = 0; index < bytes.length; index += 1) bytes[index] = (index * 31) & 0xff
+  const orphan = writeObject(objectsDir, bytes)
+  const outcome = cleanupOrphans([orphan.hash])
+  assert.equal(outcome.deleted, 1)
+  assert.equal(existsSync(orphan.path), false)
+})
+
+check('an object above the old size cap is hashed and deleted', () => {
+  const bytes = Buffer.alloc(9 * 1024 * 1024, 9)
+  const orphan = writeObject(objectsDir, bytes)
+  const report = buildOrphanReport()
+  const candidate = report.candidates.find((item) => item.hash === orphan.hash)
+  assert.ok(candidate, 'the large object must be listed')
+  assert.equal(candidate.verified, true)
+  const outcome = cleanupOrphans([orphan.hash])
+  assert.equal(outcome.deleted, 1)
+  assert.equal(existsSync(orphan.path), false)
+})
+
+check('a large object with tampered bytes is kept', () => {
+  const bytes = Buffer.alloc(9 * 1024 * 1024, 3)
+  const digest = sha256(bytes)
+  const shard = digest.slice(0, 2)
+  mkdirSync(join(objectsDir, shard), { recursive: true })
+  const path = join(objectsDir, shard, digest)
+  const tampered = Buffer.alloc(9 * 1024 * 1024, 4)
+  writeFileSync(path, tampered)
+  chmodSync(path, 0o444)
+  const outcome = cleanupOrphans([digest])
+  assert.equal(outcome.deleted, 0)
+  assert.equal(outcome.skippedUnverified, 1)
+  assert.equal(existsSync(path), true)
+})
+
+check('the preflight verifies a bounded batch and defers the rest', () => {
+  for (let index = 0; index < 205; index += 1) {
+    writeObject(objectsDir, Buffer.from(`bulk-orphan-${index}`, 'utf8'))
+  }
+  const report = buildOrphanReport()
+  assert.ok(report.verifiedCount >= 1)
+  assert.ok(report.deferredCount >= 5)
+  assert.equal(report.verifiedCount + report.unverifiedCount <= 200, true)
+  assert.equal(
+    report.verifiedCount + report.unverifiedCount + report.deferredCount,
+    report.orphanCount,
+  )
+  const deferred = report.candidates.find((item) => item.deferred === true)
+  assert.ok(deferred, 'the deferred part must be reported')
+  assert.equal(deferred.verified, false)
+  const deferredPath = join(objectsDir, deferred.hash.slice(0, 2), deferred.hash)
+  assert.equal(existsSync(deferredPath), true)
+  const verified = report.candidates.find((item) => item.verified === true)
+  assert.ok(verified)
+  cleanupOrphans([verified.hash])
+  assert.equal(existsSync(join(objectsDir, verified.hash.slice(0, 2), verified.hash)), false)
+  // Deleting the verified batch must leave the deferred object untouched.
+  assert.equal(existsSync(deferredPath), true)
+})
+
 // --- owner index cache ------------------------------------------------------
 check('the owner index caches complete scans and reuses them', () => {
   const beforeCache = sanitizeCache()
