@@ -246,6 +246,18 @@ attachments/v1/objects|files/…               # 0.5.0 起：会话附件对象�
 | 2026-10-30 | 0.3.0 | 首个基线：会话库、导入、回收站、操作日志 |
 | 2026-11-02 | 0.3.1 | 导出工作区附件 + 排除目录浏览器 + 导入冲突策略；修复导入 attach 竞态 |
 | 2026-11-06 | 0.4.0 | 界面整体重做；回收站按工作区分组；导入预览提前警告；一批数据归属与原子写修复；**回滚**"从回收站重启 DSH"功能（会触发外壳崩溃提示） |
+| 2026-11-19 | 0.6.1 | 永久删除时按引用计数清理附件；修复 Windows 只读对象删除失败的 EPERM |
+| 2026-11-25 | 0.7.0 | 附件索引完整性（首帧损坏判不完整）、导入路径穿越与摘要校验、队列合并写、幻影条目清扫、索引缓存、索引不完整时整体不删附件；客户端预检令牌与状态保留；测试入库 |
+
+### 9.1 0.7.0 的行为约定
+
+- **队列合并写**：`pending-trash.json` 的修改按会话 id 应用在最新文件之上（`applyPendingTrashOps`），不再写回请求开始时的快照；损坏的队列文件会先复制成 `.corrupt-<时间戳>`。
+- **延迟 flush 顺序**：先写 `manifest.json`，再 `rename` 会话目录；`rename` 失败只清理本次新建的条目并保留队列记录重试。flush 开头清扫“manifest 的 id 仍在队列且没有 `session/`”的条目（审计动作 `trash-phantom`），带 `session/` 的条目不动。
+- **加载守卫**：flush 删除前检查 `agents.get(id)`，仍被加载的会话保留在队列里，下次启动再试。
+- **附件索引**：解码必须逐帧完整（zstd 魔数开头但无法成帧即判不完整）；`buildAttachmentOwners` 的完整性标记传播到 `planAttachmentCleanup`，不完整时 `deletable` 为空、`keptUnverified` 计数，并写入审计、`debug.log` 与结果弹框。索引按 `名称+mtime+size` 缓存到 `cache/sessions-library/attachment-index.json`，不完整的扫描不缓存。
+- **导入校验**：`attachments/…` 成员写入前一律校验 SHA-256 与路径摘要一致；别名重建前校验规范对象本身；不合法名字（分隔符、盘符、控制字符、保留设备名）拒绝。
+- **审计形状**：会话级永久删除仍写 `action: "purge"`（含 `entries`）；延迟 flush 的附件汇总单独写 `action: "purge-attachments"`。
+- **测试**：`npm test` 运行 `test/host.test.mjs`，在临时 `DSH_HOME` 下覆盖上述路径，不触碰真实 `~/.dsh`。
 
 ## 10. 已知限制与后续
 

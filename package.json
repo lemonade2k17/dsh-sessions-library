@@ -1,6 +1,6 @@
 {
   "name": "dsh-sessions-library",
-  "version": "0.6.2",
+  "version": "0.7.0",
   "description": "会话库：按工作区分组浏览 DSH 会话，并提供会话包导出/导入（迁移）、回收站与操作日志。",
   "icon": "icon.svg",
   "type": "module",
@@ -25,7 +25,8 @@
     "dsh": ">=0.2.1-rc.3 <0.3.0-0"
   },
   "scripts": {
-    "check": "node --check index.js && node --check client.js"
+    "check": "node --check index.js && node --check client.js && node --check test/host.test.mjs",
+    "test": "node test/host.test.mjs"
   },
   "keywords": [
     "deepseek-harness",

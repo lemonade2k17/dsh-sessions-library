@@ -70,6 +70,15 @@ const ATTACHMENT_FILE_DIR = join(ATTACHMENTS_V1, 'file-objects')
 const ATTACHMENT_ALIAS_DIR = join(ATTACHMENTS_V1, 'files')
 // One attachment id is `sha256:<64 hex>`; the digest doubles as the object name.
 const ATTACHMENT_ID_PATTERN = /^sha256:([a-f0-9]{64})$/
+// zstd frame magic; a log that starts with it is compressed, so a file this
+// short or this damaged must not be mistaken for plain JSONL.
+const ZSTD_FRAME_MAGIC = 0xfd2fb528
+// The owner index decodes every log, which costs seconds on a large library;
+// per-session digests are cached against the log signature (name + mtime +
+// size) so an append invalidates exactly one entry.
+const ATTACHMENT_INDEX_CACHE = join(DSH_HOME, 'cache', 'sessions-library', 'attachment-index.json')
+// Windows device names cannot be used as file names, with or without extension.
+const WINDOWS_RESERVED_NAME = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$/i
 // Workspace registry storage (domain `workspace` v2). Read only as a fallback
 // when the controller stream is unavailable: it carries the archived/pinned
 // session sets that `workspaceRegistry.list()` does not expose.
@@ -742,13 +751,30 @@ async function readTitles(ctx, sessionIds, signal, requestId) {
  * @returns {Record<string, object>} session id to its pending record.
  */
 function readPendingTrash() {
+  let raw = null
   try {
-    const parsed = JSON.parse(readFileSync(PENDING_TRASH_FILE, 'utf8'))
+    raw = readFileSync(PENDING_TRASH_FILE, 'utf8')
+  } catch {
+    // No queue file means nothing is pending; that is the normal empty state.
+    return {}
+  }
+  try {
+    const parsed = JSON.parse(raw)
     if (parsed && typeof parsed === 'object' && parsed.items && typeof parsed.items === 'object') {
       return parsed.items
     }
+    trace('queue', 'read-shape', 'items field missing')
     return {}
   } catch {
+    // A corrupt queue read as "nothing pending" would silently cancel a
+    // queued deletion, so keep the bytes next to it for diagnosis.
+    try {
+      const backup = `${PENDING_TRASH_FILE}.corrupt-${Date.now()}`
+      writeFileSync(backup, raw)
+      trace('queue', 'read-corrupt', `backup=${basename(backup)}`)
+    } catch {
+      trace('queue', 'read-corrupt', 'backup failed')
+    }
     return {}
   }
 }
@@ -767,9 +793,33 @@ function writePendingTrash(items) {
     const temporary = `${PENDING_TRASH_FILE}.tmp`
     writeFileSync(temporary, JSON.stringify({ items }, null, 2))
     renameSync(temporary, PENDING_TRASH_FILE)
-  } catch {
-    // Best effort: an unreadable registry only delays the move.
+    return true
+  } catch (error) {
+    // Callers must be able to tell whether the queue really changed: a silent
+    // failure would report a deletion that the next start never performs.
+    trace('queue', 'write-fail', describeError(error))
+    return false
   }
+}
+
+/**
+ * Apply per-session queue changes without overwriting a concurrent update.
+ *
+ * A delete batch awaits registry calls between reading and writing the queue;
+ * another window may restore or purge in that window, so only the ids this
+ * caller touched are applied on top of the latest file.
+ *
+ * @param {Map<string, object | null>} ops session id to its record, or null to drop it.
+ * @returns {boolean} whether the queue was persisted.
+ */
+function applyPendingTrashOps(ops) {
+  if (!(ops instanceof Map) || ops.size === 0) return true
+  const latest = readPendingTrash()
+  for (const [id, record] of ops) {
+    if (record === null) delete latest[id]
+    else latest[id] = record
+  }
+  return writePendingTrash(latest)
 }
 
 /**
@@ -2142,7 +2192,16 @@ function decodeSessionLog(buffer) {
     if (length <= 0 || offset + length > buffer.length) {
       // A log with no frame at all is still readable as plain JSONL; a log that
       // stops after some frames is a truncated append, not a different layout.
-      if (decodedFrames === 0 && offset === 0) return { text: buffer.toString('utf8'), complete: true }
+      if (decodedFrames === 0 && offset === 0) {
+        // ...but a file that starts with the zstd magic and cannot be framed is
+        // a damaged log, not an uncompressed one. Returning it as plain text
+        // would report a complete scan with zero references, which is the
+        // silent under-count the completeness flag exists to prevent.
+        if (buffer.length >= 4 && buffer.readUInt32LE(0) === ZSTD_FRAME_MAGIC) {
+          return { text: null, complete: false }
+        }
+        return { text: buffer.toString('utf8'), complete: true }
+      }
       return { text: null, complete: false }
     }
     try {
@@ -3502,15 +3561,20 @@ function restorePackageAttachments(entries, refs = null) {
         counters.failed += 1
         continue
       }
-      try {
-        let existing = 0
-        try {
-          existing = statSync(target).size
-        } catch {
-          existing = -1
+      // A package is untrusted input: the object name is its SHA-256, so the
+      // bytes are verified before they may enter the content-addressed store.
+      // The size shortcut used by the delete path is not applied here.
+      const expected = expectedAttachmentDigest(entry.segments)
+      if (expected !== null) {
+        const actual = createHash('sha256').update(entry.data).digest('hex')
+        if (actual !== expected) {
+          counters.failed += 1
+          trace('import', 'attach-digest-mismatch', `path=${entry.segments.join('/').slice(0, 80)} expected=${expected.slice(0, 12)} actual=${actual.slice(0, 12)}`)
+          continue
         }
-        if (existing === entry.data.length
-          && (entry.data.length > ATTACHMENT_VERIFY_BYTES || sameFileContent(target, entry.data))) {
+      }
+      try {
+        if (existsSync(target) && sameFileContent(target, entry.data)) {
           counters.skipped += 1
           continue
         }
@@ -3536,6 +3600,20 @@ function restorePackageAttachments(entries, refs = null) {
       // single safe segment may become a path component, otherwise `..\..\evil`
       // would make this copy land outside the attachment store.
       const recorded = typeof ref.name === 'string' && ref.name !== '' ? ref.name : null
+      // The canonical object may predate this import; never alias bytes that
+      // no longer match the digest the name promises.
+      try {
+        const size = statSync(objectPath).size
+        if (size <= ATTACHMENT_VERIFY_BYTES
+          && createHash('sha256').update(readFileSync(objectPath)).digest('hex') !== ref.hash) {
+          counters.failed += 1
+          trace('import', 'attach-object-corrupt', `hash=${ref.hash.slice(0, 12)}`)
+          continue
+        }
+      } catch {
+        counters.failed += 1
+        continue
+      }
       const name = recorded === null ? 'file' : safeAttachmentName(recorded)
       if (name === null) {
         counters.failed += 1
@@ -3563,6 +3641,23 @@ function restorePackageAttachments(entries, refs = null) {
 }
 
 /**
+ * Read the digest a package member path promises, when it has one.
+ *
+ * @param {string[]} segments member path below `attachments/`.
+ * @returns {string | null} 64-hex digest, or null for an unrecognised layout.
+ */
+function expectedAttachmentDigest(segments) {
+  if (!Array.isArray(segments)) return null
+  // Package members mirror the store below `attachments/`, so the layout
+  // version (v1) is part of the path but not of the digest position.
+  const parts = segments[0] === 'v1' ? segments.slice(1) : segments
+  if (parts.length < 3) return null
+  if (parts[0] !== 'objects' && parts[0] !== 'file-objects' && parts[0] !== 'files') return null
+  const digest = parts[2]
+  return /^[a-f0-9]{64}$/.test(digest) ? digest : null
+}
+
+/**
  * Accept a log-recorded attachment name only when it is one path segment.
  *
  * `join()` normalizes `..`, so a name that separator-splits would escape the
@@ -3582,6 +3677,8 @@ function safeAttachmentName(value) {
   // Windows, which would make the alias unresolvable.
   if (/[\\/:*?"<>|\u0000-\u001F]/.test(value)) return null
   if (value !== value.trim() || value.endsWith('.')) return null
+  // A reserved device name would resolve to the device rather than to a file.
+  if (WINDOWS_RESERVED_NAME.test(value)) return null
   return value
 }
 
@@ -4139,7 +4236,9 @@ async function trashSessions(ctx, rawIds, signal, includeForks, progress = null)
   // membership, and the pre-detach snapshot is exactly what the manifest
   // records as the origin workspace.
   const workspaceList = listWorkspacesSafe(registry)
-  let pendingChanged = false
+  // Queue changes are applied by id on top of the latest file; a snapshot
+  // write here could resurrect a record that another request restored.
+  const pendingOps = new Map()
   const results = []
   const families = []
 
@@ -4183,7 +4282,7 @@ async function trashSessions(ctx, rawIds, signal, includeForks, progress = null)
         const wasArchived = previous !== null && typeof previous.wasArchived === 'boolean'
           ? previous.wasArchived
           : archived.has(member.id)
-        pending[member.id] = {
+        pendingOps.set(member.id, {
           ...(previous ?? {}),
           // Keep the first request's timestamp so the bin entry keeps its age.
           requestedAt: previous !== null && typeof previous.requestedAt === 'number'
@@ -4200,8 +4299,7 @@ async function trashSessions(ctx, rawIds, signal, includeForks, progress = null)
           // only the archive this delete applied to hide the session.
           wasArchived,
           archivedByDelete: !wasArchived,
-        }
-        pendingChanged = true
+        })
         trace('trash', 'deferred', `id=${member.id} family=${family.rootId}`)
         appendOperation({ action: 'defer', sessionId: member.id, title: member.title, role: member.role })
         results.push({ id: member.id, familyRoot: family.rootId, role: member.role, status: 'deferred' })
@@ -4281,7 +4379,9 @@ async function trashSessions(ctx, rawIds, signal, includeForks, progress = null)
     families.push({ familyRoot: family.rootId, memberCount: memberIds.length })
   }
 
-  if (pendingChanged) writePendingTrash(pending)
+  if (pendingOps.size > 0 && applyPendingTrashOps(pendingOps) !== true) {
+    trace('trash', 'queue-write-failed', `ids=${pendingOps.size}`)
+  }
 
   return { results, families }
 }
@@ -4338,8 +4438,9 @@ async function restoreTrashEntries(ctx, rawNames, signal, options = {}) {
         continue
       }
       const record = currentPending[pendingId]
-      delete currentPending[pendingId]
-      writePendingTrash(currentPending)
+      // Un-archive first: once the queue record is gone the entry disappears
+      // from the bin, so a failed un-archive would leave the session hidden with
+      // nothing left to retry. Keeping the record makes the failure retryable.
       try {
         // A session that was archived before the delete keeps that state; only
         // the archive added by the delete itself is undone.
@@ -4347,9 +4448,24 @@ async function restoreTrashEntries(ctx, rawNames, signal, options = {}) {
           await registry.unarchiveSession(pendingId)
         }
       } catch (error) {
-        // The session was archived only to hide it during deletion, so a failure
-        // here leaves it invisible; keep a trace to make that diagnosable.
         trace('restore', 'unarchive-fail', `id=${pendingId} ${describeError(error)}`)
+        results.push({ entryName: rawName, sessionId: pendingId, status: 'failed', reason: `取消归档失败：${describeError(error)}` })
+        continue
+      }
+      delete currentPending[pendingId]
+      if (writePendingTrash(currentPending) !== true) {
+        // The archive was undone but the queue still lists the session. A kept
+        // `purge: true` would destroy the restored session on the next start,
+        // so the destructive intent is dropped even when the write only
+        // partially succeeds.
+        const { purge, purgeRequestedAt, ...keptRecord } = record
+        if (applyPendingTrashOps(new Map([[pendingId, keptRecord]])) !== true) {
+          trace('restore', 'queue-write-failed', `id=${pendingId} purge-intent-dropped=false`)
+        } else {
+          trace('restore', 'queue-write-failed', `id=${pendingId} purge-intent-dropped=true`)
+        }
+        results.push({ entryName: rawName, sessionId: pendingId, status: 'failed', reason: '队列写入失败；已取消永久删除标记，请重试' })
+        continue
       }
       trace('restore', 'end', `ok pending id=${pendingId}`)
       appendOperation({
@@ -4473,8 +4589,12 @@ function appendAudit(record) {
   try {
     mkdirSync(dirname(PURGE_AUDIT_FILE), { recursive: true })
     appendFileSync(PURGE_AUDIT_FILE, `${JSON.stringify(record)}\n`)
-  } catch {
-    // Audit failures must not block the purge.
+    return true
+  } catch (error) {
+    // Audit failures must not block the purge, but they must be visible: the
+    // audit trail is the only record of what was destroyed.
+    trace('audit', 'write-fail', describeError(error))
+    return false
   }
 }
 
@@ -4535,6 +4655,49 @@ function collectSessionAttachmentRefs(sessionDir, health = null) {
  * @param {Set<string>} excludedIds session ids that are being deleted.
  * @returns {Map<string, Set<string>>} owner session ids per digest.
  */
+function readAttachmentIndexCache() {
+  try {
+    const parsed = JSON.parse(readFileSync(ATTACHMENT_INDEX_CACHE, 'utf8'))
+    return parsed && typeof parsed === 'object' && parsed.sessions && typeof parsed.sessions === 'object'
+      ? parsed.sessions
+      : {}
+  } catch {
+    return {}
+  }
+}
+
+function writeAttachmentIndexCache(sessions) {
+  try {
+    mkdirSync(dirname(ATTACHMENT_INDEX_CACHE), { recursive: true })
+    const temporary = `${ATTACHMENT_INDEX_CACHE}.tmp`
+    writeFileSync(temporary, JSON.stringify({ version: 1, sessions }))
+    renameSync(temporary, ATTACHMENT_INDEX_CACHE)
+  } catch {
+    // A cache miss only costs time.
+  }
+}
+
+/**
+ * Signature one session log set: a name/mtime/size list that changes on append.
+ *
+ * @param {string} sessionDir session directory.
+ * @returns {string | null} signature, or null when the logs cannot be statted.
+ */
+function sessionLogSignature(sessionDir) {
+  const logs = listSessionLogFiles(sessionDir)
+  if (logs.length === 0) return null
+  const parts = []
+  try {
+    for (const logPath of logs) {
+      const stats = statSync(logPath)
+      parts.push(`${basename(logPath)}:${Math.round(stats.mtimeMs)}:${stats.size}`)
+    }
+  } catch {
+    return null
+  }
+  return parts.join('|')
+}
+
 function buildAttachmentOwners(excludedIds, health = null) {
   const owners = new Map()
   const markIncomplete = (reason) => {
@@ -4555,6 +4718,8 @@ function buildAttachmentOwners(excludedIds, health = null) {
     if (health !== null && typeof health === 'object') health.rootUnreadable = true
     trace('attach', 'index-incomplete', 'sessions root unreadable')
   }
+  const previousCache = readAttachmentIndexCache()
+  const nextCache = {}
   for (const project of projects) {
     if (!project.isDirectory()) continue
     let sessions = []
@@ -4568,11 +4733,25 @@ function buildAttachmentOwners(excludedIds, health = null) {
       if (!session.isDirectory()) continue
       const id = session.name
       if (excludedIds.has(id)) continue
-      for (const hash of collectSessionAttachmentRefs(join(SESSIONS_ROOT, project.name, id), health).keys()) {
-        remember(hash, id)
+      const sessionDir = join(SESSIONS_ROOT, project.name, id)
+      const key = `${project.name}/${id}`
+      const signature = sessionLogSignature(sessionDir)
+      if (signature === null) continue
+      const cached = previousCache[key]
+      if (cached && cached.signature === signature && Array.isArray(cached.digests)) {
+        for (const hash of cached.digests) remember(hash, id)
+        nextCache[key] = cached
+        continue
       }
+      const local = { incomplete: 0 }
+      const refs = collectSessionAttachmentRefs(sessionDir, local)
+      if (health !== null && typeof health === 'object') health.incomplete = (health.incomplete ?? 0) + local.incomplete
+      for (const hash of refs.keys()) remember(hash, id)
+      // Only a complete scan is cacheable; a damaged log is retried next time.
+      if (local.incomplete === 0) nextCache[key] = { signature, digests: [...refs.keys()] }
     }
   }
+  writeAttachmentIndexCache(nextCache)
   for (const entry of readTrashEntries()) {
     const id = typeof entry.sessionId === 'string' && entry.sessionId !== ''
       ? entry.sessionId
@@ -4609,7 +4788,14 @@ function buildAttachmentOwners(excludedIds, health = null) {
  */
 function clearReadOnly(target) {
   try {
-    chmodSync(target, 0o666)
+    if (process.platform === 'win32') {
+      chmodSync(target, 0o666)
+      return
+    }
+    // On POSIX the read-only bit is the owner write bit; rewriting the mode as
+    // 0o666 would strip a directory's execute bit and break the recursive rm.
+    const mode = statSync(target).mode & 0o7777
+    chmodSync(target, mode | 0o200)
   } catch {
     // A missing path or an unchangeable directory is the caller's problem.
   }
@@ -4642,11 +4828,20 @@ function removeAttachmentPath(target, recursive = false) {
 
 function deleteAttachmentObject(hash) {
   const shard = hash.slice(0, 2)
-  const counters = { deleted: 0, bytes: 0, failed: 0, errorCodes: {} }
+  // `deleted` / `failed` count digests, so the dialog and the preflight agree;
+  // `deletedPaths` / `failedPaths` keep the per-path detail for diagnostics.
+  const counters = { deleted: 0, bytes: 0, failed: 0, deletedPaths: 0, failedPaths: 0, errorCodes: {} }
   const noteFailure = (code) => {
-    counters.failed += 1
+    counters.failedPaths += 1
     const key = typeof code === 'string' && code !== '' ? code : 'unknown'
     counters.errorCodes[key] = (counters.errorCodes[key] ?? 0) + 1
+  }
+  const outcome = () => {
+    // A digest is deleted only when everything that existed is gone; a partial
+    // removal is reported as failed rather than as a successful deletion.
+    counters.deleted = counters.deletedPaths > 0 && counters.failedPaths === 0 ? 1 : 0
+    counters.failed = counters.failedPaths > 0 ? 1 : 0
+    return counters
   }
   const verified = (filePath) => {
     let size = 0
@@ -4687,7 +4882,7 @@ function deleteAttachmentObject(hash) {
       noteFailure(removal.code)
       continue
     }
-    counters.deleted += 1
+    counters.deletedPaths += 1
     if (!countedBytes) {
       counters.bytes += size
       countedBytes = true
@@ -4700,7 +4895,7 @@ function deleteAttachmentObject(hash) {
     const resolved = resolve(aliasDir)
     if (!isInsideRoot(pathKey(resolved), pathKey(ATTACHMENT_ALIAS_DIR))) {
       noteFailure('alias-outside-root')
-      return counters
+      return outcome()
     }
     let aliasBytes = 0
     let aliasOk = true
@@ -4719,7 +4914,7 @@ function deleteAttachmentObject(hash) {
     }
     if (!aliasOk) {
       noteFailure('alias-verify-failed')
-      return counters
+      return outcome()
     }
     // Alias entries are hard links of the same read-only object, so each one
     // has to lose the attribute before the directory can go.
@@ -4733,12 +4928,12 @@ function deleteAttachmentObject(hash) {
     const aliasRemoval = removeAttachmentPath(aliasDir, true)
     if (!aliasRemoval.ok) {
       noteFailure(aliasRemoval.code)
-      return counters
+      return outcome()
     }
-    counters.deleted += 1
+    counters.deletedPaths += 1
     if (!countedBytes) counters.bytes += aliasBytes
   }
-  return counters
+  return outcome()
 }
 
 /**
@@ -4798,12 +4993,16 @@ function runAttachmentCleanup(plan) {
     // True when the owner index could not be trusted; nothing was deleted.
     indexIncomplete: plan.indexIncomplete === true,
     keptUnverified: Number(plan.keptUnverified) || 0,
+    deletedPaths: 0,
+    failedPaths: 0,
   }
   for (const item of plan.deletable) {
     const outcome = deleteAttachmentObject(item.hash)
     counters.deleted += outcome.deleted
     counters.bytes += outcome.bytes
     counters.failed += outcome.failed
+    counters.deletedPaths += Number(outcome.deletedPaths) || 0
+    counters.failedPaths += Number(outcome.failedPaths) || 0
     for (const [code, times] of Object.entries(outcome.errorCodes ?? {})) {
       counters.errorCodes[code] = (counters.errorCodes[code] ?? 0) + times
     }
@@ -4883,7 +5082,7 @@ async function purgeTrashEntries(rawNames) {
   const byName = new Map(entries.map((entry) => [entry.entryName, entry]))
   const trashRoot = resolve(TRASH_ROOT)
   const pending = readPendingTrash()
-  let pendingChanged = false
+  const pendingOps = new Map()
   const results = []
   const purged = []
   const queued = []
@@ -4902,8 +5101,7 @@ async function purgeTrashEntries(rawNames) {
       // The session is still open, so its log cannot be removed now; queue the
       // deletion for the next start instead of rejecting it.
       if (record.purge !== true) {
-        pending[pendingId] = { ...record, purge: true, purgeRequestedAt: Date.now() }
-        pendingChanged = true
+        pendingOps.set(pendingId, { ...record, purge: true, purgeRequestedAt: Date.now() })
         appendOperation({
           action: 'queue-purge',
           sessionId: pendingId,
@@ -4949,7 +5147,9 @@ async function purgeTrashEntries(rawNames) {
     }
   }
 
-  if (pendingChanged) writePendingTrash(pending)
+  if (pendingOps.size > 0 && applyPendingTrashOps(pendingOps) !== true) {
+    trace('purge', 'queue-write-failed', `ids=${pendingOps.size}`)
+  }
 
   let attachments = null
   if (purged.length > 0) {
@@ -5329,11 +5529,58 @@ async function exportSessions(ctx, rawIds, signal, options = {}) {
  * @param {object} ctx Cordis context.
  * @returns {Promise<void>} resolution after every queued session was handled.
  */
+/**
+ * Remove trash entries that a crash left without their session directory.
+ *
+ * The flush writes the manifest before moving the session in, so dying in
+ * between leaves an entry that lists in the bin but can never be restored.
+ * Only entries whose manifest names a session still queued are removed: the
+ * retry recreates them under a fresh name.
+ *
+ * @param {Set<string>} pendingIds session ids still present in the queue.
+ * @returns {void}
+ */
+function sweepPhantomTrashEntries(pendingIds) {
+  let names = []
+  try {
+    names = readdirSync(TRASH_ROOT, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name)
+  } catch {
+    return
+  }
+  const trashRoot = resolve(TRASH_ROOT)
+  for (const name of names) {
+    const entryDir = join(TRASH_ROOT, name)
+    const resolved = resolve(entryDir)
+    if (resolved === trashRoot || !resolved.startsWith(trashRoot + sep)) continue
+    // Never touch an entry that still holds its session.
+    if (existsSync(join(entryDir, 'session'))) continue
+    let manifest = null
+    try {
+      manifest = JSON.parse(readFileSync(join(entryDir, 'manifest.json'), 'utf8'))
+    } catch {
+      continue
+    }
+    if (!manifest || typeof manifest.id !== 'string' || !pendingIds.has(manifest.id)) continue
+    try {
+      rmSync(entryDir, { recursive: true, force: true })
+      trace('trash', 'phantom-removed', `entry=${name} id=${manifest.id}`)
+      appendAudit({ at: new Date().toISOString(), action: 'trash-phantom', entryName: name, sessionId: manifest.id })
+    } catch (error) {
+      trace('trash', 'phantom-remove-fail', `entry=${name} ${describeError(error)}`)
+    }
+  }
+}
+
 async function flushPendingTrash(ctx) {
   const items = readPendingTrash()
   const ids = Object.keys(items)
   if (ids.length === 0) return
 
+  // A crash between the manifest and the move leaves an entry that lists but
+  // cannot be restored; the queued record retries it under a fresh name.
+  sweepPhantomTrashEntries(new Set(ids))
   const registry = ctx.get('workspaceRegistry')
   // A queued session can be opened again before this runs (the "all" view lists
   // archived sessions), and the plugin can also be re-applied while sessions are
@@ -5502,7 +5749,7 @@ async function flushPendingTrash(ctx) {
     const attachments = runAttachmentCleanup(planAttachmentCleanup(purgeSessions))
     appendAudit({
       at: new Date().toISOString(),
-      action: 'purge',
+      action: 'purge-attachments',
       deferred: true,
       attachments,
     })
@@ -5880,3 +6127,24 @@ export function apply(ctx) {
   }, 6000)
   ctx.effect(() => () => clearTimeout(flushTimer), 'sessions-library: deferred trash flush')
 }
+
+// Test-only surface: the harness needs the internals, but the shipped bundle must
+// not expose them. The runner sets the variable before importing this module.
+export const __test = process.env.DSH_SESSIONS_LIBRARY_TEST === '1'
+  ? {
+      decodeSessionLog,
+      safeAttachmentName,
+      clearReadOnly,
+      readPendingTrash,
+      writePendingTrash,
+      applyPendingTrashOps,
+      flushPendingTrash,
+      restorePackageAttachments,
+      collectSessionAttachmentRefs,
+      planAttachmentCleanup,
+      runAttachmentCleanup,
+      deleteAttachmentObject,
+      buildAttachmentOwners,
+      sweepPhantomTrashEntries,
+    }
+  : null

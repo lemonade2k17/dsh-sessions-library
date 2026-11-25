@@ -879,6 +879,11 @@ window.__ModuleLoader__.load({
         // Groups left with no family at all: they fade out together with their
         // last family, so nothing in the list disappears without a beat.
         const [trashRemovingGroups, setTrashRemovingGroups] = React.useState({})
+        // Bin families with a restore/cancel request in flight, keyed by family
+        // key. The row button is disabled meanwhile: a second click would race
+        // the first request and overwrite its success with "找不到条目".
+        const [busyRestore, setBusyRestore] = React.useState({})
+        const [busyCancel, setBusyCancel] = React.useState({})
         const [purgeDialog, setPurgeDialog] = React.useState(null)
         const [logs, setLogs] = React.useState([])
         const [logsPhase, setLogsPhase] = React.useState('idle')
@@ -923,6 +928,21 @@ window.__ModuleLoader__.load({
         // Newest export preflight wins: two exclusion refreshes may resolve out of
         // order, and a late response would overwrite the fresh counts.
         const exportPreflightToken = React.useRef(0)
+        // Same ordering rule for the recycle bin and the operation log: the
+        // visible-page poll and a user action's own refresh can be in flight at
+        // once, and an older answer must never roll back the list a newer read
+        // just produced.
+        const trashRequestRef = React.useRef(0)
+        const logsRequestRef = React.useRef(0)
+        // Newest delete preflight wins. Closing the dialog or flipping the forks
+        // switch starts another one, and the late answer of the old batch must
+        // not pop the box back open over the user's cancel.
+        const deletePreflightToken = React.useRef(0)
+        // Newest permanent-delete attachment preflight, plus the entry-name key
+        // of the batch it was asked for: an answer for another selection must
+        // never be written into the confirmation on screen now.
+        const purgePreflightToken = React.useRef(0)
+        const purgePreflightKey = React.useRef('')
         // Root element, used to tell clicks inside this page from clicks in the
         // native sidebar or another panel.
         const rootRef = React.useRef(null)
@@ -1247,9 +1267,15 @@ window.__ModuleLoader__.load({
         const selectedTrashCount = selectedTrashEntries.length
         const allTrashSelected = trashFamilies.length > 0
           && trashFamilies.every((family) => trashSelected[family.key] === true)
+        // A bin search forces every group open, so nothing in the bin is
+        // collapsed while a query is active. Both the toolbar and the group
+        // headers read this one flag: otherwise the toolbar offered "全部展开"
+        // for a list that already showed every group, and the headers rendered
+        // as clickable while their toggle could not change anything.
+        const trashSearchActive = trashQuery.trim() !== ''
         // No visible workspace group is expanded: the toolbar button flips to
         // "全部展开" so one click opens the whole bin again.
-        const trashAllCollapsed = trashGroups.length > 0
+        const trashAllCollapsed = !trashSearchActive && trashGroups.length > 0
           && trashGroups.every((bucket) => trashExpanded[bucket.key] !== true)
 
         /** Select one session in the Conversation. */
@@ -1472,12 +1498,18 @@ window.__ModuleLoader__.load({
          */
         async function refreshTrash(options = {}) {
           const silent = options.silent === true
+          // The 15s poll and a user action's own refresh (restore, purge,
+          // cancel) can overlap. Only the newest read may write: an older,
+          // slower poll answer would otherwise put back the rows that action
+          // just removed.
+          const token = ++trashRequestRef.current
           if (!silent) {
             setTrashPhase('loading')
             setTrashError(null)
           }
           try {
             const payload = await postJson('api/sessions-library/trash-list', {})
+            if (token !== trashRequestRef.current) return
             const entries = Array.isArray(payload.entries) ? payload.entries : []
             cachedTrashEntries = entries
             setTrash(entries)
@@ -1490,6 +1522,7 @@ window.__ModuleLoader__.load({
             setTrashPhase('ready')
             lastSyncRef.current = Date.now()
           } catch (failure) {
+            if (token !== trashRequestRef.current) return
             // A silent failure keeps the last good list instead of replacing it
             // with an error screen the user did not ask for.
             if (silent) return
@@ -1542,12 +1575,16 @@ window.__ModuleLoader__.load({
          */
         async function refreshLogs(options = {}) {
           const silent = options.silent === true
+          // Same ordering rule as the bin: the poll must not overwrite the list
+          // a delete or a manual refresh produced after it was already sent.
+          const token = ++logsRequestRef.current
           if (!silent) {
             setLogsPhase('loading')
             setLogsError(null)
           }
           try {
             const payload = await postJson(LOGS_PATH, { limit: LOGS_LIMIT })
+            if (token !== logsRequestRef.current) return
             const entries = Array.isArray(payload.entries) ? payload.entries : []
             cachedLogEntries = entries
             setLogs(entries)
@@ -1571,6 +1608,7 @@ window.__ModuleLoader__.load({
             setLogsPhase('ready')
             lastSyncRef.current = Date.now()
           } catch (failure) {
+            if (token !== logsRequestRef.current) return
             if (silent) return
             setLogsPhase('error')
             setLogsError(failure && failure.message ? failure.message : String(failure))
@@ -1640,12 +1678,18 @@ window.__ModuleLoader__.load({
           const ids = selectedVisibleIds()
           if (ids.length === 0) return
           const withForks = includeForks === true
+          // Flipping the forks switch starts a second preflight while the first
+          // may still be in flight, and the dialog can be cancelled in between:
+          // only the newest request may write, so the old answer can neither
+          // overwrite the new preview nor reopen the closed dialog.
+          const token = ++deletePreflightToken.current
           setDialog({ phase: 'loading', families: [], results: [], includeForks: withForks, error: null, limit: null })
           try {
             const payload = await postJson('api/sessions-library/delete-preflight', {
               sessionIds: ids,
               includeForks: withForks,
             }, { timeoutMs: BATCH_TIMEOUT_MS })
+            if (token !== deletePreflightToken.current) return
             setDialog({
               phase: 'ready',
               families: Array.isArray(payload.families) ? payload.families : [],
@@ -1655,6 +1699,7 @@ window.__ModuleLoader__.load({
               limit: readBatchLimit(payload.limit),
             })
           } catch (failure) {
+            if (token !== deletePreflightToken.current) return
             setDialog({
               phase: 'error',
               families: [],
@@ -1814,13 +1859,15 @@ window.__ModuleLoader__.load({
             }, {
               timeoutMs: LONG_REQUEST_TIMEOUT_MS,
             })
+            const importedCount = Number(payload.imported) || 0
+            const adoptedCount = Number(payload.adopted) || 0
             setImportDialog((current) => (current
               ? {
                   ...current,
                   phase: 'done',
                   outcome: {
-                    imported: Number(payload.imported) || 0,
-                    adopted: Number(payload.adopted) || 0,
+                    imported: importedCount,
+                    adopted: adoptedCount,
                     skipped: Number(payload.skipped) || 0,
                     failed: Number(payload.failed) || 0,
                     results: Array.isArray(payload.results) ? payload.results : [],
@@ -1832,7 +1879,11 @@ window.__ModuleLoader__.load({
                   },
                 }
               : current))
-            if ((Number(payload.imported) || 0) > 0) {
+            // An adopted session is not written again, but it still left the
+            // local archive and entered the library and the Native sidebar, so
+            // it needs the same refresh as a fresh import. The result screen
+            // already promises a refresh in both cases.
+            if (importedCount > 0 || adoptedCount > 0) {
               setReloadToken((token) => token + 1)
               refreshNativeSessionList()
             }
@@ -1868,6 +1919,15 @@ window.__ModuleLoader__.load({
             // shows once the count is known.
             attachmentInfo: null,
             includeAttachments: true,
+            // A failed preflight is not "nothing to back up": it is recorded on
+            // its own field, keeps both switches untouched and blocks the
+            // export until it is retried.
+            preflightError: null,
+            // Whether the user flipped a switch by hand. Only an untouched
+            // switch follows a new preview's default, so an exclusion change
+            // cannot re-arm a choice the user just turned off.
+            touchedWorkspace: false,
+            touchedAttachments: false,
             // One-off selection: it lives only in this dialog instance, so every
             // new export starts with nothing excluded by hand.
             excludePaths: [],
@@ -1886,10 +1946,40 @@ window.__ModuleLoader__.load({
           // Two quick refreshes can resolve out of order; only the newest request
           // may write the dialog, otherwise stale counts overwrite fresh ones.
           const token = ++exportPreflightToken.current
-          const workspaceResult = await postJson(WORKSPACE_PREFLIGHT_PATH, {
-            sessionIds: ids,
-            excludePaths: Array.isArray(excludePaths) ? excludePaths : [],
-          }, { timeoutMs: BATCH_TIMEOUT_MS }).catch(() => null)
+          let workspaceResult = null
+          let preflightError = null
+          try {
+            workspaceResult = await postJson(WORKSPACE_PREFLIGHT_PATH, {
+              sessionIds: ids,
+              excludePaths: Array.isArray(excludePaths) ? excludePaths : [],
+            }, { timeoutMs: BATCH_TIMEOUT_MS })
+            // An empty answer is as unusable as a rejected one: it cannot be
+            // read as "no workspace files, no attachments".
+            if (!workspaceResult || typeof workspaceResult !== 'object') {
+              preflightError = '预检没有返回结果'
+            }
+          } catch (failure) {
+            // Keep the reason: a walk that failed says nothing about how many
+            // files or attachments exist, so it can never be reported as "0".
+            preflightError = failure && failure.message ? failure.message : String(failure)
+          }
+          if (token !== exportPreflightToken.current) return
+          if (preflightError !== null) {
+            // The old code swallowed the failure into zero counts, which made the
+            // dialog claim there was nothing to back up and forced both switches
+            // off — every attachment then silently stayed out of the package.
+            // Nothing else is written here: the user's own choices are kept as
+            // they are, and beginExport refuses to run from this state.
+            setExportDialog((current) => (current && current.phase === 'choose'
+              ? {
+                  ...current,
+                  workspaceInfo: { failed: true },
+                  attachmentInfo: { failed: true },
+                  preflightError,
+                }
+              : current))
+            return
+          }
           const workspaceInfo = {
             count: workspaceResult ? Number(workspaceResult.totalFiles) || 0 : 0,
             // Links the walk refused to follow; the dialog says so when > 0.
@@ -1903,7 +1993,6 @@ window.__ModuleLoader__.load({
               ? workspaceResult.workspaces
               : [],
           }
-          if (token !== exportPreflightToken.current) return
           const attachmentResult = workspaceResult && workspaceResult.attachments
             && typeof workspaceResult.attachments === 'object'
             ? workspaceResult.attachments
@@ -1914,17 +2003,23 @@ window.__ModuleLoader__.load({
             bytes: attachmentResult ? Number(attachmentResult.bytes) || 0 : 0,
             missing: attachmentResult ? Number(attachmentResult.missing) || 0 : 0,
           }
-          setExportDialog((current) => (current && current.phase === 'choose'
-            ? {
-                ...current,
-                workspaceInfo,
-                includeWorkspaceFiles: workspaceInfo.count > 0,
-                attachmentInfo,
-                // Default to on: a package without its attachment objects would
-                // hand the receiver a history that cannot run a single turn.
-                includeAttachments: attachmentInfo.total > 0,
-              }
-            : current))
+          setExportDialog((current) => {
+            if (!current || current.phase !== 'choose') return current
+            const next = {
+              ...current,
+              workspaceInfo,
+              attachmentInfo,
+              preflightError: null,
+            }
+            // Defaults only fill an untouched switch. Re-running the preview
+            // (after an exclusion change, say) must not re-check what the user
+            // deliberately cleared.
+            if (current.touchedWorkspace !== true) next.includeWorkspaceFiles = workspaceInfo.count > 0
+            // Default to on: a package without its attachment objects would
+            // hand the receiver a history that cannot run a single turn.
+            if (current.touchedAttachments !== true) next.includeAttachments = attachmentInfo.total > 0
+            return next
+          })
         }
 
         /**
@@ -2100,6 +2195,17 @@ window.__ModuleLoader__.load({
         async function beginExport(createDir = false) {
           const ids = selectedVisibleIds()
           if (ids.length === 0) return
+          // A failed preflight cannot answer "are there attachments": the old
+          // code reported zero, sent `includeAttachments:false` and quietly
+          // dropped every attachment from the package. Refuse the export and
+          // ask for a retry instead.
+          if (exportDialog !== null && typeof exportDialog.preflightError === 'string') {
+            const message = exportDialog.preflightError
+            setExportDialog((current) => (current
+              ? { ...current, error: `预检失败，暂时无法导出：${message}。请先点「重试统计」再导出。` }
+              : current))
+            return
+          }
           const targetDir = exportTarget.trim()
           // The checkbox only counts once the preview has counted files: before
           // that, "included" would mean "all of them", which is exactly what the
@@ -2154,13 +2260,15 @@ window.__ModuleLoader__.load({
               setExportDialog((current) => (current ? { ...current, phase: 'choose', error: null } : current))
               return
             }
-            setExportDialog({
+            setExportDialog((current) => ({
+              ...(current || {}),
               phase: 'error',
-              path: '',
-              fileName: '',
-              sessionCount: 0,
+              // Keep the preview, the exclusion list and both switches:
+              // replacing the whole state stripped workspaceInfo, which left
+              // "开始导出" greyed out forever and turned "返回修改位置" into a
+              // chooser that could not export anything.
               error: failure && failure.message ? failure.message : String(failure),
-            })
+            }))
           }
         }
 
@@ -2175,6 +2283,10 @@ window.__ModuleLoader__.load({
             progress: { done: 0, total: 0, current: '' },
           }))
           let pollTimer = null
+          // One progress read at a time: a big batch can outlive several 350ms
+          // ticks, and without this flag the interval piled dozens of unanswered
+          // requests behind each other.
+          let pollInFlight = false
           const stopPolling = () => {
             if (pollTimer !== null) {
               clearInterval(pollTimer)
@@ -2182,6 +2294,8 @@ window.__ModuleLoader__.load({
             }
           }
           const pollProgress = async () => {
+            if (pollInFlight) return
+            pollInFlight = true
             try {
               const payload = await postJson(DELETE_PROGRESS_PATH, { token: progressToken })
               const progress = payload && payload.progress
@@ -2198,6 +2312,8 @@ window.__ModuleLoader__.load({
                 : current))
             } catch {
               // Progress is cosmetic; a failed poll must not break the delete.
+            } finally {
+              pollInFlight = false
             }
           }
           pollTimer = setInterval(pollProgress, 350)
@@ -2280,10 +2396,17 @@ window.__ModuleLoader__.load({
          * it into the recycle bin as usual.
          *
          * @param {string[]} entryNames pending entry names to un-queue.
+         * @param {string} [familyKey] bin family whose button is now busy.
          * @returns {Promise<void>} resolution after the recycle bin refreshed.
          */
-        async function cancelQueuedPurge(entryNames) {
+        async function cancelQueuedPurge(entryNames, familyKey) {
           if (!Array.isArray(entryNames) || entryNames.length === 0) return
+          const key = typeof familyKey === 'string' ? familyKey : ''
+          // A second click would ask the Host about an entry the first request
+          // already changed, and its "找不到条目" answer would replace the
+          // success notice.
+          if (key !== '' && busyCancel[key] === true) return
+          if (key !== '') setBusyCancel((current) => ({ ...current, [key]: true }))
           setTrashError(null)
           setTrashNotice(null)
           try {
@@ -2314,10 +2437,29 @@ window.__ModuleLoader__.load({
             await refreshTrash({ silent: true })
           } catch (failure) {
             setTrashError(failure && failure.message ? failure.message : String(failure))
+          } finally {
+            if (key !== '') {
+              setBusyCancel((current) => {
+                if (current[key] !== true) return current
+                const next = { ...current }
+                delete next[key]
+                return next
+              })
+            }
           }
         }
 
-        async function restoreFamily(entryNames) {
+        /**
+         * Restore one bin family.
+         *
+         * @param {string[]} entryNames entry names of the family.
+         * @param {string} [familyKey] bin family whose button is now busy.
+         * @returns {Promise<void>} resolution after the recycle bin refreshed.
+         */
+        async function restoreFamily(entryNames, familyKey) {
+          const key = typeof familyKey === 'string' ? familyKey : ''
+          if (key !== '' && busyRestore[key] === true) return
+          if (key !== '') setBusyRestore((current) => ({ ...current, [key]: true }))
           setTrashError(null)
           setTrashNotice(null)
           try {
@@ -2350,6 +2492,15 @@ window.__ModuleLoader__.load({
             setReloadToken((token) => token + 1)
           } catch (failure) {
             setTrashError(failure && failure.message ? failure.message : String(failure))
+          } finally {
+            if (key !== '') {
+              setBusyRestore((current) => {
+                if (current[key] !== true) return current
+                const next = { ...current }
+                delete next[key]
+                return next
+              })
+            }
           }
         }
 
@@ -2485,14 +2636,24 @@ window.__ModuleLoader__.load({
          * @returns {Promise<void>} resolution after the preview settled.
          */
         async function loadPurgeAttachmentPreflight(entryNames) {
+          // The confirmation can be closed and reopened before this read-only
+          // preflight answers. Key the request to the exact entry-name batch it
+          // was asked for (plus a sequence, since the same batch can be asked
+          // twice): an older answer must never be written into the confirmation
+          // the user is looking at now.
+          const batchKey = Array.isArray(entryNames) ? [...entryNames].sort().join('\n') : ''
+          const token = ++purgePreflightToken.current
+          purgePreflightKey.current = batchKey
           try {
             const payload = await postJson('api/sessions-library/purge-preflight', { entryNames }, {
               timeoutMs: BATCH_TIMEOUT_MS,
             })
+            if (token !== purgePreflightToken.current || batchKey !== purgePreflightKey.current) return
             setPurgeDialog((current) => (current && current.phase === 'confirm'
               ? { ...current, attachmentReport: payload }
               : current))
           } catch {
+            if (token !== purgePreflightToken.current || batchKey !== purgePreflightKey.current) return
             setPurgeDialog((current) => (current && current.phase === 'confirm'
               ? { ...current, attachmentReport: { failed: true } }
               : current))
@@ -2516,6 +2677,9 @@ window.__ModuleLoader__.load({
               phase: 'done',
               results,
               attachments: payload.attachments || null,
+              // A failed earlier attempt left its message in the dialog; the
+              // success panel must not keep showing it next to "已永久删除".
+              error: null,
             }))
             setTrashSelected({})
             // Only the fully purged entries leave the bin; queued ones stay
@@ -2909,6 +3073,10 @@ window.__ModuleLoader__.load({
           const queuedNames = family.entries
             .filter((entry) => entry.purge === true)
             .map((entry) => entry.entryName)
+          // This family's action is already on the wire: the button stays
+          // disabled until it settles, so a double click cannot race itself.
+          const restoreBusy = busyRestore[family.key] === true
+          const cancelBusy = busyCancel[family.key] === true
           const cardStyle = bucket
             ? {
                 padding: '6px 8px 8px',
@@ -2949,7 +3117,8 @@ window.__ModuleLoader__.load({
                     {
                       className: 'sl-btn',
                       style: actionButtonStyle,
-                      onClick: () => cancelQueuedPurge(queuedNames),
+                      disabled: cancelBusy,
+                      onClick: () => cancelQueuedPurge(queuedNames, family.key),
                     },
                     '放弃永久删除（留在回收站）',
                   )
@@ -2959,7 +3128,8 @@ window.__ModuleLoader__.load({
                       {
                         className: 'sl-btn',
                         style: actionButtonStyle,
-                        onClick: () => restoreFamily(family.entries.map((entry) => entry.entryName)),
+                        disabled: restoreBusy,
+                        onClick: () => restoreFamily(family.entries.map((entry) => entry.entryName), family.key),
                       },
                       '恢复会话（回到会话库）',
                     )
@@ -3022,8 +3192,7 @@ window.__ModuleLoader__.load({
               // A search forces groups open: results must be visible the moment
               // the query matches, while the manual expansion state is kept for
               // when the query is cleared.
-              const searchActive = trashQuery.trim() !== ''
-              const collapsed = !searchActive && trashExpanded[bucket.key] !== true
+              const collapsed = !trashSearchActive && trashExpanded[bucket.key] !== true
               const sessionCount = bucket.families.reduce((sum, family) => sum + family.entries.length, 0)
               const bytes = bucket.families.reduce((sum, family) => sum + family.totalBytes, 0)
               return h(
@@ -3037,15 +3206,23 @@ window.__ModuleLoader__.load({
                   'div',
                   {
                     className: 'sl-group-head',
-                    role: 'button',
-                    tabIndex: 0,
-                    'aria-expanded': collapsed ? 'false' : 'true',
-                    onClick: () => toggleTrashGroup(bucket.key),
-                    onKeyDown: (event) => {
-                      if (event.key !== 'Enter' && event.key !== ' ') return
-                      event.preventDefault()
-                      toggleTrashGroup(bucket.key)
-                    },
+                    // A search forces the body open, so the header is not a
+                    // control then: role/tabIndex/onClick/onKeyDown made it look
+                    // clickable and announced "可展开" while the toggle could not
+                    // hide anything. aria-expanded now just reports the body.
+                    ...(trashSearchActive
+                      ? { 'aria-expanded': 'true', style: { cursor: 'default' } }
+                      : {
+                          role: 'button',
+                          tabIndex: 0,
+                          'aria-expanded': collapsed ? 'false' : 'true',
+                          onClick: () => toggleTrashGroup(bucket.key),
+                          onKeyDown: (event) => {
+                            if (event.key !== 'Enter' && event.key !== ' ') return
+                            event.preventDefault()
+                            toggleTrashGroup(bucket.key)
+                          },
+                        }),
                   },
                   h(
                     'span',
@@ -3314,7 +3491,12 @@ window.__ModuleLoader__.load({
                     className: 'sl-btn',
                     style: actionButtonStyle,
                     disabled: dialog.phase === 'busy',
-                    onClick: () => setDialog(null),
+                    onClick: () => {
+                      // Drop a preflight still on the wire: its answer must not
+                      // reopen the dialog that was just dismissed.
+                      deletePreflightToken.current += 1
+                      setDialog(null)
+                    },
                   },
                   dialog.phase === 'done' ? '关闭' : '取消',
                 ),
@@ -4019,32 +4201,50 @@ window.__ModuleLoader__.load({
           const title = done ? '已导出会话' : failed ? '导出失败' : '导出会话'
           const workspaceInfo = exportDialog.workspaceInfo || null
           const workspaceFileCount = workspaceInfo ? Number(workspaceInfo.count) || 0 : 0
+          // A failed preflight is a state of its own: the counts are unknown, so
+          // neither "0 files / 0 attachments" nor a silent export is allowed.
+          const preflightError = typeof exportDialog.preflightError === 'string'
+            && exportDialog.preflightError !== ''
+            ? exportDialog.preflightError
+            : null
+          const workspaceInfoFailed = workspaceInfo !== null && workspaceInfo.failed === true
           // Batch bound: the Host caps one request, so the preview and the
           // finished package only cover the head of the selection. Say so
           // instead of letting "exported N" read as the whole selection.
           const batchLimit = readBatchLimit(exportDialog.limit)
             || (workspaceInfo !== null ? readBatchLimit(workspaceInfo.limit) : null)
           const batchTruncated = Boolean(batchLimit && batchLimit.requested > batchLimit.accepted)
-          const includeWorkspaceFiles = exportDialog.includeWorkspaceFiles === true && workspaceFileCount > 0
+          // While the walk failed the count proves nothing: show the switch's
+          // stored choice instead of "unchecked because 0".
+          const includeWorkspaceFiles = exportDialog.includeWorkspaceFiles === true
+            && workspaceInfo !== null
+            && (workspaceInfoFailed || workspaceFileCount > 0)
           const workspaceLabel = workspaceInfo === null
             ? '正在统计工作区文件…'
-            : workspaceFileCount === 0
-              ? '所选会话的工作区没有可备份的文件'
-              : `包含工作区文件（该会话工作区目录里的项目文件）：${workspaceFileCount} 个 · ${((Number(workspaceInfo.bytes) || 0) / 1048576).toFixed(2)} MB`
-                + `${workspaceInfo.truncated ? '（已达上限，部分文件未包含）' : ''}`
-                + `${Number(workspaceInfo.links) > 0 ? ` · 跳过 ${Number(workspaceInfo.links)} 个链接` : ''}`
+            : workspaceInfoFailed
+              ? '工作区文件统计失败，导出前需要重试统计'
+              : workspaceFileCount === 0
+                ? '所选会话的工作区没有可备份的文件'
+                : `包含工作区文件（该会话工作区目录里的项目文件）：${workspaceFileCount} 个 · ${((Number(workspaceInfo.bytes) || 0) / 1048576).toFixed(2)} MB`
+                  + `${workspaceInfo.truncated ? '（已达上限，部分文件未包含）' : ''}`
+                  + `${Number(workspaceInfo.links) > 0 ? ` · 跳过 ${Number(workspaceInfo.links)} 个链接` : ''}`
           // Chat attachments counted by the same preflight request.
           const attachmentInfo = exportDialog.attachmentInfo || null
           const attachmentTotal = attachmentInfo ? Number(attachmentInfo.total) || 0 : 0
           const attachmentAvailable = attachmentInfo ? Number(attachmentInfo.available) || 0 : 0
           const attachmentMissing = attachmentInfo ? Number(attachmentInfo.missing) || 0 : 0
-          const includeAttachments = exportDialog.includeAttachments === true && attachmentTotal > 0
+          const attachmentInfoFailed = attachmentInfo !== null && attachmentInfo.failed === true
+          const includeAttachments = exportDialog.includeAttachments === true
+            && attachmentInfo !== null
+            && (attachmentInfoFailed || attachmentTotal > 0)
           const attachmentLabel = attachmentInfo === null
             ? '正在统计会话附件…'
-            : attachmentTotal === 0
-              ? '所选会话没有引用聊天附件'
-              : `包含会话附件（对话里的图片与文件）：${attachmentAvailable} 个 · ${((Number(attachmentInfo.bytes) || 0) / 1048576).toFixed(2)} MB`
-                + `${attachmentMissing > 0 ? ` · 本机缺失 ${attachmentMissing} 个（无法打包）` : ''}`
+            : attachmentInfoFailed
+              ? '会话附件统计失败，导出前需要重试统计'
+              : attachmentTotal === 0
+                ? '所选会话没有引用聊天附件'
+                : `包含会话附件（对话里的图片与文件）：${attachmentAvailable} 个 · ${((Number(attachmentInfo.bytes) || 0) / 1048576).toFixed(2)} MB`
+                  + `${attachmentMissing > 0 ? ` · 本机缺失 ${attachmentMissing} 个（无法打包）` : ''}`
           // Paths picked in the exclusion browser, and the workspace roots the
           // browser may start from.
           const exportExcludePaths = Array.isArray(exportDialog.excludePaths) ? exportDialog.excludePaths : []
@@ -4067,7 +4267,9 @@ window.__ModuleLoader__.load({
                 className: 'sl-btn',
                 style: { ...actionButtonStyle, opacity: workspaceInfo === null ? 0.55 : 1 },
                 disabled: workspaceInfo === null,
-                title: workspaceInfo === null ? '正在统计工作区文件…' : undefined,
+                title: workspaceInfo === null
+                  ? '正在统计工作区文件…'
+                  : preflightError !== null ? '预检失败，导出前需要重试统计' : undefined,
                 onClick: () => beginExport(false),
               },
               '开始导出',
@@ -4075,7 +4277,21 @@ window.__ModuleLoader__.load({
           } else if (failed) {
             actions.push(h(
               'button',
-              { key: 'back', className: 'sl-btn', style: actionButtonStyle, onClick: () => setExportDialog((current) => ({ ...(current || {}), phase: 'choose', error: null })) },
+              {
+                key: 'back',
+                className: 'sl-btn',
+                style: actionButtonStyle,
+                onClick: () => {
+                  // The preview, the exclusion list and both switches survived
+                  // the failure, so this lands on a working chooser again. The
+                  // counts are re-read anyway: an export attempt can take
+                  // minutes, and nobody has checked them since.
+                  setExportDialog((current) => (current
+                    ? { ...current, phase: 'choose', error: null, preflightError: null }
+                    : current))
+                  refreshExcludePreview()
+                },
+              },
               '返回修改位置',
             ))
             actions.push(h(
@@ -4137,15 +4353,39 @@ window.__ModuleLoader__.load({
                           )
                         : null,
                     ),
+                    preflightError !== null
+                      ? h(
+                          'div',
+                          { className: 'sl-note', 'data-tone': 'caution' },
+                          `工作区文件与会话附件的统计失败：${preflightError}。为避免漏打包，需要重新统计后才能导出。`,
+                          h(
+                            'button',
+                            {
+                              className: 'sl-btn',
+                              style: { ...actionButtonStyle, marginLeft: 8 },
+                              onClick: refreshExcludePreview,
+                            },
+                            '重试统计',
+                          ),
+                        )
+                      : null,
                     h(
                       'div',
                       { style: exportOptionRowStyle },
                       renderCheckbox(
                         includeWorkspaceFiles ? 'all' : 'none',
                         () => {
-                          if (workspaceFileCount === 0) return
+                          // A walk that found no files has nothing to toggle; a
+                          // failed walk is unknown, so its choice stays editable.
+                          if (workspaceFileCount === 0 && !workspaceInfoFailed) return
                           setExportDialog((current) => (current
-                            ? { ...current, includeWorkspaceFiles: current.includeWorkspaceFiles !== true }
+                            ? {
+                                ...current,
+                                includeWorkspaceFiles: current.includeWorkspaceFiles !== true,
+                                // From here on the switch is the user's: a
+                                // later preview must not reset it.
+                                touchedWorkspace: true,
+                              }
                             : current))
                         },
                         '包含工作区文件',
@@ -4158,9 +4398,13 @@ window.__ModuleLoader__.load({
                       renderCheckbox(
                         includeAttachments ? 'all' : 'none',
                         () => {
-                          if (attachmentTotal === 0) return
+                          if (attachmentTotal === 0 && !attachmentInfoFailed) return
                           setExportDialog((current) => (current
-                            ? { ...current, includeAttachments: current.includeAttachments !== true }
+                            ? {
+                                ...current,
+                                includeAttachments: current.includeAttachments !== true,
+                                touchedAttachments: true,
+                              }
                             : current))
                         },
                         '包含会话附件',
@@ -4676,7 +4920,16 @@ window.__ModuleLoader__.load({
           ], setTrashSort),
           h(
             'button',
-            { className: 'sl-ghost', onClick: toggleAllTrashGroups },
+            {
+              className: 'sl-ghost',
+              // While a search forces every group open the label says 全部收起;
+              // there is nothing to fold away, so the control is inert until the
+              // query is cleared instead of silently doing nothing.
+              disabled: trashSearchActive,
+              style: trashSearchActive ? { opacity: 0.45, cursor: 'not-allowed' } : undefined,
+              title: trashSearchActive ? '搜索时分组固定展开' : undefined,
+              onClick: toggleAllTrashGroups,
+            },
             h(Icon, { name: 'expand', size: 14 }),
             trashAllCollapsed ? '全部展开' : '全部收起',
           ),
