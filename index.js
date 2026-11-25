@@ -2119,11 +2119,16 @@ function attachmentDigest(raw) {
  * Session logs are appended one zstd frame at a time, so a one-shot decode only
  * returns the header frame and would hide every attachment reference.
  *
+ * A log that does not decode frame by frame cannot be trusted for attachment
+ * ownership: the caller has to know whether the text is the whole history or
+ * only the prefix before the damage, otherwise a damaged survivor silently
+ * looks like it owns nothing and its shared objects become deletable.
+ *
  * @param {Buffer} buffer log bytes.
- * @returns {string | null} decoded text, or null when nothing can be decoded.
+ * @returns {{ text: string | null, complete: boolean }} decoded text and whether every frame decoded.
  */
-function decodeSessionLogText(buffer) {
-  if (!Buffer.isBuffer(buffer) || buffer.length === 0) return null
+function decodeSessionLog(buffer) {
+  if (!Buffer.isBuffer(buffer) || buffer.length === 0) return { text: null, complete: true }
   const chunks = []
   let offset = 0
   let decodedFrames = 0
@@ -2132,20 +2137,35 @@ function decodeSessionLogText(buffer) {
     try {
       length = firstZstdFrameLength(buffer.subarray(offset))
     } catch {
-      break
+      length = 0
     }
-    if (length <= 0 || offset + length > buffer.length) break
+    if (length <= 0 || offset + length > buffer.length) {
+      // A log with no frame at all is still readable as plain JSONL; a log that
+      // stops after some frames is a truncated append, not a different layout.
+      if (decodedFrames === 0 && offset === 0) return { text: buffer.toString('utf8'), complete: true }
+      return { text: null, complete: false }
+    }
     try {
       chunks.push(zstdDecompressSync(buffer.subarray(offset, offset + length)))
     } catch {
-      break
+      return { text: null, complete: false }
     }
     offset += length
     decodedFrames += 1
   }
-  // An unknown layout is still readable as plain JSONL; never hide its refs.
-  if (decodedFrames === 0) return buffer.toString('utf8')
-  return Buffer.concat(chunks).toString('utf8')
+  if (decodedFrames === 0) return { text: buffer.toString('utf8'), complete: true }
+  return { text: Buffer.concat(chunks).toString('utf8'), complete: true }
+}
+
+/**
+ * Decode one log only when every frame decodes.
+ *
+ * @param {Buffer} buffer log bytes.
+ * @returns {string | null} decoded text, or null when the log is incomplete.
+ */
+function decodeSessionLogText(buffer) {
+  const outcome = decodeSessionLog(buffer)
+  return outcome.complete ? outcome.text : null
 }
 
 /**
@@ -2158,11 +2178,27 @@ function decodeSessionLogText(buffer) {
  *
  * @param {Buffer} buffer log bytes.
  * @param {Map<string, object>} into accumulated references keyed by digest.
+ * @param {(() => void) | null} [onIncomplete] called when the log does not decode fully.
  * @returns {number} references found in this log.
  */
-function collectLogAttachments(buffer, into) {
-  const text = decodeSessionLogText(buffer)
-  if (text === null) return 0
+function collectLogAttachments(buffer, into, onIncomplete = null) {
+  const outcome = decodeSessionLog(buffer)
+  if (!outcome.complete || outcome.text === null) {
+    trace('attach', 'log-incomplete', `bytes=${buffer.length} refsUnreadable=true`)
+    if (typeof onIncomplete === 'function') onIncomplete()
+    return 0
+  }
+  return collectAttachmentRefsFromText(outcome.text, into)
+}
+
+/**
+ * Collect attachment references from decoded JSONL text.
+ *
+ * @param {string} text decoded log text.
+ * @param {Map<string, object>} into accumulated references keyed by digest.
+ * @returns {number} references found in this text.
+ */
+function collectAttachmentRefsFromText(text, into) {
   let found = 0
   for (const line of text.split('\n')) {
     if (line.indexOf('attachmentId') < 0) continue
@@ -3496,8 +3532,22 @@ function restorePackageAttachments(entries, refs = null) {
       const shard = ref.hash.slice(0, 2)
       const objectPath = join(ATTACHMENT_FILE_DIR, shard, ref.hash)
       if (!existsSync(objectPath)) continue
-      const name = typeof ref.name === 'string' && ref.name !== '' ? ref.name : 'file'
+      // The name comes from the imported log, so it is untrusted input: only a
+      // single safe segment may become a path component, otherwise `..\..\evil`
+      // would make this copy land outside the attachment store.
+      const recorded = typeof ref.name === 'string' && ref.name !== '' ? ref.name : null
+      const name = recorded === null ? 'file' : safeAttachmentName(recorded)
+      if (name === null) {
+        counters.failed += 1
+        trace('import', 'attach-alias-rejected', `hash=${ref.hash.slice(0, 12)} name=${recorded.slice(0, 40)}`)
+        continue
+      }
       const aliasPath = join(ATTACHMENT_ALIAS_DIR, shard, ref.hash, name)
+      if (!isInsideRoot(pathKey(resolve(aliasPath)), pathKey(ATTACHMENT_ALIAS_DIR))) {
+        counters.failed += 1
+        trace('import', 'attach-alias-rejected', `hash=${ref.hash.slice(0, 12)} outside-root`)
+        continue
+      }
       try {
         mkdirSync(dirname(aliasPath), { recursive: true })
         const size = statSync(objectPath).size
@@ -3510,6 +3560,29 @@ function restorePackageAttachments(entries, refs = null) {
     }
   }
   return counters
+}
+
+/**
+ * Accept a log-recorded attachment name only when it is one path segment.
+ *
+ * `join()` normalizes `..`, so a name that separator-splits would escape the
+ * alias directory; the digest still names the object, but the copy destination
+ * would not. A name that cannot be a single segment is rejected rather than
+ * rewritten: the read path looks the alias up by the recorded name, so a
+ * different name would not make the reference readable anyway.
+ *
+ * @param {string} value recorded name.
+ * @returns {string | null} the safe name, or null when it is not one segment.
+ */
+function safeAttachmentName(value) {
+  if (typeof value !== 'string' || value === '' || value.length > 180) return null
+  if (value === '.' || value === '..') return null
+  // Separators, a drive colon, a NUL or any Windows-forbidden character would
+  // escape or fail the path, and trailing dots/spaces are silently trimmed on
+  // Windows, which would make the alias unresolvable.
+  if (/[\\/:*?"<>|\u0000-\u001F]/.test(value)) return null
+  if (value !== value.trim() || value.endsWith('.')) return null
+  return value
 }
 
 /**
@@ -4419,16 +4492,36 @@ function appendAudit(record) {
  * @param {string} sessionDir absolute session directory.
  * @returns {Map<string, object>} references keyed by digest.
  */
-function collectSessionAttachmentRefs(sessionDir) {
+function collectSessionAttachmentRefs(sessionDir, health = null) {
   const refs = new Map()
-  for (const logPath of listSessionLogFiles(sessionDir)) {
+  const markIncomplete = (reason) => {
+    if (health !== null && typeof health === 'object') health.incomplete = (health.incomplete ?? 0) + 1
+    trace('attach', 'scan-incomplete', `${basename(sessionDir)}: ${reason}`)
+  }
+  try {
+    readdirSync(sessionDir, { withFileTypes: true })
+  } catch {
+    markIncomplete('session directory unreadable')
+    return refs
+  }
+  const logs = listSessionLogFiles(sessionDir)
+  // A session that has not written a log yet references nothing, so an empty
+  // directory is complete rather than degraded.
+  if (logs.length === 0) return refs
+  for (const logPath of logs) {
     let data = null
     try {
       data = readFileSync(logPath)
     } catch {
-      data = null
+      markIncomplete(`unreadable ${basename(logPath)}`)
+      continue
     }
-    if (data !== null) collectLogAttachments(data, refs)
+    const outcome = decodeSessionLog(data)
+    if (!outcome.complete || outcome.text === null) {
+      markIncomplete(`undecodable ${basename(logPath)}`)
+      continue
+    }
+    collectAttachmentRefsFromText(outcome.text, refs)
   }
   return refs
 }
@@ -4442,8 +4535,12 @@ function collectSessionAttachmentRefs(sessionDir) {
  * @param {Set<string>} excludedIds session ids that are being deleted.
  * @returns {Map<string, Set<string>>} owner session ids per digest.
  */
-function buildAttachmentOwners(excludedIds) {
+function buildAttachmentOwners(excludedIds, health = null) {
   const owners = new Map()
+  const markIncomplete = (reason) => {
+    if (health !== null && typeof health === 'object') health.incomplete = (health.incomplete ?? 0) + 1
+    trace('attach', 'index-incomplete', reason)
+  }
   const remember = (hash, id) => {
     if (!owners.has(hash)) owners.set(hash, new Set())
     owners.get(hash).add(id)
@@ -4453,6 +4550,10 @@ function buildAttachmentOwners(excludedIds) {
     projects = readdirSync(SESSIONS_ROOT, { withFileTypes: true })
   } catch {
     projects = []
+    // Without the session root every reference looks unreferenced, so the whole
+    // cleanup has to stand down rather than delete anything.
+    if (health !== null && typeof health === 'object') health.rootUnreadable = true
+    trace('attach', 'index-incomplete', 'sessions root unreadable')
   }
   for (const project of projects) {
     if (!project.isDirectory()) continue
@@ -4460,13 +4561,14 @@ function buildAttachmentOwners(excludedIds) {
     try {
       sessions = readdirSync(join(SESSIONS_ROOT, project.name), { withFileTypes: true })
     } catch {
+      markIncomplete(`project unreadable: ${project.name}`)
       continue
     }
     for (const session of sessions) {
       if (!session.isDirectory()) continue
       const id = session.name
       if (excludedIds.has(id)) continue
-      for (const hash of collectSessionAttachmentRefs(join(SESSIONS_ROOT, project.name, id)).keys()) {
+      for (const hash of collectSessionAttachmentRefs(join(SESSIONS_ROOT, project.name, id), health).keys()) {
         remember(hash, id)
       }
     }
@@ -4478,7 +4580,7 @@ function buildAttachmentOwners(excludedIds) {
     if (excludedIds.has(id)) continue
     const sessionDir = join(TRASH_ROOT, entry.entryName, 'session')
     if (!existsSync(sessionDir)) continue
-    for (const hash of collectSessionAttachmentRefs(sessionDir).keys()) remember(hash, id)
+    for (const hash of collectSessionAttachmentRefs(sessionDir, health).keys()) remember(hash, id)
   }
   return owners
 }
@@ -4652,8 +4754,11 @@ function planAttachmentCleanup(sessions) {
     if (typeof session.sessionId === 'string' && session.sessionId !== '') ids.add(session.sessionId)
     for (const [hash, meta] of session.refs) if (!merged.has(hash)) merged.set(hash, meta)
   }
-  if (merged.size === 0) return { deletable: [], shared: [], referenced: 0 }
-  const owners = buildAttachmentOwners(ids)
+  if (merged.size === 0) return { deletable: [], shared: [], referenced: 0, indexIncomplete: false, keptUnverified: 0 }
+  // A scan that could not read every surviving session cannot prove an object
+  // is unused, so its result is reported separately instead of deleting.
+  const health = { incomplete: 0, rootUnreadable: false }
+  const owners = buildAttachmentOwners(ids, health)
   const deletable = []
   const shared = []
   for (const [hash, meta] of merged) {
@@ -4661,7 +4766,16 @@ function planAttachmentCleanup(sessions) {
     if (others !== undefined && others.size > 0) shared.push({ hash, meta, owners: [...others] })
     else deletable.push({ hash, meta })
   }
-  return { deletable, shared, referenced: merged.size }
+  const indexIncomplete = health.incomplete > 0 || health.rootUnreadable === true
+  if (indexIncomplete) {
+    trace(
+      'purge',
+      'attach-index-incomplete',
+      `incomplete=${health.incomplete} rootUnreadable=${health.rootUnreadable === true} kept=${deletable.length}`,
+    )
+    return { deletable: [], shared, referenced: merged.size, indexIncomplete: true, keptUnverified: deletable.length }
+  }
+  return { deletable, shared, referenced: merged.size, indexIncomplete: false, keptUnverified: 0 }
 }
 
 /**
@@ -4681,6 +4795,9 @@ function runAttachmentCleanup(plan) {
     missing: 0,
     // Why a removal failed, so a retry can be diagnosed instead of guessed.
     errorCodes: {},
+    // True when the owner index could not be trusted; nothing was deleted.
+    indexIncomplete: plan.indexIncomplete === true,
+    keptUnverified: Number(plan.keptUnverified) || 0,
   }
   for (const item of plan.deletable) {
     const outcome = deleteAttachmentObject(item.hash)
@@ -4733,6 +4850,9 @@ function buildPurgeAttachmentReport(rawNames) {
       deletableBytes: bytesOf(plan.deletable),
       shared: plan.shared.length,
       sharedBytes: bytesOf(plan.shared),
+      // The dialog must not promise a deletion the cleanup will refuse to run.
+      indexIncomplete: plan.indexIncomplete === true,
+      keptUnverified: Number(plan.keptUnverified) || 0,
     },
     entries: sessions.map((session) => ({
       entryName: session.entryName,
@@ -5016,10 +5136,16 @@ async function exportSessions(ctx, rawIds, signal, options = {}) {
   // that packed `workspaces/` alone produced packages whose imported sessions
   // could not run a single turn once an image object was missing.
   const attachmentRefs = new Map()
+  // A log this Host cannot decode fully hides its references, so the package
+  // would silently miss those objects. Count them and report the count instead
+  // of pretending the session referenced nothing.
+  let attachmentScanIncomplete = 0
   if (options.includeAttachments !== false) {
     for (const entry of entries) {
       if (!entry.name.endsWith('.jsonl.zstd')) continue
-      collectLogAttachments(entry.data, attachmentRefs)
+      collectLogAttachments(entry.data, attachmentRefs, () => {
+        attachmentScanIncomplete += 1
+      })
     }
   }
   const attachmentPack = options.includeAttachments !== false
@@ -5177,6 +5303,9 @@ async function exportSessions(ctx, rawIds, signal, options = {}) {
     attachmentBytes: attachmentPack.bytes,
     attachmentMissing: attachmentPack.missing.length,
     attachmentSkipped: attachmentPack.skipped.length,
+    // Logs whose references could not be read; the package may lack those
+    // objects, so the Client can warn instead of presenting a complete export.
+    attachmentScanIncomplete,
     bytes: archive.length,
     missing: ids.filter((id) => !byId.has(id)).length,
     // The Host accepts a bounded batch; report it instead of letting the Client
@@ -5206,6 +5335,12 @@ async function flushPendingTrash(ctx) {
   if (ids.length === 0) return
 
   const registry = ctx.get('workspaceRegistry')
+  // A queued session can be opened again before this runs (the "all" view lists
+  // archived sessions), and the plugin can also be re-applied while sessions are
+  // live. Destroying a loaded session's log would break its Agent, so those
+  // records stay queued instead of being flushed.
+  const agents = ctx.get('agents')
+  const isLoaded = (id) => Boolean(agents && typeof agents.get === 'function' && agents.get(id))
   // One listing for the whole flush; hints below only read it, the detach
   // inside the loop is the only mutation.
   const workspaceList = listWorkspacesSafe(registry)
@@ -5216,13 +5351,19 @@ async function flushPendingTrash(ctx) {
   for (const id of ids) {
     const record = items[id] && typeof items[id] === 'object' ? items[id] : {}
     try {
+      if (isLoaded(id)) {
+        remaining[id] = record
+        trace('trash', 'deferred-skip', `id=${id} loaded again`)
+        continue
+      }
       const dir = findSessionDir(id)
       if (!dir) {
         trace('trash', 'deferred-skip', `id=${id} already gone`)
         continue
       }
       // A queued permanent delete destroys the log here instead of creating a
-      // trash entry: no Agent is live yet, and the durable audit records it.
+      // trash entry: the guard above proved no Agent is live for it, and the
+      // durable audit records it.
       if (record.purge === true) {
         const refs = collectSessionAttachmentRefs(dir)
         const sizeBytes = dirSize(dir)
@@ -5267,13 +5408,11 @@ async function flushPendingTrash(ctx) {
       const deletedAt = Date.now()
       const entryName = `${deletedAt}-${id}`
       const entryDir = join(TRASH_ROOT, entryName)
-      mkdirSync(entryDir, { recursive: true })
-      renameSync(dir, join(entryDir, 'session'))
-      // Hint priority: the wipe record captured the origin membership at
-      // delete time, so it wins even when the workspace is gone by now; the
-      // attached membership and the bare ids only serve records written by an
-      // older Host. An array in the record is trusted even when empty —
-      // "empty" means the session was ungrouped already.
+      // Hint priority: the wipe record captured the origin membership at delete
+      // time, so it wins even when the workspace is gone by now; the attached
+      // membership and the bare ids only serve records written by an older Host.
+      // An array in the record is trusted even when empty: "empty" means the
+      // session was ungrouped already.
       const recordedHints = Array.isArray(record.workspaces)
         ? record.workspaces.filter(isWorkspaceHint)
         : []
@@ -5301,6 +5440,16 @@ async function flushPendingTrash(ctx) {
           // Already unpinned or unknown; both are harmless.
         }
       }
+      // Only a directory this attempt created may be removed again on failure;
+      // an existing entry of the same name belongs to an earlier attempt.
+      let entryDirCreated = false
+      if (!existsSync(entryDir)) {
+        mkdirSync(entryDir, { recursive: true })
+        entryDirCreated = true
+      }
+      // The manifest is written before the session directory moves. A crash in
+      // between leaves an entry the queued record retries; the old order left a
+      // moved session without a manifest that no restore could ever read.
       writeFileSync(join(entryDir, 'manifest.json'), JSON.stringify({
         id,
         entryName,
@@ -5317,10 +5466,25 @@ async function flushPendingTrash(ctx) {
         workspaces: workspaceHints,
         archived: false,
         pinned: false,
-        sizeBytes: dirSize(join(entryDir, 'session')),
+        sizeBytes: dirSize(dir),
         deletedAt,
         deferred: true,
       }, null, 2))
+      try {
+        renameSync(dir, join(entryDir, 'session'))
+      } catch (error) {
+        // A manifest without the session lists as an unrestorable entry, and the
+        // queue retries this session anyway, so drop the half-built directory
+        // (but never one that existed before this attempt).
+        if (entryDirCreated) {
+          try {
+            rmSync(entryDir, { recursive: true, force: true })
+          } catch {
+            // A leftover directory is harmless; the next attempt overwrites it.
+          }
+        }
+        throw error
+      }
       trace('trash', 'deferred-ok', `id=${id}`)
       appendOperation({
         action: 'flush-trash',

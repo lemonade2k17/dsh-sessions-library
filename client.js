@@ -3401,11 +3401,15 @@ window.__ModuleLoader__.load({
                   ? doneSummary
                   : `将永久删除 ${sessionCount} 个会话（${(totalBytes / 1048576).toFixed(1)} MB）。此操作不可恢复；成本账本不会被清理。`
                     + (attachmentTotals
-                      ? `会话带的 ${attachmentTotals.referenced} 个附件中，`
-                        + `${attachmentTotals.deletable} 个没有其他会话使用，会一并删除（${(attachmentTotals.deletableBytes / 1048576).toFixed(2)} MB）`
-                        + `${attachmentTotals.shared > 0
-                          ? `；${attachmentTotals.shared} 个仍被其他会话使用，将保留（${(attachmentTotals.sharedBytes / 1048576).toFixed(2)} MB）`
-                          : ''}。`
+                      ? attachmentTotals.indexIncomplete === true
+                        ? `会话带的 ${attachmentTotals.referenced} 个附件中，`
+                          + `${Number(attachmentTotals.keptUnverified) || 0} 个看起来没有别的会话引用，`
+                          + `但本机附件索引不完整，本次不会删除任何附件（全部保留）。`
+                        : `会话带的 ${attachmentTotals.referenced} 个附件中，`
+                          + `${attachmentTotals.deletable} 个没有其他会话使用，会一并删除（${(attachmentTotals.deletableBytes / 1048576).toFixed(2)} MB）`
+                          + `${attachmentTotals.shared > 0
+                            ? `；${attachmentTotals.shared} 个仍被其他会话使用，将保留（${(attachmentTotals.sharedBytes / 1048576).toFixed(2)} MB）`
+                            : ''}。`
                       : attachmentReport && attachmentReport.failed === true
                         ? '会话附件统计失败，永久删除时会按“有共用就保留”的规则再判断一次。'
                         : '正在统计会话附件…')
@@ -3430,6 +3434,9 @@ window.__ModuleLoader__.load({
                       + `${Number(purgeAttachments.failed) > 0 ? `；${purgeAttachments.failed} 个未能删除` : ''}`
                       + `${Number(purgeAttachments.missing) > 0
                         ? `；${purgeAttachments.missing} 个对象在本机已不存在`
+                        : ''}`
+                      + `${purgeAttachments.indexIncomplete === true
+                        ? `；附件索引不完整，${Number(purgeAttachments.keptUnverified) || 0} 个附件本次未删除（可稍后重试）`
                         : ''}`
                       + `${Number(purgeAttachments.failed) > 0 && purgeAttachments.errorCodes
                         ? `（失败原因：${Object.entries(purgeAttachments.errorCodes)
