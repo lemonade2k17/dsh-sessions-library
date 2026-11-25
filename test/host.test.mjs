@@ -285,7 +285,7 @@ check('orphan cleanup keeps an object whose bytes do not match its name', () => 
 check('orphan cleanup re-checks references before deleting', () => {
   const bytes = Buffer.from('late-reference', 'utf8')
   const orphan = writeObject(objectsDir, bytes)
-  // The preflight saw an orphan; a session starts referencing it afterwards.
+  // The object is an orphan, then a session starts referencing it afterwards.
   const ref = { hash: orphan.hash, name: 'late.png' }
   makeSession('session-late-ref', logFrames('session-late-ref', [{ hash: orphan.hash, name: 'late.png', bytes: bytes.length }]))
   const outcome = cleanupOrphans([orphan.hash])

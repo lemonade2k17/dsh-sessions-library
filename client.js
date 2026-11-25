@@ -3300,10 +3300,11 @@ window.__ModuleLoader__.load({
                     null,
                     Number(orphanReport.orphanCount) > 0
                       ? `发现 ${orphanReport.orphanCount} 个无引用附件（${(Number(orphanReport.orphanBytes) / 1048576).toFixed(2)} MB），`
-                        + `其中 ${(Array.isArray(orphanReport.candidates) ? orphanReport.candidates.filter((item) => item.verified === true).length : 0)} 个已通过校验，可清理。`
+                        + `其中 ${Number(orphanReport.verifiedCount) || 0} 个已通过校验，可清理`
+                        + `${Number(orphanReport.unverifiedCount) > 0 ? `；${orphanReport.unverifiedCount} 个未通过校验，将保留` : ''}。`
                       : '没有发现无引用附件。',
                   ),
-                  Number(orphanReport.orphanCount) > 0
+                  Number(orphanReport.verifiedCount) > 0
                     ? h(
                         'button',
                         {

@@ -5281,6 +5281,10 @@ function cleanupOrphans(rawHashes) {
     failed: counters.failed,
     skippedShared: counters.skippedShared,
     skippedUnverified: counters.skippedUnverified,
+    // Keep the deleted digests for after-the-fact inspection, bounded so one
+    // very large batch cannot grow the audit file without limit.
+    digests: wanted.slice(0, 200),
+    digestsTruncated: wanted.length > 200,
   })
   trace('orphans', 'end', `requested=${counters.requested} deleted=${counters.deleted} failed=${counters.failed} bytes=${counters.bytes}`)
   return counters
